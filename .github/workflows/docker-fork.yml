@@ -1,0 +1,225 @@
+name: Docker Build, Test, and Publish (fork)
+
+# Fork-side mirror of docker.yml. Upstream's jobs are gated on
+# `github.repository == 'NousResearch/hermes-agent'` and publish to Docker Hub
+# using environment-scoped secrets that do not exist here, so this workflow
+# reproduces the same build → test → push-by-digest → manifest-merge pipeline
+# against GHCR using the built-in GITHUB_TOKEN.
+#
+# Deliberately kept faithful to upstream: same Dockerfile, same per-arch matrix,
+# same HERMES_GIT_SHA build arg, same tests/docker/ suite against the built
+# image, same digest/merge dance for the multi-arch manifest. Only the registry,
+# the repository gate, the triggers and the tag names differ.
+
+on:
+  push:
+    branches:
+      - feat/kubernetes-terminal-backend
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/david-igou/hermes-agent
+
+jobs:
+  build:
+    if: github.repository == 'david-igou/hermes-agent'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            cache-from: type=gha,scope=docker-fork-amd64
+            cache-to: type=gha,mode=max,scope=docker-fork-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            cache-from: type=gha,scope=docker-fork-arm64
+            cache-to: type=gha,mode=max,scope=docker-fork-arm64
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build ${{ matrix.arch }} image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE_NAME }}:test
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+          cache-from: ${{ matrix.cache-from }}
+          cache-to: ${{ matrix.cache-to }}
+
+      - name: Install uv (for docker tests)
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+
+      - name: Set up Python 3.11 (for docker tests)
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install Python dependencies (for docker tests)
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra dev
+
+      - name: Run docker integration tests
+        env:
+          HERMES_TEST_IMAGE: ${{ env.IMAGE_NAME }}:test
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          scripts/run_tests.sh tests/docker/ --file-timeout 600
+
+  publish:
+    if: github.repository == 'david-igou/hermes-agent'
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            cache-from: type=gha,scope=docker-fork-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            cache-from: type=gha,scope=docker-fork-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout trusted source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push ${{ matrix.arch }} by digest
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: ${{ matrix.cache-from }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    if: github.repository == 'david-igou/hermes-agent'
+    runs-on: ubuntu-latest
+    needs: [publish]
+    timeout-minutes: 10
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags are branch-scoped on purpose: this is a feature branch of a fork,
+      # not upstream main, so it must never claim :main or :latest.
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          args=()
+          for digest_file in *; do
+            args+=("${IMAGE_NAME}@sha256:${digest_file}")
+          done
+          short_sha="${GIT_SHA::12}"
+          tags=(-t "${IMAGE_NAME}:k8s-backend" -t "${IMAGE_NAME}:${short_sha}")
+          for i in 1 2 3; do
+            if docker buildx imagetools create "${tags[@]}" "${args[@]}"; then
+              break
+            fi
+            if [ "$i" = 3 ]; then
+              echo "::error::imagetools create failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::imagetools create failed (attempt $i); retrying in 20s"
+            sleep 20
+          done
+
+      - name: Inspect image
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: docker buildx imagetools inspect "${IMAGE_NAME}:k8s-backend"
