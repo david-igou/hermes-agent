@@ -31,7 +31,6 @@ import logging
 import os
 import posixpath
 import re
-import shlex
 import socket
 import tarfile
 import threading
@@ -57,6 +56,12 @@ _SA_NAMESPACE_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 _SA_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
 WORKSPACE_CONTAINER_NAME = "workspace"
+# Grace added to the caller's timeout before the exec loop gives up on its
+# own; _wait_for_process is expected to act first.
+_EXEC_GRACE_SECONDS = 15
+# Terminator for the stdin file-sync payload (see _stdin_upload).
+_SYNC_SENTINEL = "__HERMES_TAR_EOF__"
+_STDIN_CHUNK_BYTES = 64 * 1024
 MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "hermes-agent"}
 
 
@@ -71,13 +76,18 @@ MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "hermes-agent"}
 DEFAULT_KUBERNETES_CONFIG: dict[str, Any] = {
     # --- selection / connection ---------------------------------------
     "provisioner": "direct",          # direct | sandbox
-    "namespace": "",                  # "" -> downward API -> SA namespace file
+    "namespace": "",                  # "" -> the projected SA namespace file
     "kubeconfig": "",                 # out-of-cluster dev only (a path, not a secret)
     "context": "",                    # kubeconfig context; ignored in-cluster
     # --- workload shape (both provisioners) ---------------------------
     "image": "nikolaik/python-nodejs:python3.11-nodejs20",
     "image_pull_policy": "IfNotPresent",
     "image_pull_secrets": [],
+    # Container this backend builds AND execs into.  With sandbox.template_ref
+    # / sandbox.use_claim the pod is built by the operator, so when the
+    # reconciled pod has no container with this name the first one is used
+    # instead (see _BaseProvisioner.pick_container).
+    "container_name": "workspace",
     "service_account": "hermes-session-noperms",
     "automount_service_account_token": False,
     "runtime_class_name": "",         # e.g. "kata" for OpenShift sandboxed containers
@@ -85,15 +95,25 @@ DEFAULT_KUBERNETES_CONFIG: dict[str, Any] = {
     "tolerations": [],
     "labels": {},
     "annotations": {},
-    "env": {},                        # literal env vars inside the session container
+    # Literal NON-SECRET env vars inside the session container. config.yaml is
+    # the non-secret half of the config split: put API keys in a Secret and
+    # reference it by NAME via pod_template_overrides (envFrom/secretKeyRef).
+    "env": {},
     "mount_path": "/workspace",
-    "pod_template_overrides": {},     # strategic-merge patch, applied last
+    # Strategic-merge patch applied last onto the built pod template. Lists of
+    # named objects (containers, volumes, volumeMounts, env, ...) merge by
+    # `name`; every other list replaces wholesale.
+    "pod_template_overrides": {},
     # --- workspace lifetime -------------------------------------------
     "persistent": False,
     "volume": {
-        "size": "",                   # "" -> {container_disk}Mi
+        "size": "10Gi",               # "" -> {container_disk}Mi (50Gi by default)
         "storage_class_name": "",     # "" -> omit (cluster default StorageClass)
         "access_modes": ["ReadWriteOnce"],
+        # "" -> hermes-ws-<task>, which every Hermes instance in the namespace
+        # running that task id SHARES. Set an explicit name when several
+        # agents share a namespace and must not share a workspace.
+        "claim_name": "",
     },
     "active_deadline_seconds": 14400,  # ephemeral pods only; 0 -> omit
     "ready_timeout_seconds": 120,
@@ -142,6 +162,67 @@ def _deep_merge(base: dict, overlay: Any) -> dict:
         else:
             out[key] = deepcopy(value)
     return out
+
+
+def _is_named_object_list(value: Any) -> bool:
+    """True for a Kubernetes ``name``-keyed list (containers, volumes, env...)."""
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, dict) and item.get("name") for item in value)
+    )
+
+
+def strategic_merge(base: dict, overlay: Any) -> dict:
+    """Merge *overlay* onto *base* the way a strategic-merge patch does.
+
+    ``pod_template_overrides`` is documented as a strategic-merge patch, and
+    the natural thing to write is::
+
+        pod_template_overrides:
+          spec:
+            containers:
+              - name: workspace
+                env: [...]
+
+    A plain deep merge replaces the whole ``containers`` list, silently
+    dropping ``image``/``command``/``volumeMounts``/``securityContext`` and
+    leaving a pod that never becomes Ready.  So lists whose elements are all
+    dicts with a ``name`` (containers, initContainers, volumes, volumeMounts,
+    env, imagePullSecrets, ...) merge element-wise on that key — the same
+    ``patchMergeKey: name`` Kubernetes itself uses for those fields.  Every
+    other list (tolerations, capabilities.drop, command, args) replaces
+    wholesale, as it does upstream.
+    """
+    out = deepcopy(base)
+    if not isinstance(overlay, dict):
+        return out
+    for key, value in overlay.items():
+        current = out.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            out[key] = strategic_merge(current, value)
+        elif _is_named_object_list(value) and _is_named_object_list(current):
+            merged = [deepcopy(item) for item in current]
+            index = {item["name"]: pos for pos, item in enumerate(merged)}
+            for item in value:
+                name = item["name"]
+                if name in index:
+                    merged[index[name]] = strategic_merge(merged[index[name]], item)
+                else:
+                    merged.append(deepcopy(item))
+            out[key] = merged
+        else:
+            out[key] = deepcopy(value)
+    return out
+
+
+def _dig_dict(obj: Any, *path: str) -> dict:
+    """Walk *path* through nested mappings, returning ``{}`` when absent."""
+    for key in path:
+        if not isinstance(obj, dict):
+            return {}
+        obj = obj.get(key)
+    return obj if isinstance(obj, dict) else {}
 
 
 def merge_kubernetes_config(user_config: Any) -> dict:
@@ -198,13 +279,38 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
             "Kubernetes quantity (e.g. 50Gi)"
         )
 
-    for field in ("namespace", "service_account", "runtime_class_name"):
+    for field in ("namespace", "service_account", "runtime_class_name",
+                  "container_name"):
         value = str(kcfg.get(field) or "")
         if value and not _RFC1123_RE.match(value):
             problems.append(
                 f"terminal.kubernetes.{field}={value!r} is not a valid "
                 "RFC-1123 name (lowercase alphanumeric, '-', max 63 chars)"
             )
+    claim_name = str((kcfg.get("volume") or {}).get("claim_name") or "")
+    if claim_name and not _RFC1123_RE.match(claim_name):
+        problems.append(
+            f"terminal.kubernetes.volume.claim_name={claim_name!r} is not a "
+            "valid RFC-1123 name (lowercase alphanumeric, '-', max 63 chars)"
+        )
+
+    # The managed-by label is the selector for the shipped NetworkPolicy and
+    # ValidatingAdmissionPolicy and for session-pod adoption. Overriding it
+    # silently drops the pod out of all three, so it is reserved.
+    managed_by_key = next(iter(MANAGED_BY_LABEL))
+    if managed_by_key in (kcfg.get("labels") or {}):
+        problems.append(
+            f"terminal.kubernetes.labels: {managed_by_key!r} is reserved "
+            "(k8s/networkpolicy.yaml, k8s/validatingadmissionpolicy.yaml and "
+            "session-pod adoption all select on it); remove it"
+        )
+    if managed_by_key in _dig_dict(
+        kcfg.get("pod_template_overrides") or {}, "metadata", "labels"
+    ):
+        problems.append(
+            "terminal.kubernetes.pod_template_overrides.metadata.labels: "
+            f"{managed_by_key!r} is reserved and cannot be overridden"
+        )
 
     sb = kcfg.get("sandbox") or {}
     if sb.get("use_claim") and not str(sb.get("template_ref") or "").strip():
@@ -359,14 +465,12 @@ def load_kubernetes_apis(kcfg: dict):
 def resolve_namespace(kcfg: dict) -> str:
     """Resolve the namespace session pods are created in.
 
-    ``terminal.kubernetes.namespace`` → ``HERMES_POD_NAMESPACE`` (downward API,
-    injected by the Deployment — runtime identity, not user config) → the
-    projected ServiceAccount namespace file.
+    ``terminal.kubernetes.namespace`` → the projected ServiceAccount namespace
+    file.  There is deliberately no env-var branch: in-cluster the kubelet
+    already projects the namespace, and out-of-cluster the config key covers
+    it, so a third source would only add a way to disagree.
     """
     namespace = str(kcfg.get("namespace") or "").strip()
-    if namespace:
-        return namespace
-    namespace = (os.getenv("HERMES_POD_NAMESPACE") or "").strip()
     if namespace:
         return namespace
     try:
@@ -407,9 +511,21 @@ def resolve_owner_reference(core_api, namespace: str, kcfg: dict) -> Optional[di
             name = getattr(pod.metadata, "name", "") or ""
             uid = getattr(pod.metadata, "uid", "") or ""
         except Exception as exc:
-            logger.debug("k8s: could not resolve agent pod identity: %s", exc)
+            # Not cosmetic: with no ownerReference the session pod loses its
+            # only garbage-collection path, so say so out loud.
+            logger.warning(
+                "k8s: could not resolve the agent pod identity (%s: %s); session "
+                "pods will carry no ownerReference and will NOT be garbage "
+                "collected when this agent dies. Set HERMES_POD_NAME/"
+                "HERMES_POD_UID from the downward API, or grant 'get pods'.",
+                type(exc).__name__, exc,
+            )
             return None
     if not (name and uid):
+        logger.warning(
+            "k8s: agent pod identity incomplete (name=%r uid=%r); session pods "
+            "will carry no ownerReference.", name, uid,
+        )
         return None
     return {
         "apiVersion": "v1",
@@ -428,6 +544,11 @@ def resolve_owner_reference(core_api, namespace: str, kcfg: dict) -> Optional[di
 # ---------------------------------------------------------------------------
 
 
+def container_name(kcfg: dict) -> str:
+    """Name of the container this backend builds and prefers to exec into."""
+    return str(kcfg.get("container_name") or "").strip() or WORKSPACE_CONTAINER_NAME
+
+
 def build_pod_template(
     kcfg: dict,
     *,
@@ -436,12 +557,17 @@ def build_pod_template(
     resources: Resources,
     pvc_name: str,
     labels: Optional[dict] = None,
+    owned: bool = True,
 ) -> dict:
     """Build the ``{"metadata": ..., "spec": ...}`` shared by both provisioners.
 
     ``DirectProvisioner`` posts this as a ``Pod``; ``SandboxProvisioner`` posts
     it as ``Sandbox.spec.podTemplate``.  Keeping one builder is what makes
     flipping ``terminal.kubernetes.provisioner`` a one-line change.
+
+    *owned* is False when no ownerReference could be resolved — the one case
+    where a persistent pod also needs the activeDeadlineSeconds backstop,
+    because nothing else would ever reap it.
     """
     mount_path = str(kcfg.get("mount_path") or "/workspace")
     sc = kcfg.get("security_context") or {}
@@ -455,9 +581,11 @@ def build_pod_template(
     # On vanilla Kubernetes set security_context.run_as_user so runAsNonRoot
     # can schedule a root-default image, and fs_group so the non-root uid can
     # write the emptyDir/PVC (they mount root:root 0755 otherwise).
-    if sc.get("run_as_user"):
+    # `is not None`, not truthiness: 0 is a legitimate (if unwise) value and
+    # must reach the manifest rather than being silently dropped.
+    if sc.get("run_as_user") is not None:
         pod_security["runAsUser"] = int(sc["run_as_user"])
-    if sc.get("fs_group"):
+    if sc.get("fs_group") is not None:
         pod_security["fsGroup"] = int(sc["fs_group"])
     seccomp = str(sc.get("seccomp_profile") or "").strip()
     if seccomp:
@@ -469,7 +597,7 @@ def build_pod_template(
     }
     if sc.get("run_as_non_root", True):
         container_security["runAsNonRoot"] = True
-    if sc.get("run_as_user"):
+    if sc.get("run_as_user") is not None:
         container_security["runAsUser"] = int(sc["run_as_user"])
     if sc.get("read_only_root_filesystem"):
         container_security["readOnlyRootFilesystem"] = True
@@ -492,7 +620,7 @@ def build_pod_template(
         container_resources["limits"] = limits
 
     container: dict[str, Any] = {
-        "name": WORKSPACE_CONTAINER_NAME,
+        "name": container_name(kcfg),
         "image": image,
         # Keep the pod alive so we can exec into it repeatedly.
         "command": ["sleep", "infinity"],
@@ -556,13 +684,18 @@ def build_pod_template(
     if kcfg.get("tolerations"):
         spec["tolerations"] = deepcopy(kcfg["tolerations"])
     deadline = int(kcfg.get("active_deadline_seconds") or 0)
-    if not persistent and deadline > 0:
-        # Hard lifetime ceiling for ephemeral pods (leak backstop). Never set
-        # for persistent pods — their workspace is meant to be long-lived.
+    if deadline > 0 and (not persistent or not owned):
+        # Hard lifetime ceiling (leak backstop). Normally ephemeral-only — a
+        # persistent workspace is meant to be long-lived — but a persistent pod
+        # with no ownerReference has no reaper at all, and its PVC (the durable
+        # half) outlives the pod either way.
         spec["activeDeadlineSeconds"] = deadline
 
     metadata: dict[str, Any] = {
-        "labels": {**MANAGED_BY_LABEL, **(kcfg.get("labels") or {}), **(labels or {})},
+        # MANAGED_BY_LABEL goes LAST: the shipped NetworkPolicy, the
+        # ValidatingAdmissionPolicy and pod adoption all select on it, so user
+        # labels must not be able to strip the pod out of them.
+        "labels": {**(kcfg.get("labels") or {}), **(labels or {}), **MANAGED_BY_LABEL},
     }
     if kcfg.get("annotations"):
         metadata["annotations"] = dict(kcfg["annotations"])
@@ -570,8 +703,105 @@ def build_pod_template(
     template = {"metadata": metadata, "spec": spec}
     overrides = kcfg.get("pod_template_overrides") or {}
     if overrides:
-        template = _deep_merge(template, overrides)
+        template = strategic_merge(template, overrides)
+        # Re-stamp after the override merge, for the same reason.
+        template.setdefault("metadata", {}).setdefault("labels", {}).update(
+            MANAGED_BY_LABEL
+        )
     return template
+
+
+# ---------------------------------------------------------------------------
+# Trust evaluation (feeds the approval layer)
+# ---------------------------------------------------------------------------
+
+# Volume types a throwaway session pod may use. Anything else (hostPath,
+# secret, projected, csi, nfs, persistentVolumeClaim, ...) either reaches host
+# state or injects credentials, so the pod stops being a throwaway sandbox.
+_SANDBOX_VOLUME_TYPES = frozenset({"emptyDir"})
+
+
+def unhardened_reasons(kcfg: dict) -> list[str]:
+    """Why the pod this config BUILDS is not a throwaway sandbox (empty = it is).
+
+    ``tools.approval`` skips the dangerous-command guards for backends whose
+    workload cannot touch anything durable.  The justification for putting
+    ``kubernetes`` on that path is an ephemeral, non-root, drop-ALL,
+    token-less, emptyDir pod — so the verdict must be derived from the
+    RENDERED pod template, not from a hand-picked subset of config keys.
+    ``security_context`` and ``pod_template_overrides`` (merged last) can
+    re-grant every one of those properties, and anything short of full
+    hardening has to keep the guards.
+    """
+    reasons: list[str] = []
+    if kcfg.get("persistent"):
+        # `rm -rf /workspace` would destroy a PVC the user asked to keep.
+        reasons.append("persistent: true (durable PVC workspace)")
+
+    try:
+        template = build_pod_template(
+            kcfg,
+            persistent=bool(kcfg.get("persistent")),
+            image=str(kcfg.get("image") or ""),
+            resources=Resources(),
+            pvc_name="hermes-ws",
+        )
+    except Exception as exc:  # unrenderable config -> assume untrusted
+        return reasons + [f"pod template could not be rendered ({exc})"]
+
+    spec = template.get("spec") or {}
+    if (spec.get("securityContext") or {}).get("runAsNonRoot") is not True:
+        reasons.append("pod securityContext.runAsNonRoot is not true")
+    if spec.get("automountServiceAccountToken") is not False:
+        reasons.append("automountServiceAccountToken is not false")
+    expected_sa = str(kcfg.get("service_account") or "default")
+    if str(spec.get("serviceAccountName") or "") != expected_sa:
+        reasons.append(
+            f"serviceAccountName {spec.get('serviceAccountName')!r} is not the "
+            f"configured {expected_sa!r}"
+        )
+    for key in ("hostNetwork", "hostPID", "hostIPC"):
+        if spec.get(key):
+            reasons.append(f"{key} is enabled")
+
+    containers: list[Any] = []
+    for field in ("containers", "initContainers", "ephemeralContainers"):
+        containers.extend(spec.get(field) or [])
+    if not containers:
+        reasons.append("pod template declares no containers")
+    for entry in containers:
+        if not isinstance(entry, dict):
+            reasons.append("a container entry is not a mapping")
+            continue
+        name = entry.get("name", "?")
+        csc = entry.get("securityContext") or {}
+        if csc.get("privileged"):
+            reasons.append(f"container {name} is privileged")
+        if csc.get("allowPrivilegeEscalation") is not False:
+            reasons.append(f"container {name} allows privilege escalation")
+        if csc.get("runAsNonRoot") is False or csc.get("runAsUser") == 0:
+            reasons.append(f"container {name} may run as root")
+        capabilities = csc.get("capabilities") or {}
+        drops = [str(c).upper() for c in (capabilities.get("drop") or [])]
+        if "ALL" not in drops:
+            reasons.append(f"container {name} does not drop ALL capabilities")
+        if capabilities.get("add"):
+            reasons.append(
+                f"container {name} adds capabilities {list(capabilities['add'])}"
+            )
+
+    for volume in (spec.get("volumes") or []):
+        if not isinstance(volume, dict):
+            reasons.append("a volume entry is not a mapping")
+            continue
+        kinds = [k for k in volume if k != "name"]
+        extra = [k for k in kinds if k not in _SANDBOX_VOLUME_TYPES]
+        if extra or not kinds:
+            reasons.append(
+                f"volume {volume.get('name', '?')} is "
+                f"{', '.join(extra) or 'untyped'}, not an emptyDir"
+            )
+    return reasons
 
 
 # ---------------------------------------------------------------------------
@@ -614,8 +844,45 @@ class _BaseProvisioner(WorkspaceProvisioner):
 
     def pvc_name(self, task_id: str) -> str:
         # Deliberately NOT instance-scoped: a persistent workspace must resume
-        # for the same task across agent restarts.
-        return f"hermes-ws-{sanitize_name(task_id)}"
+        # for the same task across agent restarts, and the instance
+        # discriminator is derived from the agent pod UID, which changes on
+        # every restart.  The consequence is that two Hermes instances in one
+        # namespace running the same task id share this claim (ReadWriteOnce:
+        # the second pod stays Pending) — set
+        # terminal.kubernetes.volume.claim_name to give an instance its own.
+        configured = str(
+            (self.kcfg.get("volume") or {}).get("claim_name") or ""
+        ).strip()
+        return configured or f"hermes-ws-{sanitize_name(task_id)}"
+
+    def container_name(self) -> str:
+        return container_name(self.kcfg)
+
+    def pick_container(self, pod: Any) -> str:
+        """Choose which container of the RECONCILED pod to exec into.
+
+        The configured name is a preference, not a guarantee: with
+        ``sandbox.template_ref`` / ``sandbox.use_claim`` the operator builds
+        the pod from a SandboxTemplate, and ``pod_template_overrides`` can
+        replace ``spec.containers`` outright.  Hardcoding "workspace" makes
+        every exec in those modes fail with ``container workspace is not valid
+        for pod ...``.
+        """
+        preferred = self.container_name()
+        names: list[str] = []
+        for entry in (getattr(getattr(pod, "spec", None), "containers", None) or []):
+            name = getattr(entry, "name", None)
+            if name is None and isinstance(entry, dict):
+                name = entry.get("name")
+            if name:
+                names.append(str(name))
+        if not names or preferred in names:
+            return preferred
+        logger.info(
+            "k8s: pod has no container %r (found %s); exec-ing into %r instead",
+            preferred, ", ".join(names), names[0],
+        )
+        return names[0]
 
     # -- PVC ------------------------------------------------------------
     def pvc_manifest(self, task_id: str, resources: Resources) -> dict:
@@ -628,14 +895,20 @@ class _BaseProvisioner(WorkspaceProvisioner):
         storage_class = str(vol.get("storage_class_name") or "").strip()
         if storage_class:
             spec["storageClassName"] = storage_class
-        # No ownerRef: a persistent PVC must outlive the agent pod.
+        # No ownerRef: a persistent PVC must outlive the agent pod.  The task
+        # label is what a reaper (see k8s/README.md) selects on, since nothing
+        # in this backend ever deletes these claims.
         return {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
             "metadata": {
                 "name": self.pvc_name(task_id),
                 "namespace": self.namespace,
-                "labels": dict(MANAGED_BY_LABEL),
+                "labels": {
+                    **MANAGED_BY_LABEL,
+                    "app.kubernetes.io/component": "hermes-workspace",
+                    "hermes.nousresearch.com/task": sanitize_name(task_id),
+                },
             },
             "spec": spec,
         }
@@ -686,7 +959,8 @@ class _BaseProvisioner(WorkspaceProvisioner):
         "CreateContainerConfigError", "CreateContainerError",
     })
 
-    def wait_pod_ready(self, pod_name: str) -> None:
+    def wait_pod_ready(self, pod_name: str):
+        """Block until the pod is Ready, then return it (for container pick)."""
         from kubernetes.client.exceptions import ApiException
 
         deadline = time.monotonic() + self.ready_timeout
@@ -706,7 +980,7 @@ class _BaseProvisioner(WorkspaceProvisioner):
                 c.type == "Ready" and c.status == "True" for c in conditions
             )
             if pod.status.phase == "Running" and ready:
-                return
+                return pod
             if pod.status.phase in ("Failed", "Succeeded"):
                 raise RuntimeError(
                     f"session pod {pod_name} entered phase {pod.status.phase}. "
@@ -768,6 +1042,7 @@ class DirectProvisioner(_BaseProvisioner):
             image=image,
             resources=resources,
             pvc_name=self.pvc_name(task_id),
+            owned=self._owner_reference is not None,
         )
         metadata = dict(template["metadata"])
         metadata["name"] = self.workspace_name(task_id)
@@ -807,7 +1082,11 @@ class DirectProvisioner(_BaseProvisioner):
             return True
         owners = getattr(pod.metadata, "owner_references", None) or []
         our_uid = self._owner_reference.get("uid")
-        return any(getattr(o, "uid", None) == our_uid for o in owners) or not owners
+        # No `or not owners` fallback: an unowned pod carrying our label is
+        # exactly what another agent's workspace looks like, and adopting it
+        # means uploading our credential files into it and later deleting it.
+        # Ownership has to be proved, not assumed.
+        return any(getattr(o, "uid", None) == our_uid for o in owners)
 
     def ensure(
         self, task_id: str, persistent: bool, image: str, resources: Resources
@@ -834,8 +1113,8 @@ class DirectProvisioner(_BaseProvisioner):
                     "by this Hermes instance; refusing to reuse it."
                 )
 
-        self.wait_pod_ready(pod_name)
-        return PodRef(self.namespace, pod_name, WORKSPACE_CONTAINER_NAME)
+        pod = self.wait_pod_ready(pod_name)
+        return PodRef(self.namespace, pod_name, self.pick_container(pod))
 
     def destroy(self, pod_ref: PodRef, persistent: bool) -> None:
         self._delete_pod(pod_ref.namespace, pod_ref.pod_name)
@@ -890,16 +1169,18 @@ class SandboxProvisioner(_BaseProvisioner):
                 image=image,
                 resources=resources,
                 pvc_name=self.pvc_name(task_id),
+                owned=self._owner_reference is not None,
             )
         if self.ttl_seconds:
             spec["ttlSeconds"] = int(self.ttl_seconds)
         if self.spec_overrides:
-            spec = _deep_merge(spec, self.spec_overrides)
+            spec = strategic_merge(spec, self.spec_overrides)
 
         metadata: dict[str, Any] = {
             "name": self.workspace_name(task_id),
             "namespace": self.namespace,
-            "labels": {**MANAGED_BY_LABEL, **(self.kcfg.get("labels") or {})},
+            # MANAGED_BY_LABEL last: user labels must not be able to strip it.
+            "labels": {**(self.kcfg.get("labels") or {}), **MANAGED_BY_LABEL},
         }
         if self._owner_reference is not None:
             metadata["ownerReferences"] = [dict(self._owner_reference)]
@@ -913,7 +1194,7 @@ class SandboxProvisioner(_BaseProvisioner):
     def claim_manifest(self, task_id: str) -> dict:
         spec: dict[str, Any] = {"sandboxTemplateRef": {"name": self.template_ref}}
         if self.spec_overrides:
-            spec = _deep_merge(spec, self.spec_overrides)
+            spec = strategic_merge(spec, self.spec_overrides)
         metadata: dict[str, Any] = {
             "name": self.workspace_name(task_id),
             "namespace": self.namespace,
@@ -935,7 +1216,8 @@ class SandboxProvisioner(_BaseProvisioner):
             plural=plural, name=name,
         )
 
-    def _create_object(self, group: str, plural: str, body: dict) -> None:
+    def _create_object(self, group: str, plural: str, body: dict) -> bool:
+        """Create the CR. Returns True when it already existed (409)."""
         from kubernetes.client.exceptions import ApiException
 
         try:
@@ -952,7 +1234,37 @@ class SandboxProvisioner(_BaseProvisioner):
                 ) from exc
             if exc.status != 409:
                 raise
-            # Already exists — resume it.
+            # Already exists — the caller must prove it is ours before reuse.
+            return True
+        return False
+
+    def _assert_ours(self, group: str, plural: str, name: str) -> None:
+        """Refuse to adopt a pre-existing CR this agent did not create.
+
+        Adoption is not free: ``KubernetesEnvironment.__init__`` immediately
+        uploads the agent's credential files into whatever pod the CR points
+        at, and ``destroy()`` later deletes it.
+        """
+        if self._owner_reference is None:
+            # Out-of-cluster dev: no agent identity to compare against, so the
+            # instance discriminator in the name is the only guard there is.
+            return
+        try:
+            existing = self._get_object(group, plural, name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{plural[:-1]} {name} already exists but could not be read "
+                f"({exc}); refusing to reuse it."
+            ) from exc
+        owners = _dig_dict(existing, "metadata").get("ownerReferences") or []
+        our_uid = self._owner_reference.get("uid")
+        if not any(
+            isinstance(o, dict) and o.get("uid") == our_uid for o in owners
+        ):
+            raise RuntimeError(
+                f"{plural[:-1]} {name} already exists and was not created by "
+                "this Hermes instance; refusing to reuse it."
+            )
 
     @staticmethod
     def _dig(obj: Any, *path: str) -> Any:
@@ -962,12 +1274,11 @@ class SandboxProvisioner(_BaseProvisioner):
             obj = obj.get(key)
         return obj
 
-    def _resolve_pod_name(self, sandbox: dict, sandbox_name: str) -> Optional[str]:
-        """Find the pod agent-sandbox-operator reconciled for this Sandbox.
+    def _pod_name_from_status(self, sandbox: dict) -> Optional[str]:
+        """Read the reconciled pod name straight out of the CR status.
 
-        Status field names differ across operator releases, so probe the known
-        shapes, then fall back to a label lookup, then to the convention that
-        the pod is named after the Sandbox.
+        Pure dict digs, no API calls: this runs on every poll iteration of
+        ``_wait_sandbox``.
         """
         status = sandbox.get("status") or {}
         for path in (("podRef", "name"), ("podName",), ("pod", "name"),
@@ -975,6 +1286,20 @@ class SandboxProvisioner(_BaseProvisioner):
             value = self._dig(status, *path)
             if isinstance(value, str) and value:
                 return value
+        return None
+
+    def _resolve_pod_name(self, sandbox: dict, sandbox_name: str) -> Optional[str]:
+        """Find the pod agent-sandbox-operator reconciled for this Sandbox.
+
+        Status field names differ across operator releases, so probe the known
+        shapes, then fall back to a label lookup, then to the convention that
+        the pod is named after the Sandbox.  Called ONCE, after readiness: the
+        label fallback issues three LISTs, and running it on every 0.5s poll
+        meant up to 720 LISTs per session provisioning.
+        """
+        from_status = self._pod_name_from_status(sandbox)
+        if from_status:
+            return from_status
 
         if self._api is not None:
             for selector in (
@@ -1011,7 +1336,8 @@ class SandboxProvisioner(_BaseProvisioner):
                         )
             # Some operator versions surface the pod before the condition
             # flips; that's good enough because we still gate on pod Ready.
-            if plural == "sandboxes" and self._resolve_pod_name(last, name) != name:
+            # Status-only (no LIST): this runs every 0.5s.
+            if plural == "sandboxes" and self._pod_name_from_status(last):
                 return last
             time.sleep(0.5)
         raise TimeoutError(
@@ -1028,8 +1354,10 @@ class SandboxProvisioner(_BaseProvisioner):
             self._ensure_pvc(task_id, resources)
 
         if self.use_claim:
-            self._create_object(self.CLAIM_GROUP, "sandboxclaims",
-                                self.claim_manifest(task_id))
+            existed = self._create_object(self.CLAIM_GROUP, "sandboxclaims",
+                                          self.claim_manifest(task_id))
+            if existed:
+                self._assert_ours(self.CLAIM_GROUP, "sandboxclaims", name)
             self._created_names.add(name)
             claim = self._wait_sandbox("sandboxclaims", name, self.CLAIM_GROUP)
             sandbox_name = (
@@ -1044,17 +1372,44 @@ class SandboxProvisioner(_BaseProvisioner):
                     "the operator's actual status shape."
                 )
         else:
-            self._create_object(
+            existed = self._create_object(
                 self.group, "sandboxes",
                 self.sandbox_manifest(task_id, persistent, image, resources),
             )
+            if existed:
+                self._assert_ours(self.group, "sandboxes", name)
             self._created_names.add(name)
             sandbox_name = name
 
         sandbox = self._wait_sandbox("sandboxes", sandbox_name, self.group)
         pod_name = self._resolve_pod_name(sandbox, sandbox_name)
-        self.wait_pod_ready(pod_name)
-        return PodRef(self.namespace, pod_name, WORKSPACE_CONTAINER_NAME)
+        pod = self.wait_pod_ready(pod_name)
+        self._assert_pod_belongs(pod, pod_name, sandbox, sandbox_name)
+        # The pod was built by the operator (SandboxTemplate/warm pool) or by
+        # us (podTemplate), so the container name must come from the pod.
+        return PodRef(self.namespace, pod_name, self.pick_container(pod))
+
+    def _assert_pod_belongs(self, pod, pod_name: str, sandbox: dict,
+                            sandbox_name: str) -> None:
+        """Refuse to exec into a pod that something else owns.
+
+        Only ``status.podRef`` is authoritative; the label lookup and the
+        name convention are guesses.  If the pod declares owners and none of
+        them is our Sandbox we resolved the wrong pod — and the very next
+        thing that happens is a credential-file upload into it.
+        """
+        sandbox_uid = _dig_dict(sandbox, "metadata").get("uid")
+        owners = getattr(
+            getattr(pod, "metadata", None), "owner_references", None
+        ) or []
+        if not sandbox_uid or not owners:
+            return
+        if any(getattr(o, "uid", None) == sandbox_uid for o in owners):
+            return
+        raise RuntimeError(
+            f"pod {pod_name} is not owned by sandbox {sandbox_name} "
+            f"(uid {sandbox_uid}); refusing to exec into it."
+        )
 
     def destroy(self, pod_ref: PodRef, persistent: bool) -> None:
         from kubernetes.client.exceptions import ApiException
@@ -1164,15 +1519,21 @@ class KubernetesEnvironment(BaseEnvironment):
             pass
 
     def _ensure_pod(self) -> PodRef:
-        """Re-provision after an interrupt tore the ephemeral pod down.
+        """Re-provision after the session pod went away.
 
-        Without this a single timeout bricks the session: ``cancel()`` deletes
-        the pod, every later exec 404s, and the agent sees empty output with
+        ``cancel()`` no longer destroys the pod, so this is now reached only
+        when the pod genuinely disappeared (activeDeadlineSeconds, an operator
+        TTL, an eviction).  Without it a single vanished pod bricks the
+        session: every later exec 404s and the agent sees empty output with
         rc=1 until the idle reaper evicts the environment.
         """
         with self._lock:
             if self._pod_ref is not None:
                 return self._pod_ref
+        logger.warning(
+            "k8s: session pod for task %s is gone; provisioning a new one — "
+            "an ephemeral workspace starts empty again.", self._task_id,
+        )
         pod_ref = self._provisioner.ensure(
             task_id=self._task_id,
             persistent=self._persistent,
@@ -1204,26 +1565,65 @@ class KubernetesEnvironment(BaseEnvironment):
                 logger.debug("k8s: file sync skipped: %s", exc)
 
     # -- raw exec -------------------------------------------------------
+    def _exec_client(self):
+        """Build a CoreV1Api on a PRIVATE ApiClient, for exactly one exec.
+
+        ``kubernetes.stream.stream()`` does not wrap the client: it
+        MONKEYPATCHES ``api_client.request`` with a websocket implementation
+        and restores it in a ``finally``.  That is not reentrant.  Two
+        overlapping execs on one ApiClient interleave the save/restore and the
+        second restore installs the websocket partial *permanently* — after
+        which every REST call the provisioner makes (create/read/delete pod)
+        tries to open a websocket against a plain HTTPS URL.
+
+        Concurrency is the normal case here: the gateway, TUI and desktop all
+        collapse the terminal to one "default" environment, ACP runs each
+        session in its own thread, and the idle reaper calls ``cleanup()``
+        from a background thread while an exec may be in flight.  So exec
+        never touches the shared client — it gets its own, whose only job is
+        to build the request.
+        """
+        from kubernetes.client import ApiClient, CoreV1Api
+
+        configuration = getattr(
+            getattr(self._exec_api, "api_client", None), "configuration", None
+        )
+        try:
+            api_client = (
+                ApiClient(configuration) if configuration is not None else ApiClient()
+            )
+        except Exception:
+            # Never fall back to the SHARED client: that is the bug.
+            api_client = ApiClient()
+        return CoreV1Api(api_client), api_client
+
     def _open_stream(self, command: list[str], *, stdin: bool = False):
-        from kubernetes.client import CoreV1Api
         from kubernetes.stream import stream as k8s_stream
 
         ref = self._pod_ref
         if ref is None:
             raise RuntimeError("kubernetes session pod is not provisioned")
-        api = self._exec_api or CoreV1Api()
-        return k8s_stream(
-            api.connect_get_namespaced_pod_exec,
-            ref.pod_name,
-            ref.namespace,
-            container=ref.container,
-            command=command,
-            stderr=True,
-            stdin=stdin,
-            stdout=True,
-            tty=False,
-            _preload_content=False,
-        )
+        api, api_client = self._exec_client()
+        try:
+            return k8s_stream(
+                api.connect_get_namespaced_pod_exec,
+                ref.pod_name,
+                ref.namespace,
+                container=ref.container,
+                command=command,
+                stderr=True,
+                stdin=stdin,
+                stdout=True,
+                tty=False,
+                _preload_content=False,
+            )
+        finally:
+            # The returned WSClient owns its own websocket; the ApiClient was
+            # only needed to build the request, so it can go immediately.
+            try:
+                api_client.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _drain(resp, chunks: list[str]) -> None:
@@ -1234,27 +1634,43 @@ class KubernetesEnvironment(BaseEnvironment):
 
     @staticmethod
     def _safe_returncode(resp) -> "int | None":
-        """Read ``WSClient.returncode`` without letting it explode.
+        """Read ``WSClient.returncode``, or None when it is UNKNOWN.
 
         ``returncode`` parses the exec error channel with ``yaml.safe_load``
-        and then subscripts the result. On an abnormal disconnect (the pod
-        being deleted mid-exec — i.e. our own cancel path) that channel is
-        empty, ``safe_load("")`` returns None, and the property raises
-        ``TypeError``. Left unguarded that discards every byte of output the
-        command already produced.
+        and subscripts the result.  On an abnormal disconnect that channel is
+        empty, ``safe_load("")`` returns None and the property raises
+        ``TypeError``; while the stream is still open it returns None by
+        design.  Both mean "we do not know", which is NOT the same as success
+        — every caller must treat None as a failure, or a timed-out upload
+        gets recorded as a completed one.
         """
         try:
-            return resp.returncode
+            rc = resp.returncode
         except Exception:
             return None
+        return rc if isinstance(rc, int) else None
 
-    def _exec_capture(self, command: list[str], *, timeout: int = 60) -> tuple[str, int]:
-        """Blocking exec helper used by the file-sync transport."""
+    def _exec_capture(
+        self, command: list[str], *, timeout: int = 60
+    ) -> "tuple[str, int | None]":
+        """Blocking exec helper used by the file-sync transport.
+
+        Returns ``(output, returncode)`` where a returncode of ``None`` means
+        the exit status could not be determined.  Raises ``TimeoutError`` when
+        the deadline expires with the stream still open, rather than reading a
+        returncode that is None-because-still-running and calling it success.
+        """
         resp = self._open_stream(command)
         chunks: list[str] = []
         deadline = time.monotonic() + max(1, timeout)
+        timed_out = False
         try:
-            while resp.is_open() and time.monotonic() < deadline:
+            while True:
+                if not resp.is_open():
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
                 resp.update(timeout=1)
                 self._drain(resp, chunks)
             self._drain(resp, chunks)
@@ -1263,8 +1679,25 @@ class KubernetesEnvironment(BaseEnvironment):
                 resp.close()
             except Exception:
                 pass
-        rc = self._safe_returncode(resp)
-        return "".join(chunks), (rc if rc is not None else 0)
+        if timed_out:
+            raise TimeoutError(
+                f"kubernetes exec did not finish within {timeout}s: "
+                f"{' '.join(command[:2])}"
+            )
+        return "".join(chunks), self._safe_returncode(resp)
+
+    def _forget_pod_if_gone(self, exc: Exception) -> None:
+        """Drop the pod ref when the API server says the pod is gone.
+
+        activeDeadlineSeconds, an operator TTL or a node eviction can delete
+        the session pod underneath us; clearing the ref makes the next command
+        re-provision instead of 404-ing forever.
+        """
+        if getattr(exc, "status", None) != 404 and "not found" not in str(exc).lower():
+            return
+        with self._lock:
+            self._pod_ref = None
+        self._snapshot_ready = False
 
     def _run_bash(
         self, cmd_string: str, *, login: bool = False, timeout: int = 120,
@@ -1272,16 +1705,33 @@ class KubernetesEnvironment(BaseEnvironment):
     ):
         shell = "bash -l -c" if login else "bash -c"
         command = [*shell.split(), cmd_string]
+        # stdin_data is always None here: _stdin_mode = "heredoc" makes the
+        # base class fold it into cmd_string before calling us.  The deadline
+        # is a backstop under _wait_for_process's own timeout, so a wedged
+        # websocket cannot pin the worker thread forever.
+        deadline = time.monotonic() + max(1, int(timeout or 0)) + _EXEC_GRACE_SECONDS
+        # Reset BEFORE the worker thread starts: doing it inside exec_fn (after
+        # _open_stream returned) erased a kill() that landed while the stream
+        # was still opening.
+        with self._lock:
+            self._cancelled = False
 
         def exec_fn() -> tuple[str, int]:
             chunks: list[str] = []
             resp = None
+            timed_out = False
             try:
                 resp = self._open_stream(command)
                 with self._lock:
                     self._active_stream = resp
-                    self._cancelled = False
+                    already_cancelled = self._cancelled
+                if already_cancelled:
+                    # kill() landed while the stream was opening.
+                    return "", 130
                 while resp.is_open():
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
                     resp.update(timeout=1)
                     self._drain(resp, chunks)
                 # Drain any tail buffered by the final update().
@@ -1295,6 +1745,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 if not cancelled:
                     logger.warning("k8s: exec stream error: %s", exc)
                     chunks.append(f"\n[kubernetes exec error: {exc}]")
+                    self._forget_pod_if_gone(exc)
                 return "".join(chunks), (130 if cancelled else 1)
             finally:
                 with self._lock:
@@ -1308,34 +1759,34 @@ class KubernetesEnvironment(BaseEnvironment):
                 cancelled = self._cancelled
             if cancelled:
                 return "".join(chunks), 130
+            if timed_out:
+                chunks.append(f"\n[kubernetes: exec exceeded {timeout}s]")
+                return "".join(chunks), 124
             rc = self._safe_returncode(resp)
-            return "".join(chunks), (rc if rc is not None else 0)
+            if rc is None:
+                # Unknown != success. Reporting 0 here told the model a failed
+                # or half-killed command had succeeded.
+                chunks.append("\n[kubernetes: exec status unavailable]")
+                return "".join(chunks), 1
+            return "".join(chunks), rc
 
         def cancel() -> None:
             with self._lock:
                 self._cancelled = True
                 stream = self._active_stream
-            # Close the websocket first so the exec'd process is signalled and
-            # the worker thread can exit. The PR left persistent sessions with
-            # a no-op cancel, leaking a thread + websocket + pipe fd for the
-            # full duration of the runaway command.
+            # Closing the websocket is the whole interrupt: the kubelet
+            # terminates the exec'd process when the stream goes away.
+            #
+            # The pod is deliberately NOT destroyed here. _wait_for_process
+            # calls _kill_process() on an ORDINARY TIMEOUT as well as on a
+            # user interrupt (base.py), so tearing the pod down wiped
+            # /workspace — every file the agent had just written — whenever a
+            # command ran past its timeout, with no notice to the agent.
             if stream is not None:
                 try:
                     stream.close()
                 except Exception:
                     pass
-            if not self._persistent:
-                # Ephemeral: tearing the pod down is the cleanest interrupt.
-                # _ensure_pod() re-provisions on the next command.
-                ref = self._pod_ref
-                if ref is not None:
-                    try:
-                        self._provisioner.destroy(ref, persistent=False)
-                    except Exception:
-                        pass
-                with self._lock:
-                    self._pod_ref = None
-                self._snapshot_ready = False
 
         return _ThreadedProcessHandle(exec_fn, cancel_fn=cancel)
 
@@ -1348,10 +1799,8 @@ class KubernetesEnvironment(BaseEnvironment):
     def _bulk_upload(self, files: list[tuple[str, str]]) -> None:
         """Push many files into the pod in one shot.
 
-        Preferred path streams a base64 tar over the exec stdin channel and
-        half-closes it (``v5.channel.k8s.io``) so the remote ``tar`` sees EOF.
-        Clusters that negotiate an older subprotocol have no half-close, so we
-        fall back to appending bounded base64 chunks with ordinary execs.
+        The payload travels over the exec STDIN channel, never over argv —
+        see :meth:`_stdin_upload`.
         """
         if not files:
             return
@@ -1368,79 +1817,85 @@ class KubernetesEnvironment(BaseEnvironment):
 
         dirs = unique_parent_dirs(files)
         if dirs:
-            self._exec_capture(["sh", "-c", quoted_mkdir_command(dirs)])
+            out, rc = self._exec_capture(["sh", "-c", quoted_mkdir_command(dirs)])
+            if rc != 0:
+                raise RuntimeError(
+                    "kubernetes file sync: could not create target directories "
+                    f"(exit {rc if rc is not None else 'unknown'}): {out.strip()}"
+                )
 
-        encoded = base64.b64encode(payload).decode("ascii")
-        if self._stdin_upload(encoded):
-            return
-        self._upload_tar_base64(encoded)
+        # encodebytes() wraps at 76 columns, which keeps the remote `sed`
+        # working on short lines instead of one multi-MB line.
+        self._stdin_upload(base64.encodebytes(payload).decode("ascii"))
 
-    def _stdin_upload(self, encoded: str) -> bool:
-        """Try the stdin half-close path. Returns False when unavailable."""
+    def _stdin_upload(self, encoded: str, *, timeout: int = 120) -> None:
+        """Stream a base64 tar into the pod over the exec STDIN channel.
+
+        NEVER over argv.  ``kubernetes/stream/ws_client.py`` appends every
+        ``command`` element to the exec request URL as a repeated ``?command=``
+        parameter, and kube-apiserver records ``requestURI`` in the audit log
+        at Metadata level and above (OpenShift's default policy included).
+        ``iter_sync_files()`` starts with ``get_credential_file_mounts()``, so
+        an argv transport writes the agent's credential files into the cluster
+        audit log and everything downstream of it.  The previous chunked-argv
+        fallback did exactly that; it is gone, and a sync that cannot use
+        stdin now fails loudly instead of silently downgrading.
+
+        The remote reader terminates on a sentinel line rather than on EOF, so
+        this works on clusters that negotiate a pre-v5 subprotocol (no stdin
+        half-close).  When ``v5.channel.k8s.io`` IS available the channel is
+        half-closed as well, so a remote without ``sed`` still sees EOF.
+        """
+        from kubernetes.stream.ws_client import STDIN_CHANNEL, V5_CHANNEL_PROTOCOL
+
+        remote = (
+            f"sed -n '/^{_SYNC_SENTINEL}$/q;p' | base64 -d | tar xf - -C /"
+        )
+        resp = self._open_stream(["sh", "-c", remote], stdin=True)
+        chunks: list[str] = []
+        timed_out = False
         try:
-            from kubernetes.stream.ws_client import (
-                STDIN_CHANNEL,
-                V5_CHANNEL_PROTOCOL,
-            )
-        except Exception:
-            return False
+            if not encoded.endswith("\n"):
+                encoded += "\n"
+            for offset in range(0, len(encoded), _STDIN_CHUNK_BYTES):
+                resp.write_stdin(encoded[offset:offset + _STDIN_CHUNK_BYTES])
+            resp.write_stdin(f"{_SYNC_SENTINEL}\n")
+            if getattr(resp, "subprotocol", None) == V5_CHANNEL_PROTOCOL:
+                try:
+                    resp.close_channel(STDIN_CHANNEL)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug("k8s: stdin half-close unavailable: %s", exc)
 
-        resp = None
-        try:
-            resp = self._open_stream(
-                ["sh", "-c", "base64 -d | tar xf - -C /"], stdin=True
-            )
-            if getattr(resp, "subprotocol", None) != V5_CHANNEL_PROTOCOL:
-                # No half-close: `tar` would block on stdin forever.
-                return False
-            for offset in range(0, len(encoded), 64 * 1024):
-                resp.write_stdin(encoded[offset:offset + 64 * 1024])
-            resp.close_channel(STDIN_CHANNEL)
-            deadline = time.monotonic() + 120
-            chunks: list[str] = []
-            while resp.is_open() and time.monotonic() < deadline:
+            deadline = time.monotonic() + max(1, timeout)
+            while True:
+                if not resp.is_open():
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
                 resp.update(timeout=1)
                 self._drain(resp, chunks)
             self._drain(resp, chunks)
-            rc = self._safe_returncode(resp)
-            if rc not in (0, None):
-                raise RuntimeError(
-                    f"kubernetes file sync: tar extract failed: {''.join(chunks).strip()}"
-                )
-            return True
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            logger.debug("k8s: stdin file upload unavailable (%s)", exc)
-            return False
         finally:
-            if resp is not None:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
+            try:
+                resp.close()
+            except Exception:
+                pass
 
-    def _upload_tar_base64(self, encoded: str) -> None:
-        """Ship a base64 tar to the pod in bounded chunks, then extract."""
-        remote_tmp = f"/tmp/.hermes-sync.{os.getpid()}.b64"
-        self._exec_capture(["sh", "-c", f"rm -f {shlex.quote(remote_tmp)}"])
-        chunk = 48 * 1024  # keeps each exec URL well under API-server limits
-        for offset in range(0, len(encoded), chunk):
-            piece = encoded[offset:offset + chunk]
-            _, rc = self._exec_capture(
-                ["sh", "-c", f"printf %s {shlex.quote(piece)} >> {shlex.quote(remote_tmp)}"],
-                timeout=60,
+        if timed_out:
+            raise TimeoutError(
+                f"kubernetes file sync: tar extract did not finish within "
+                f"{timeout}s ({''.join(chunks).strip()})"
             )
-            if rc != 0:
-                raise RuntimeError("kubernetes file sync: chunk upload failed")
-        out, rc = self._exec_capture(
-            ["sh", "-c",
-             f"base64 -d {shlex.quote(remote_tmp)} | tar xf - -C / && "
-             f"rm -f {shlex.quote(remote_tmp)}"],
-            timeout=120,
-        )
+        rc = self._safe_returncode(resp)
         if rc != 0:
-            raise RuntimeError(f"kubernetes file sync: extract failed: {out.strip()}")
+            # rc None (unknown) lands here too, on purpose: FileSyncManager
+            # commits its synced-file state whenever this returns without
+            # raising, so "we do not know" must never look like success.
+            raise RuntimeError(
+                "kubernetes file sync: tar extract failed (exit "
+                f"{rc if rc is not None else 'unknown'}): {''.join(chunks).strip()}"
+            )
 
     def _upload_file(self, host_path: str, remote_path: str) -> None:
         self._bulk_upload([(host_path, remote_path)])
@@ -1448,7 +1903,12 @@ class KubernetesEnvironment(BaseEnvironment):
     def _delete_files(self, remote_paths: list[str]) -> None:
         if not remote_paths:
             return
-        self._exec_capture(["sh", "-c", quoted_rm_command(remote_paths)])
+        out, rc = self._exec_capture(["sh", "-c", quoted_rm_command(remote_paths)])
+        if rc != 0:
+            raise RuntimeError(
+                "kubernetes file sync: delete failed (exit "
+                f"{rc if rc is not None else 'unknown'}): {out.strip()}"
+            )
 
     # -- teardown -------------------------------------------------------
     def cleanup(self):
@@ -1473,6 +1933,9 @@ __all__ = [
     "SandboxProvisioner",
     "KubernetesEnvironment",
     "build_pod_template",
+    "container_name",
+    "strategic_merge",
+    "unhardened_reasons",
     "merge_kubernetes_config",
     "validate_kubernetes_config",
     "load_kubernetes_apis",

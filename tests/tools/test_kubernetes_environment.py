@@ -9,8 +9,13 @@ No cluster required: the kubernetes client is stubbed into ``sys.modules`` and
 manifest builders run with ``api=None``.
 """
 
+import base64
+import io
 import json
+import time
 import sys
+import tarfile
+import threading
 import types as _types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -30,6 +35,10 @@ from tools.environments.kubernetes import (
     sanitize_name,
     validate_kubernetes_config,
 )
+
+# strategic_merge / unhardened_reasons are imported inside the tests that use
+# them so this module still imports against a build that lacks them (which is
+# how the regression tests below are demonstrated to fail pre-fix).
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +61,26 @@ def _stub_kubernetes(monkeypatch):
 
     exc_mod.ApiException = ApiException
     k.client.exceptions = exc_mod
-    k.client.CoreV1Api = MagicMock
+
+    # Every exec builds its OWN ApiClient: kubernetes.stream.stream()
+    # monkeypatches api_client.request, so sharing one corrupts it under
+    # concurrency.  These are real (tiny) classes rather than MagicMock so
+    # CoreV1Api(api_client) does not read as MagicMock(spec=...).
+    class _StubApiClient:
+        def __init__(self, configuration=None):
+            self.configuration = configuration
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    def _stub_core_v1_api(api_client=None, **kwargs):
+        api = MagicMock()
+        api.api_client = api_client if api_client is not None else _StubApiClient()
+        return api
+
+    k.client.ApiClient = _StubApiClient
+    k.client.CoreV1Api = _stub_core_v1_api
     k.client.CustomObjectsApi = MagicMock
     k.config.load_incluster_config = lambda: None
     k.config.load_kube_config = lambda **kw: None
@@ -208,8 +236,30 @@ def test_pvc_manifest_has_no_ownerref():
     pvc = _provisioner().pvc_manifest("mytask", resources=Resources(disk_mib=10240))
     assert pvc["metadata"]["name"] == "hermes-ws-mytask"
     assert "ownerReferences" not in pvc["metadata"]
-    assert pvc["spec"]["resources"]["requests"]["storage"] == "10240Mi"
+    # Conservative explicit default rather than 50Gi derived from container_disk.
+    assert pvc["spec"]["resources"]["requests"]["storage"] == "10Gi"
     assert "storageClassName" not in pvc["spec"]
+    # Nothing else reaps these claims, so a reaper needs a selector.
+    assert pvc["metadata"]["labels"]["hermes.nousresearch.com/task"] == "mytask"
+
+
+def test_pvc_size_still_falls_back_to_container_disk_when_cleared():
+    pvc = _provisioner(volume={"size": ""}).pvc_manifest(
+        "mytask", resources=Resources(disk_mib=10240)
+    )
+    assert pvc["spec"]["resources"]["requests"]["storage"] == "10240Mi"
+
+
+def test_pvc_name_can_be_pinned_so_instances_do_not_share_a_workspace():
+    """pvc_name() is task-scoped but not instance-scoped, so two agents in one
+    namespace collide on hermes-ws-default (RWO: the second pod stays
+    Pending). volume.claim_name is the escape hatch."""
+    default = _provisioner().pvc_name("default")
+    pinned = _provisioner(volume={"claim_name": "hermes-ws-agent-a"}).pvc_name(
+        "default"
+    )
+    assert default == "hermes-ws-default"
+    assert pinned == "hermes-ws-agent-a"
 
 
 def test_pvc_honours_configured_storage_class_and_size():
@@ -381,11 +431,14 @@ def test_pod_name_is_instance_scoped():
 # ---------------------------------------------------------------------------
 
 
-def _running_pod(labels=None, owners=None):
+def _running_pod(labels=None, owners=None, containers=("workspace",)):
     cond = SimpleNamespace(type="Ready", status="True")
     return SimpleNamespace(
         metadata=SimpleNamespace(
             name="hermes-ws", labels=labels or {}, owner_references=owners or []
+        ),
+        spec=SimpleNamespace(
+            containers=[SimpleNamespace(name=n) for n in containers]
         ),
         status=SimpleNamespace(
             phase="Running", conditions=[cond], container_statuses=[]
@@ -660,13 +713,23 @@ def test_sandbox_claim_requires_bound_sandbox_name():
 class _FakeWSClient:
     """Mimics kubernetes.stream WSClient for one exec call."""
 
-    def __init__(self, stdout="", returncode=0, open_cycles=1, raise_on_update=None):
+    def __init__(self, stdout="", returncode=0, open_cycles=1, raise_on_update=None,
+                 subprotocol="v4.channel.k8s.io", update_sleep=0.0):
+        self._update_sleep = update_sleep
         self._stdout = stdout
         self._returncode = returncode
         self._cycles = open_cycles
         self._raise_on_update = raise_on_update
         self.closed = False
-        self.subprotocol = "v4.channel.k8s.io"
+        self.subprotocol = subprotocol
+        self.stdin_writes: list[str] = []
+        self.channels_closed: list[int] = []
+
+    def write_stdin(self, data):
+        self.stdin_writes.append(data)
+
+    def close_channel(self, channel):
+        self.channels_closed.append(channel)
 
     def is_open(self):
         if self.closed or self._cycles <= 0:
@@ -677,6 +740,8 @@ class _FakeWSClient:
     def update(self, timeout=None):
         if self._raise_on_update:
             raise self._raise_on_update
+        if self._update_sleep:
+            time.sleep(self._update_sleep)
 
     def peek_stdout(self):
         return bool(self._stdout)
@@ -701,7 +766,7 @@ class _FakeWSClient:
         return self._returncode
 
 
-def _make_k8s_env(monkeypatch, exec_results, persistent=False):
+def _make_k8s_env(monkeypatch, exec_results, persistent=False, api=None):
     """exec_results: list of _FakeWSClient factories / tuples per exec call."""
     monkeypatch.setattr("tools.environments.base.is_interrupted", lambda: False)
 
@@ -730,7 +795,8 @@ def _make_k8s_env(monkeypatch, exec_results, persistent=False):
         image="img:1",
         cwd="/workspace",
         timeout=30,
-        sync_files=False,  # file sync is exercised separately
+        api=api,
+        sync_files=False,  # exercised directly below (see the file-sync tests)
     )
     env._exec_calls = calls
     return env
@@ -784,12 +850,19 @@ def test_cleanup_is_idempotent(monkeypatch):
     assert env._provisioner.destroy.call_count == 1
 
 
-def test_ephemeral_cancel_deletes_pod_and_clears_ref(monkeypatch):
-    env = _make_k8s_env(monkeypatch, [("", 0), ("", 0)])
+def test_cancel_does_not_destroy_the_ephemeral_pod(monkeypatch):
+    """_wait_for_process calls _kill_process() on an ORDINARY TIMEOUT as well
+    as on a user interrupt (base.py:1127). Destroying the pod there deleted
+    /workspace — every file the agent had just written — on any command that
+    ran past its timeout, with no notice to the agent. Closing the websocket
+    is enough: the kubelet reaps the exec'd process."""
+    client = _FakeWSClient(open_cycles=10_000)
+    env = _make_k8s_env(monkeypatch, [("", 0), client])
     handle = env._run_bash("sleep 1")
     handle.kill()
-    env._provisioner.destroy.assert_called()
-    assert env._pod_ref is None
+    assert client.closed is True
+    env._provisioner.destroy.assert_not_called()
+    assert env._pod_ref is not None
 
 
 def test_persistent_cancel_closes_stream_without_deleting_pod(monkeypatch):
@@ -804,13 +877,15 @@ def test_persistent_cancel_closes_stream_without_deleting_pod(monkeypatch):
     assert env._pod_ref is not None
 
 
-def test_session_recovers_after_interrupt(monkeypatch):
-    """A single timeout used to brick the session: cancel() deleted the pod but
-    nothing could re-provision, so every later command 404'd with empty output
-    until the idle reaper evicted the environment."""
-    env = _make_k8s_env(monkeypatch, [("", 0), ("", 0), ("", 0), ("back\n", 0)])
-    handle = env._run_bash("sleep 1")
-    handle.kill()
+def test_session_recovers_when_the_pod_disappears(monkeypatch):
+    """activeDeadlineSeconds / an operator TTL / an eviction can delete the pod
+    under us. Without this the session bricks: every later command 404s with
+    empty output until the idle reaper evicts the environment."""
+    from kubernetes.client.exceptions import ApiException
+
+    gone = _FakeWSClient(raise_on_update=ApiException(status=404, reason="Not Found"))
+    env = _make_k8s_env(monkeypatch, [("", 0), gone, ("", 0), ("back\n", 0)])
+    env.execute("ls")
     assert env._pod_ref is None
 
     env._provisioner.ensure.reset_mock()
@@ -818,6 +893,29 @@ def test_session_recovers_after_interrupt(monkeypatch):
     env._provisioner.ensure.assert_called_once()
     assert env._pod_ref is not None
     assert "back" in result["output"]
+
+
+def test_kill_racing_stream_open_is_not_erased(monkeypatch):
+    """exec_fn used to set _cancelled = False AFTER _open_stream returned, so a
+    kill() that landed while the stream was still opening was erased and the
+    command kept running."""
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    opening = threading.Event()
+    release = threading.Event()
+    client = _FakeWSClient(open_cycles=10_000)
+
+    def slow_stream(*args, **kwargs):
+        opening.set()
+        release.wait(5)
+        return client
+
+    monkeypatch.setattr("kubernetes.stream.stream", slow_stream)
+    handle = env._run_bash("sleep 3600")
+    assert opening.wait(5)
+    handle.kill()          # cancel() runs with _active_stream still None
+    release.set()
+    assert handle.wait(timeout=5) == 130
+    assert client.closed is True
 
 
 def test_failed_ensure_does_not_orphan_a_pod(monkeypatch):
@@ -1072,3 +1170,609 @@ def test_kubernetes_is_a_container_backend():
     import tools.terminal_tool as tt
 
     assert "kubernetes" in tt._CONTAINER_BACKENDS
+
+
+# ---------------------------------------------------------------------------
+# Exec client isolation  (CRITICAL: stream() monkeypatches api_client.request)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingApiClient:
+    """ApiClient stand-in that exposes the ``request`` attribute stream() swaps."""
+
+    def __init__(self, configuration=None):
+        self.configuration = configuration
+        self.request = "REST"
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _RecordingCoreV1Api:
+    """Real class (not a Mock) so ``api_method.__self__`` resolves, like the SDK."""
+
+    def __init__(self, api_client=None):
+        self.api_client = api_client if api_client is not None else _RecordingApiClient()
+
+    def connect_get_namespaced_pod_exec(self, *args, **kwargs):  # pragma: no cover
+        raise AssertionError("stream() is stubbed in these tests")
+
+
+def _sdk_like_stream(seen, barrier=None):
+    """Reproduce what kubernetes.stream.stream() actually does.
+
+    It is not a wrapper: it MONKEYPATCHES ``api_client.request`` with a
+    websocket implementation and restores it in a ``finally`` — which is not
+    reentrant.
+    """
+
+    def _stream(api_method, *args, **kwargs):
+        client = api_method.__self__.api_client
+        seen.append(client)
+        previous = client.request
+        client.request = "WEBSOCKET"
+        try:
+            if barrier is not None:
+                barrier.wait(timeout=5)
+            return _FakeWSClient(open_cycles=1)
+        finally:
+            client.request = previous
+
+    return _stream
+
+
+def _use_recording_client(monkeypatch):
+    import kubernetes.client as kclient
+
+    monkeypatch.setattr(kclient, "ApiClient", _RecordingApiClient)
+    monkeypatch.setattr(kclient, "CoreV1Api", _RecordingCoreV1Api)
+
+
+def test_every_exec_gets_its_own_api_client(monkeypatch):
+    """The provisioner's CoreV1Api must never be handed to stream()."""
+    shared = _RecordingCoreV1Api(_RecordingApiClient(configuration="CFG"))
+    env = _make_k8s_env(monkeypatch, [("", 0)], api=shared)
+
+    seen = []
+    _use_recording_client(monkeypatch)
+    monkeypatch.setattr("kubernetes.stream.stream", _sdk_like_stream(seen))
+
+    env._open_stream(["true"]).close()
+    env._open_stream(["true"]).close()
+
+    assert len(seen) == 2
+    assert seen[0] is not seen[1], "each exec needs its own ApiClient"
+    assert all(client is not shared.api_client for client in seen)
+    # ... but the shared client's auth/config still applies.
+    assert all(client.configuration == "CFG" for client in seen)
+    # ... and the throwaway clients are not leaked.
+    assert all(client.closed for client in seen)
+    assert shared.api_client.request == "REST"
+
+
+def test_concurrent_execs_do_not_poison_the_shared_api_client(monkeypatch):
+    """Two overlapping execs on ONE ApiClient interleave stream()'s
+    save/restore, and the second restore installs the websocket partial
+    permanently — after which every provisioner REST call (create/read/delete
+    pod) tries to open a websocket against a plain HTTPS URL. Concurrency is
+    routine here: gateway/TUI/desktop sessions collapse to one environment and
+    the idle reaper calls cleanup() from another thread."""
+    shared = _RecordingCoreV1Api(_RecordingApiClient(configuration="CFG"))
+    env = _make_k8s_env(monkeypatch, [("", 0)], api=shared)
+
+    seen = []
+    barrier = threading.Barrier(2)
+    _use_recording_client(monkeypatch)
+    monkeypatch.setattr("kubernetes.stream.stream", _sdk_like_stream(seen, barrier))
+
+    errors = []
+
+    def _exec():
+        try:
+            env._open_stream(["true"]).close()
+        except Exception as exc:  # pragma: no cover - surfaced by the assert
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_exec) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert shared.api_client.request == "REST", (
+        "the shared ApiClient was permanently poisoned by overlapping execs"
+    )
+    assert len(set(id(client) for client in seen)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Container-name resolution  (template_ref / use_claim / overridden containers)
+# ---------------------------------------------------------------------------
+
+
+def test_container_name_is_configurable_and_reaches_the_manifest():
+    template = build_pod_template(
+        _kcfg(container_name="devbox"), persistent=False, image="img:1",
+        resources=Resources(), pvc_name="pvc",
+    )
+    assert template["spec"]["containers"][0]["name"] == "devbox"
+
+
+def test_direct_ensure_targets_the_configured_container():
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _running_pod(containers=("devbox",))
+    p = _provisioner_with_api(api, container_name="devbox")
+    ref = p.ensure("abc", persistent=False, image="img:1", resources=Resources())
+    assert ref.container == "devbox"
+
+
+def test_sandbox_with_template_ref_execs_into_the_operators_container():
+    """sandbox.template_ref means the operator builds the pod from a
+    SandboxTemplate, so hardcoding "workspace" made every exec fail with
+    `container workspace is not valid for pod ...` — two of the three sandbox
+    modes were dead on arrival."""
+    custom = MagicMock()
+    custom.get_namespaced_custom_object.return_value = {
+        "metadata": {"uid": "sb-uid"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}],
+                   "podRef": {"name": "sandbox-pod-1"}},
+    }
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _running_pod(containers=("agent",))
+
+    p = _sandbox_provisioner(api=api, custom=custom, template_ref="agent-base")
+    ref = p.ensure("abc", persistent=False, image="img:1", resources=Resources())
+
+    assert ref.pod_name == "sandbox-pod-1"
+    assert ref.container == "agent"
+
+
+def test_pick_container_prefers_the_configured_name_when_the_pod_has_it():
+    p = _provisioner_with_api(MagicMock())
+    pod = _running_pod(containers=("istio-proxy", "workspace"))
+    assert p.pick_container(pod) == "workspace"
+
+
+def test_pick_container_falls_back_to_the_configured_name_without_a_spec():
+    p = _provisioner_with_api(MagicMock())
+    assert p.pick_container(SimpleNamespace()) == "workspace"
+
+
+def test_container_name_is_validated_as_an_rfc1123_name():
+    assert any(
+        "container_name" in problem
+        for problem in validate_kubernetes_config(_kcfg(container_name="Not Valid"))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unknown exit status is a failure, not a success
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_exit_status_is_reported_as_failure(monkeypatch):
+    """WSClient.returncode raises (empty error channel) or returns None (stream
+    still open). Both mean "unknown" — reporting 0 told the model a failed or
+    half-killed command had succeeded."""
+    client = _FakeWSClient(stdout="partial output\n",
+                           returncode=TypeError("NoneType not subscriptable"))
+    env = _make_k8s_env(monkeypatch, [("", 0), client])
+    result = env.execute("something")
+    assert "partial output" in result["output"]
+    assert result["returncode"] != 0
+    assert "status unavailable" in result["output"]
+
+
+def test_exec_capture_raises_instead_of_reading_a_running_returncode(monkeypatch):
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    stuck = _FakeWSClient(open_cycles=10_000, returncode=None, update_sleep=0.05)
+    monkeypatch.setattr("kubernetes.stream.stream", lambda *a, **k: stuck)
+    with pytest.raises(TimeoutError):
+        env._exec_capture(["sh", "-c", "sleep 999"], timeout=1)
+
+
+# ---------------------------------------------------------------------------
+# File-sync transport (no payload in exec argv, failures are loud)
+# ---------------------------------------------------------------------------
+
+
+def _recording_sync_stream(commands, clients, returncodes):
+    def _stream(*args, **kwargs):
+        commands.append(list(kwargs.get("command") or ()))
+        index = min(len(clients), len(returncodes) - 1)
+        client = _FakeWSClient(returncode=returncodes[index])
+        clients.append(client)
+        return client
+
+    return _stream
+
+
+def test_bulk_upload_streams_the_payload_over_stdin_never_argv(monkeypatch, tmp_path):
+    """ws_client.get_websocket_url appends every argv element to the exec
+    request URL, and kube-apiserver records requestURI in the audit log at
+    Metadata level and above. iter_sync_files() starts with the agent's
+    credential files, so an argv transport writes them into the cluster audit
+    log. The chunked-argv fallback that did this is gone."""
+    secret = tmp_path / "creds.json"
+    secret.write_bytes(b'{"api_key": "SUPER-SECRET-TOKEN"}' * 400)  # > one argv chunk
+
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    commands, clients = [], []
+    monkeypatch.setattr(
+        "kubernetes.stream.stream", _recording_sync_stream(commands, clients, [0])
+    )
+
+    env._bulk_upload([(str(secret), "/workspace/.hermes/creds.json")])
+
+    argv = " ".join(" ".join(command) for command in commands)
+    assert "SUPER-SECRET-TOKEN" not in argv
+    assert all(
+        len(part) < 1024 for command in commands for part in command
+    ), "the payload must never travel through exec argv (apiserver audit log)"
+
+    written = "".join(clients[-1].stdin_writes)
+    assert written.rstrip().endswith("__HERMES_TAR_EOF__")
+    payload = base64.b64decode(written.split("__HERMES_TAR_EOF__")[0])
+    with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+        member = tar.getmember("workspace/.hermes/creds.json")
+        assert tar.extractfile(member).read() == secret.read_bytes()
+
+
+def test_no_argv_chunking_fallback_remains():
+    assert not hasattr(KubernetesEnvironment, "_upload_tar_base64")
+
+
+def test_stdin_upload_half_closes_when_v5_is_available(monkeypatch):
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    client = _FakeWSClient(returncode=0, subprotocol="v5.channel.k8s.io")
+    monkeypatch.setattr("kubernetes.stream.stream", lambda *a, **k: client)
+    env._stdin_upload("Zm9v\n")
+    assert client.channels_closed == [0]
+
+
+def test_bulk_upload_treats_an_unknown_exit_status_as_failure(monkeypatch, tmp_path):
+    """`if rc not in (0, None)` whitelisted None as success, so a timed-out or
+    abnormally-closed tar extract reported a completed upload."""
+    payload = tmp_path / "a.txt"
+    payload.write_text("x")
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    commands, clients = [], []
+    monkeypatch.setattr(
+        "kubernetes.stream.stream",
+        _recording_sync_stream(commands, clients,
+                               [0, TypeError("empty error channel")]),
+    )
+    with pytest.raises(RuntimeError, match="unknown"):
+        env._bulk_upload([(str(payload), "/workspace/a.txt")])
+
+
+def test_stdin_upload_raises_when_the_deadline_expires(monkeypatch):
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    stuck = _FakeWSClient(open_cycles=10_000, returncode=None, update_sleep=0.05)
+    monkeypatch.setattr("kubernetes.stream.stream", lambda *a, **k: stuck)
+    with pytest.raises(TimeoutError):
+        env._stdin_upload("Zm9v\n", timeout=1)
+
+
+def test_failed_upload_does_not_mark_files_as_synced(monkeypatch, tmp_path):
+    """FileSyncManager commits its state whenever the transport returns without
+    raising. A silent failure therefore marked the credential files as synced
+    and never retried them — the session pod runs without them, with nothing in
+    the logs."""
+    from tools.environments.file_sync import FileSyncManager
+
+    creds = tmp_path / "creds.json"
+    creds.write_text("secret")
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    commands, clients = [], []
+    monkeypatch.setattr(
+        "kubernetes.stream.stream",
+        _recording_sync_stream(commands, clients,
+                               [0, TypeError("empty error channel")]),
+    )
+    manager = FileSyncManager(
+        get_files_fn=lambda: [(str(creds), "/workspace/.hermes/creds.json")],
+        upload_fn=env._upload_file,
+        delete_fn=env._delete_files,
+        bulk_upload_fn=env._bulk_upload,
+    )
+    manager.sync(force=True)
+    assert manager._synced_files == {}, (
+        "a failed upload must not be recorded as synced"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Approval trust: derived from the BUILT pod template
+# ---------------------------------------------------------------------------
+
+
+def _has_host_access(**overrides):
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    return _kubernetes_has_host_access({"kubernetes": _kcfg(**overrides)})
+
+
+def test_default_ephemeral_pod_is_a_throwaway_sandbox():
+    from tools.environments.kubernetes import unhardened_reasons
+
+    assert unhardened_reasons(_kcfg()) == []
+    assert _has_host_access() is False
+
+
+@pytest.mark.parametrize("overrides, expected", [
+    ({"persistent": True}, "persistent"),
+    ({"automount_service_account_token": True}, "automountServiceAccountToken"),
+    ({"security_context": {"run_as_non_root": False}}, "runAsNonRoot"),
+    ({"security_context": {"allow_privilege_escalation": True}},
+     "privilege escalation"),
+    ({"security_context": {"drop_capabilities": ["NET_RAW"]}}, "drop ALL"),
+    ({"pod_template_overrides": {"spec": {"automountServiceAccountToken": True}}},
+     "automountServiceAccountToken"),
+    ({"pod_template_overrides": {"spec": {"serviceAccountName": "cluster-admin-sa"}}},
+     "serviceAccountName"),
+    ({"pod_template_overrides": {"spec": {"hostPID": True}}}, "hostPID"),
+    ({"pod_template_overrides": {"spec": {"volumes": [
+        {"name": "host", "hostPath": {"path": "/"}}]}}}, "host"),
+    ({"pod_template_overrides": {"spec": {"volumes": [
+        {"name": "creds", "secret": {"secretName": "s"}}]}}}, "creds"),
+])
+def test_dehardened_pods_keep_the_dangerous_command_guards(overrides, expected):
+    """The heuristic used to read three config keys, so a de-hardened pod — root,
+    privilege escalation, a mounted token, a privileged SA — silently kept the
+    approval-skip that only a throwaway sandbox earns."""
+    from tools.environments.kubernetes import unhardened_reasons
+
+    reasons = unhardened_reasons(_kcfg(**overrides))
+    assert any(expected in reason for reason in reasons), reasons
+    assert _has_host_access(**overrides) is True
+
+
+def test_approval_layer_keeps_guards_when_host_access_is_true():
+    from tools.approval import _should_skip_container_guards
+
+    assert _should_skip_container_guards("kubernetes", has_host_access=True) is False
+    assert _should_skip_container_guards("kubernetes", has_host_access=False) is True
+
+
+def test_host_access_evaluation_fails_closed(monkeypatch):
+    import tools.environments.kubernetes as k8s_mod
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    def _boom(_kcfg):
+        raise RuntimeError("schema exploded")
+
+    monkeypatch.setattr(k8s_mod, "unhardened_reasons", _boom)
+    assert _kubernetes_has_host_access({"kubernetes": {}}) is True
+
+
+def test_docker_host_access_dispatches_to_the_kubernetes_evaluator():
+    from tools.terminal_tool import _docker_has_host_access
+
+    assert _docker_has_host_access(
+        {"env_type": "kubernetes", "kubernetes": _kcfg(persistent=True)}
+    ) is True
+
+
+# ---------------------------------------------------------------------------
+# Reserved managed-by label
+# ---------------------------------------------------------------------------
+
+
+MANAGED_BY = "app.kubernetes.io/managed-by"
+
+
+def test_user_labels_cannot_strip_the_managed_by_label():
+    """k8s/networkpolicy.yaml, k8s/validatingadmissionpolicy.yaml and pod
+    adoption all select on this label."""
+    template = build_pod_template(
+        _kcfg(labels={MANAGED_BY: "Helm", "team": "hermes"}),
+        persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
+    )
+    assert template["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
+    assert template["metadata"]["labels"]["team"] == "hermes"
+
+
+def test_pod_template_overrides_cannot_strip_the_managed_by_label():
+    template = build_pod_template(
+        _kcfg(pod_template_overrides={"metadata": {"labels": {MANAGED_BY: "Helm"}}}),
+        persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
+    )
+    assert template["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
+
+
+def test_sandbox_manifest_keeps_the_managed_by_label():
+    manifest = _sandbox_provisioner().sandbox_manifest(
+        "abc", persistent=False, image="i:1", resources=Resources()
+    )
+    assert manifest["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
+
+
+def test_validation_rejects_the_reserved_label():
+    problems = validate_kubernetes_config(_kcfg(labels={MANAGED_BY: "Helm"}))
+    assert any("reserved" in problem for problem in problems)
+    problems = validate_kubernetes_config(
+        _kcfg(pod_template_overrides={"metadata": {"labels": {MANAGED_BY: "x"}}})
+    )
+    assert any("reserved" in problem for problem in problems)
+
+
+# ---------------------------------------------------------------------------
+# Adoption requires ownership proof
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_refuses_an_unowned_pod_that_carries_our_label():
+    """`or not owners` accepted any labelled pod with no ownerReferences —
+    which is exactly what another agent's workspace looks like."""
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod.return_value = _running_pod(
+        labels={MANAGED_BY: "hermes-agent"}, owners=[],
+    )
+    p = _provisioner_with_api(api)
+    with pytest.raises(RuntimeError, match="not created by this Hermes instance"):
+        p.ensure("abc", persistent=False, image="img:1", resources=Resources())
+
+
+def test_sandbox_refuses_to_adopt_a_cr_it_did_not_create():
+    from kubernetes.client.exceptions import ApiException
+
+    custom = MagicMock()
+    custom.create_namespaced_custom_object.side_effect = ApiException(status=409)
+    custom.get_namespaced_custom_object.return_value = {
+        "metadata": {"uid": "sb-uid",
+                     "ownerReferences": [{"uid": "somebody-else"}]},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+    p = _sandbox_provisioner(api=MagicMock(), custom=custom)
+    with pytest.raises(RuntimeError, match="not created by this Hermes instance"):
+        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+
+
+def test_sandbox_resumes_its_own_cr_on_conflict():
+    from kubernetes.client.exceptions import ApiException
+
+    custom = MagicMock()
+    custom.create_namespaced_custom_object.side_effect = ApiException(status=409)
+    custom.get_namespaced_custom_object.return_value = {
+        "metadata": {"uid": "sb-uid", "ownerReferences": [{"uid": OWNER_REF["uid"]}]},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}],
+                   "podRef": {"name": "sandbox-pod-1"}},
+    }
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _running_pod()
+    p = _sandbox_provisioner(api=api, custom=custom)
+    ref = p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+    assert ref.pod_name == "sandbox-pod-1"
+
+
+def test_sandbox_refuses_a_pod_owned_by_a_different_sandbox():
+    custom = MagicMock()
+    custom.get_namespaced_custom_object.return_value = {
+        "metadata": {"uid": "sb-uid"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}],
+                   "podRef": {"name": "someone-elses-pod"}},
+    }
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _running_pod(
+        owners=[SimpleNamespace(uid="another-sandbox")]
+    )
+    p = _sandbox_provisioner(api=api, custom=custom)
+    with pytest.raises(RuntimeError, match="not owned by sandbox"):
+        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+
+
+# ---------------------------------------------------------------------------
+# pod_template_overrides really is a strategic merge
+# ---------------------------------------------------------------------------
+
+
+def test_pod_template_overrides_merge_containers_by_name():
+    """Documented in four places as a strategic-merge patch. A plain deep merge
+    replaced spec.containers wholesale, dropping image/command/volumeMounts/
+    securityContext — the pod then never becomes Ready."""
+    template = build_pod_template(
+        _kcfg(pod_template_overrides={"spec": {"containers": [
+            {"name": "workspace", "env": [{"name": "A", "value": "1"}]}
+        ]}}),
+        persistent=False, image="img:1", resources=Resources(), pvc_name="pvc",
+    )
+    container = template["spec"]["containers"][0]
+    assert container["image"] == "img:1"
+    assert container["command"] == ["sleep", "infinity"]
+    assert container["volumeMounts"]
+    assert container["securityContext"]["allowPrivilegeEscalation"] is False
+    assert {"name": "A", "value": "1"} in container["env"]
+
+
+def test_strategic_merge_appends_unmatched_named_entries_and_replaces_plain_lists():
+    from tools.environments.kubernetes import strategic_merge
+
+    merged = strategic_merge(
+        {"volumes": [{"name": "workspace", "emptyDir": {}}], "args": ["a", "b"]},
+        {"volumes": [{"name": "extra", "emptyDir": {}}], "args": ["c"]},
+    )
+    assert [v["name"] for v in merged["volumes"]] == ["workspace", "extra"]
+    assert merged["args"] == ["c"]
+
+
+# ---------------------------------------------------------------------------
+# Misc correctness fixes
+# ---------------------------------------------------------------------------
+
+
+def test_run_as_user_and_fs_group_zero_are_not_silently_dropped():
+    template = build_pod_template(
+        _kcfg(security_context={"run_as_non_root": False, "run_as_user": 0,
+                                "fs_group": 0}),
+        persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
+    )
+    assert template["spec"]["securityContext"]["runAsUser"] == 0
+    assert template["spec"]["securityContext"]["fsGroup"] == 0
+
+
+def test_persistent_pod_without_an_owner_reference_gets_the_deadline_backstop():
+    """A persistent pod with no ownerReference has no reaper at all; its PVC
+    (the durable half) outlives the pod anyway."""
+    owned = DirectProvisioner(_kcfg(), "hermes", api=None, owner_reference=OWNER_REF)
+    orphan = DirectProvisioner(_kcfg(), "hermes", api=None, owner_reference=None)
+    assert "activeDeadlineSeconds" not in owned.pod_manifest(
+        "abc", persistent=True, image="i:1", resources=Resources())["spec"]
+    assert orphan.pod_manifest(
+        "abc", persistent=True, image="i:1", resources=Resources()
+    )["spec"]["activeDeadlineSeconds"] == 14400
+
+
+def test_wait_sandbox_does_not_list_pods_on_every_poll():
+    """The label-selector fallback issues three LISTs; running it per 0.5s poll
+    meant up to 720 LISTs per session provisioning."""
+    custom = MagicMock()
+    custom.get_namespaced_custom_object.side_effect = [
+        {"metadata": {"uid": "sb"}, "status": {"conditions": []}},
+        {"metadata": {"uid": "sb"}, "status": {"conditions": []}},
+        {"metadata": {"uid": "sb"},
+         "status": {"conditions": [{"type": "Ready", "status": "True"}],
+                    "podRef": {"name": "sandbox-pod-1"}}},
+    ]
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _running_pod()
+    p = _sandbox_provisioner(api=api, custom=custom)
+    ref = p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+    assert ref.pod_name == "sandbox-pod-1"
+    api.list_namespaced_pod.assert_not_called()
+
+
+def test_namespace_is_not_resolved_from_an_environment_variable(monkeypatch):
+    """HERMES_POD_NAMESPACE was a redundant third source: in-cluster the kubelet
+    projects the namespace and out-of-cluster the config key covers it."""
+    import tools.environments.kubernetes as k8s_mod
+
+    monkeypatch.setenv("HERMES_POD_NAMESPACE", "from-env")
+    monkeypatch.setattr(k8s_mod, "_SA_NAMESPACE_FILE", "/nonexistent/namespace")
+    with pytest.raises(ValueError):
+        k8s_mod.resolve_namespace(_kcfg())
+    assert k8s_mod.resolve_namespace(_kcfg(namespace="explicit")) == "explicit"
+
+
+def test_kubernetes_blob_is_only_bridged_for_the_kubernetes_backend():
+    """The ~1.2KB JSON payload used to land in the environment of every child
+    process the agent spawns, for every backend."""
+    from hermes_cli.config import apply_terminal_config_to_env
+
+    local_env = apply_terminal_config_to_env(
+        env={}, config={"terminal": {"backend": "local", "kubernetes": {"namespace": "x"}}},
+        override=True,
+    )
+    assert "TERMINAL_KUBERNETES" not in local_env
+
+    k8s_env = apply_terminal_config_to_env(
+        env={},
+        config={"terminal": {"backend": "kubernetes", "kubernetes": {"namespace": "x"}}},
+        override=True,
+    )
+    assert json.loads(k8s_env["TERMINAL_KUBERNETES"])["namespace"] == "x"

@@ -282,14 +282,49 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
         return
     check_ok("kubernetes namespace", f"({namespace})")
 
-    checks = [("", "pods", "create"), ("", "pods/exec", "create")]
-    if str(kcfg.get("provisioner")).lower() == "sandbox":
-        sandbox_group = (kcfg.get("sandbox") or {}).get("api_group", "agents.x-k8s.io")
-        checks.append((sandbox_group, "sandboxes", "create"))
+    # Per-provisioner, because the shipped Roles differ: the sandbox Role
+    # deliberately grants NO pods create/delete (the operator owns the pod
+    # lifecycle), so demanding them there fails a correctly configured
+    # least-privilege deployment.
+    sandbox_mode = str(kcfg.get("provisioner")).lower() == "sandbox"
+    sandbox_cfg = kcfg.get("sandbox") or {}
+    if sandbox_mode:
+        sandbox_group = sandbox_cfg.get("api_group", "agents.x-k8s.io")
+        checks = [
+            (sandbox_group, "sandboxes", "create"),
+            (sandbox_group, "sandboxes", "delete"),
+            ("", "pods", "get"),
+            ("", "pods/exec", "create"),
+        ]
+        if sandbox_cfg.get("use_claim"):
+            checks.append(("extensions." + str(sandbox_group), "sandboxclaims",
+                           "create"))
     else:
-        checks.append(("", "pods", "delete"))
-    if kcfg.get("persistent"):
+        checks = [
+            ("", "pods", "create"),
+            ("", "pods", "delete"),
+            ("", "pods/exec", "create"),
+        ]
+    if kcfg.get("persistent") and not (sandbox_mode and sandbox_cfg.get("template_ref")):
         checks.append(("", "persistentvolumeclaims", "create"))
+
+    try:
+        from tools.environments.kubernetes import unhardened_reasons
+
+        reasons = unhardened_reasons(kcfg)
+    except Exception as exc:  # pragma: no cover - defensive
+        reasons = [f"could not evaluate ({exc})"]
+    if reasons:
+        check_warn(
+            "kubernetes session pod is not a throwaway sandbox",
+            f"({'; '.join(reasons[:3])})",
+        )
+        check_info(
+            "dangerous-command approval guards stay ENABLED for this backend"
+        )
+    else:
+        check_ok("kubernetes session pod hardening",
+                 "(ephemeral, non-root, drop-ALL, no token)")
 
     try:
         from kubernetes import client as k8s_client
@@ -314,6 +349,31 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
                     f"Grant '{verb}' on '{resource}' in {namespace} — see k8s/rbac.yaml",
                     issues,
                 )
+
+        if sandbox_mode:
+            # Least-privilege signal, not a requirement: with the sandbox
+            # provisioner the operator owns pod lifecycle, so the agent's SA
+            # should NOT be able to create pods itself.
+            review = k8s_client.V1SelfSubjectAccessReview(
+                spec=k8s_client.V1SelfSubjectAccessReviewSpec(
+                    resource_attributes=k8s_client.V1ResourceAttributes(
+                        namespace=namespace, group="", resource="pods",
+                        verb="create",
+                    )
+                )
+            )
+            if getattr(
+                auth.create_self_subject_access_review(review).status,
+                "allowed", False,
+            ):
+                check_warn(
+                    "RBAC create pods (allowed)",
+                    "(broader than provisioner: sandbox needs — see "
+                    "k8s/rbac.yaml hermes-session-sandbox)",
+                )
+            else:
+                check_ok("RBAC create pods (denied)",
+                         "(expected for provisioner: sandbox)")
     except Exception as exc:
         check_warn("kubernetes RBAC check skipped", f"({exc})")
 

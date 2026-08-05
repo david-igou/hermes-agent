@@ -1,6 +1,8 @@
 # Kubernetes terminal backend — deployment manifests
 
-Manifests for running Hermes' [`kubernetes` terminal backend](../tools/environments/kubernetes.py) on a real cluster. The backend runs each agent shell command in a **session pod** instead of in the agent's own container, isolating the agent from Hermes' home directory, credential files, and ServiceAccount token.
+Manifests for running Hermes' [`kubernetes` terminal backend](../tools/environments/kubernetes.py) on a real cluster. The backend runs each agent shell command in a **session pod** instead of in the agent's own container, isolating commands from the Hermes process, its ServiceAccount token, and the agent container's filesystem.
+
+> **The session pod is an execution boundary, not a secrets boundary.** Registered credential files and skills ARE synced into it on session start (same as the Modal/Daytona backends), because skills need them. Only the ServiceAccount-token isolation is absolute.
 
 | File | What it is | Why |
 |---|---|---|
@@ -47,18 +49,26 @@ Manual equivalent:
 
 ```bash
 SA=system:serviceaccount:<AGENT_NAMESPACE>:<AGENT_SA>
+# provisioner: direct
 kubectl auth can-i create pods        --as=$SA -n <AGENT_NAMESPACE>   # yes
 kubectl auth can-i create pods/exec   --as=$SA -n <AGENT_NAMESPACE>   # yes
+# provisioner: sandbox — `create pods` must be NO; the operator owns the pod
+kubectl auth can-i create sandboxes.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes
+kubectl auth can-i create pods        --as=$SA -n <AGENT_NAMESPACE>   # no
+kubectl auth can-i get    pods        --as=$SA -n <AGENT_NAMESPACE>   # yes
+# both
 kubectl auth can-i create deployments --as=$SA -n <AGENT_NAMESPACE>   # no
 kubectl auth can-i create secrets     --as=$SA -n <AGENT_NAMESPACE>   # no
 ```
+
+`hermes doctor` runs exactly these checks per provisioner (and flags `create pods` being *allowed* under `provisioner: sandbox` as broader than needed).
 
 ## Agent Deployment requirements
 
 The Hermes pod itself needs:
 
 * the ServiceAccount bound in `rbac.yaml`;
-* the `kubernetes` python client — `pip install 'hermes-agent[kubernetes]'`, or let Hermes lazy-install it on first use.
+* the `kubernetes` python client — `pip install 'hermes-agent[kubernetes]'`. There is **no lazy install** for this backend: `check_terminal_requirements()` gates the whole terminal tool on the client being importable, so the tool stays disabled until it is installed.
 
 **Downward API is optional.** Session pods carry an `ownerReference` to the agent pod, so they are garbage-collected if the agent crashes. Hermes resolves its own pod identity by looking itself up on the pod hostname, which needs no extra env. If you prefer to inject it explicitly, these three are honoured when present (they are runtime identity, not user configuration — do not put them in `.env.example`):
 
@@ -68,9 +78,9 @@ env:
     valueFrom: {fieldRef: {fieldPath: metadata.name}}
   - name: HERMES_POD_UID
     valueFrom: {fieldRef: {fieldPath: metadata.uid}}
-  - name: HERMES_POD_NAMESPACE
-    valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
 ```
+
+(The namespace is never taken from the environment: in-cluster the kubelet already projects it, and out-of-cluster `terminal.kubernetes.namespace` covers it.) When identity cannot be resolved, Hermes logs a WARNING — session pods then carry no `ownerReference` and are not garbage-collected, so a persistent pod also gets the `active_deadline_seconds` backstop in that case.
 
 Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely (out-of-cluster dev, or a topology where the agent is not a pod). Ephemeral session pods are still bounded by `terminal.kubernetes.active_deadline_seconds`.
 
@@ -99,8 +109,11 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
 When enabled, a PVC named `hermes-ws-<task>` is created and **never deleted by Hermes** — it must outlive the agent pod for the workspace to resume, so it carries no `ownerReference`. Persistent workspaces therefore accumulate. Reap them yourself:
 
 ```bash
-kubectl -n <AGENT_NAMESPACE> get pvc -l app.kubernetes.io/managed-by=hermes-agent
+kubectl -n <AGENT_NAMESPACE> get pvc \
+  -l app.kubernetes.io/managed-by=hermes-agent,app.kubernetes.io/component=hermes-workspace
 ```
+
+The claim name is **task-scoped, not instance-scoped**: two Hermes instances in one namespace running the same task id (and `_resolve_container_task_id` collapses nearly every session to `default`) target the same PVC, and with `ReadWriteOnce` the second session pod stays `Pending`. Set `terminal.kubernetes.volume.claim_name` to give an instance its own workspace.
 
 Persistent sessions also keep the dangerous-command approval prompts on (see `tools/approval.py`): `rm -rf /workspace` against a retained PVC destroys durable state, so it is not treated as a throwaway sandbox.
 
@@ -111,3 +124,4 @@ Stated plainly, because the upstream sample overclaimed here:
 * The ValidatingAdmissionPolicy hooks on a label the pod creator chooses. A fully compromised agent could omit it. The containment boundary is the RBAC grant (and SCC on OpenShift), not the policy.
 * `create pods` in a namespace remains a powerful verb. The policy narrows *shape*; it does not make the grant harmless. Run Hermes in a dedicated namespace with nothing else in it.
 * Session pods share the cluster network unless `networkpolicy.yaml` is applied.
+* **Exec requests are recorded in the API-server audit log.** The kubernetes client puts every `command` element of an exec into the request URL, and kube-apiserver records `requestURI` at Metadata level and above. The file-sync transport therefore streams its payload over the exec **stdin** channel and never through argv — but a command the *agent* runs still appears in the audit log verbatim, including anything it pipes in through the heredoc stdin mode. Do not treat the audit log as a place secrets cannot reach.

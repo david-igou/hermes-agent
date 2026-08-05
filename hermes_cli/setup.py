@@ -1608,7 +1608,8 @@ def setup_terminal_backend(config: dict):
             print_warning(
                 "kubernetes client not installed — run: "
                 "pip install 'hermes-agent[kubernetes]' "
-                "(Hermes will also lazy-install it on first use)"
+                "(the terminal tool stays disabled until it is installed; "
+                "there is no lazy install for this backend)"
             )
 
         k8s_cfg = config["terminal"].setdefault("kubernetes", {})

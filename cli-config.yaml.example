@@ -332,8 +332,9 @@ terminal:
 # command is exec'd into that pod.
 # Great for: running Hermes in-cluster with real workload isolation, kata /
 #            sandboxed-containers runtimes, cluster-managed quotas and storage
-# Requires: pip install 'hermes-agent[kubernetes]' (also lazy-installed on first
-#           use) and the RBAC in k8s/rbac.yaml
+# Requires: pip install 'hermes-agent[kubernetes]' (NOT lazy-installed: the
+#           terminal tool stays disabled until the client is importable) and the
+#           RBAC in k8s/rbac.yaml
 #
 # IMPORTANT: every setting for this backend lives HERE, in config.yaml. There
 # are no TERMINAL_KUBERNETES_* environment variables — .env is for secrets, and
@@ -356,6 +357,9 @@ terminal:
 #     image: "nikolaik/python-nodejs:python3.11-nodejs20"
 #     image_pull_policy: "IfNotPresent"
 #     image_pull_secrets: []       # Secret NAMES, not secret values
+#     container_name: "workspace"  # container built AND exec'd into; with
+#                                  # sandbox.template_ref the operator names it,
+#                                  # and the pod's first container is used
 #     service_account: "hermes-session-noperms"
 #     automount_service_account_token: false
 #     runtime_class_name: ""       # "kata" for OpenShift sandboxed containers
@@ -363,16 +367,27 @@ terminal:
 #     tolerations: []
 #     labels: {}
 #     annotations: {}
-#     env: {}                      # literal env vars inside the session container
+#     env: {}                      # literal NON-SECRET env vars in the session
+#                                  # container. config.yaml is the non-secret half
+#                                  # of the split: put API keys in a Secret and
+#                                  # reference it by NAME through
+#                                  # pod_template_overrides (envFrom/secretKeyRef)
 #     mount_path: "/workspace"
-#     pod_template_overrides: {}   # strategic-merge patch applied last
+#     pod_template_overrides: {}   # strategic-merge patch applied last: lists of
+#                                  # named objects (containers, volumes,
+#                                  # volumeMounts, env) merge by `name`; other
+#                                  # lists replace wholesale
 #
 #     persistent: false            # opt-in retained PVC per task; NOT inherited
 #                                  # from container_persistent
 #     volume:
-#       size: ""                   # "" -> {container_disk}Mi
+#       size: "10Gi"               # "" -> {container_disk}Mi (50Gi by default)
 #       storage_class_name: ""     # "" -> cluster default StorageClass
 #       access_modes: ["ReadWriteOnce"]
+#       claim_name: ""             # "" -> hermes-ws-<task>, SHARED by every
+#                                  # Hermes instance in the namespace running
+#                                  # that task id (RWO: the second pod stays
+#                                  # Pending). Pin it per instance to avoid that.
 #     active_deadline_seconds: 14400   # ephemeral pods only (leak backstop)
 #     ready_timeout_seconds: 120       # raise for slow pulls / kata runtimes
 #     owner_reference: "auto"          # auto | off (GC session pods with the agent pod)

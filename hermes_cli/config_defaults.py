@@ -371,8 +371,8 @@ DEFAULT_CONFIG = {
             # sandbox = Sandbox CR (agents.x-k8s.io/v1beta1) reconciled by
             #           agent-sandbox-operator; exec still targets its pod
             "provisioner": "direct",
-            # "" -> HERMES_POD_NAMESPACE (downward API) -> the projected
-            # ServiceAccount namespace file.
+            # "" -> the projected ServiceAccount namespace file (in-cluster).
+            # Deliberately not env-var resolvable.
             "namespace": "",
             # Out-of-cluster dev only. A PATH to a kubeconfig, not a credential
             # (same class as terminal.ssh_key). "" -> in-cluster SA, then the
@@ -382,6 +382,11 @@ DEFAULT_CONFIG = {
             "image": "nikolaik/python-nodejs:python3.11-nodejs20",
             "image_pull_policy": "IfNotPresent",
             "image_pull_secrets": [],       # Secret NAMES, not secret values
+            # Container this backend builds AND execs into. With
+            # sandbox.template_ref / sandbox.use_claim the operator builds the
+            # pod, so if it has no container with this name the first one is
+            # used instead.
+            "container_name": "workspace",
             "service_account": "hermes-session-noperms",
             "automount_service_account_token": False,
             # spec.runtimeClassName — set to "kata" for OpenShift sandboxed
@@ -391,18 +396,29 @@ DEFAULT_CONFIG = {
             "tolerations": [],
             "labels": {},
             "annotations": {},
-            "env": {},                      # literal env vars in the session container
+            # Literal NON-SECRET env vars in the session container. config.yaml
+            # is the non-secret half of the split: put API keys in a Secret and
+            # reference it by NAME through pod_template_overrides
+            # (envFrom / valueFrom.secretKeyRef).
+            "env": {},
             "mount_path": "/workspace",
             # Strategic-merge patch applied last onto the built pod template —
             # the escape hatch so the schema need not model all of PodSpec.
+            # Lists of named objects (containers, volumes, volumeMounts, env)
+            # merge by `name`; other lists replace wholesale.
             "pod_template_overrides": {},
             # Deliberately NOT inherited from container_persistent (True for
             # docker/daytona): a cluster sandbox defaults to ephemeral.
             "persistent": False,
             "volume": {
-                "size": "",                 # "" -> {container_disk}Mi
+                "size": "10Gi",             # "" -> {container_disk}Mi (50Gi)
                 "storage_class_name": "",   # "" -> cluster default StorageClass
                 "access_modes": ["ReadWriteOnce"],
+                # "" -> hermes-ws-<task>, which every Hermes instance in the
+                # namespace running that task id SHARES (ReadWriteOnce: the
+                # second pod stays Pending). Set an explicit name when several
+                # agents share a namespace.
+                "claim_name": "",
             },
             # Hard lifetime ceiling for EPHEMERAL pods (leak backstop). 0 omits.
             "active_deadline_seconds": 14400,

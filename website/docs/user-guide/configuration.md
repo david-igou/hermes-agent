@@ -458,11 +458,15 @@ terminal:
 pip install 'hermes-agent[kubernetes]'
 ```
 
-Hermes also lazy-installs the client on first use.
+There is no lazy install for this backend: the terminal tool stays disabled until the client is importable.
 
-**Required RBAC:** apply `k8s/rbac.yaml` (pick the Role matching your provisioner), then run `hermes doctor` — it issues `SelfSubjectAccessReview` checks for `create pods`, `create pods/exec`, and `create sandboxes.agents.x-k8s.io`. See [`k8s/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/k8s/README.md) for the network policy and admission-policy manifests.
+**Required RBAC:** apply `k8s/rbac.yaml` (pick the Role matching your provisioner), then run `hermes doctor` — it issues per-provisioner `SelfSubjectAccessReview` checks (`direct`: create/delete `pods` + create `pods/exec`; `sandbox`: create/delete `sandboxes.agents.x-k8s.io`, get `pods`, create `pods/exec`, and it flags `create pods` being *allowed* as broader than that provisioner needs). See [`k8s/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/k8s/README.md) for the network policy and admission-policy manifests.
 
 **Authentication:** in-cluster ServiceAccount first, then `terminal.kubernetes.kubeconfig`, then the ambient `KUBECONFIG` / `~/.kube/config` for out-of-cluster development.
+
+**Approval guards:** the dangerous-command prompts are skipped only while the *rendered* pod is a throwaway sandbox — ephemeral, non-root, drop-ALL, no privilege escalation, no ServiceAccount token, an emptyDir workspace and the configured no-perms ServiceAccount. Setting `persistent: true`, relaxing `security_context.*`, or re-granting anything through `pod_template_overrides` puts the guards back on; `hermes doctor` reports which applies.
+
+**Credential files:** the session pod is an execution boundary, not a secrets boundary — registered credential files and skills are synced into it on session start (as with the Modal/Daytona backends). The sync streams over the exec stdin channel, never through exec argv, because exec request URLs land in the API-server audit log.
 
 **Provisioners:** `direct` creates a raw `Pod` (plus a `PersistentVolumeClaim` when `persistent: true`). `sandbox` creates a `Sandbox` custom resource (`agents.x-k8s.io/v1beta1`) reconciled by agent-sandbox-operator and execs into the pod it produces; the agent ServiceAccount then needs `sandboxes` create/delete but not bare `pods` create/delete.
 

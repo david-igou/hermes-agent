@@ -380,30 +380,37 @@ def _kubernetes_has_host_access(config: Dict[str, Any]) -> bool:
     """Return True when a Kubernetes session pod is NOT a throwaway sandbox.
 
     An ephemeral pod with an emptyDir workspace, no host namespaces, drop-ALL
-    caps and no ServiceAccount token is genuinely isolated and can skip the
-    approval layer like Docker-without-bind-mounts does.  These cases are not
-    equivalent and must keep the guards:
+    caps, non-root and no ServiceAccount token is genuinely isolated and can
+    skip the approval layer the way Docker-without-bind-mounts does.
 
-      * ``persistent: true`` — ``rm -rf /workspace`` destroys a durable PVC the
-        user explicitly asked to keep across sessions.
-      * ``automount_service_account_token: true`` — the pod holds cluster
-        credentials, so a command can reach far beyond its own filesystem.
-      * ``pod_template_overrides`` that reintroduce host namespaces or hostPath
-        volumes.
+    The verdict is derived from the RENDERED pod template, not from a
+    hand-picked subset of config keys: ``security_context`` and
+    ``pod_template_overrides`` (deep-merged last) can re-grant root, privilege
+    escalation, capabilities, a privileged ServiceAccount or a mounted token
+    without touching any of the keys a key-level heuristic would look at.
+    Anything that is not fully hardened keeps the guards, and an unreadable
+    config fails closed.
     """
     kcfg = config.get("kubernetes") or {}
-    if kcfg.get("persistent"):
+    try:
+        from tools.environments.kubernetes import (
+            merge_kubernetes_config,
+            unhardened_reasons,
+        )
+
+        reasons = unhardened_reasons(merge_kubernetes_config(kcfg))
+    except Exception as exc:  # fail closed — keep the guards
+        logger.warning(
+            "kubernetes: could not evaluate session-pod hardening (%s); "
+            "keeping the dangerous-command guards enabled", exc,
+        )
         return True
-    if kcfg.get("automount_service_account_token"):
+    if reasons:
+        logger.debug(
+            "kubernetes: session pod is not a throwaway sandbox (%s); "
+            "dangerous-command guards stay enabled", "; ".join(reasons),
+        )
         return True
-    overrides = kcfg.get("pod_template_overrides") or {}
-    spec = overrides.get("spec") if isinstance(overrides, dict) else None
-    if isinstance(spec, dict):
-        if any(spec.get(key) for key in ("hostNetwork", "hostPID", "hostIPC")):
-            return True
-        for volume in (spec.get("volumes") or []):
-            if isinstance(volume, dict) and volume.get("hostPath"):
-                return True
     return False
 
 

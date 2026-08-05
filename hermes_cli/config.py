@@ -3287,6 +3287,15 @@ def apply_terminal_config_to_env(
         if cfg_key not in terminal_cfg:
             continue
         value = terminal_cfg[cfg_key]
+        if cfg_key == "kubernetes":
+            # Only the kubernetes backend reads this ~1.2KB JSON blob. Exporting
+            # it unconditionally put it in the environment of every child
+            # process the agent spawns, for every backend.
+            backend = str(
+                terminal_cfg.get("backend") or target.get("TERMINAL_ENV") or ""
+            ).strip().lower()
+            if backend != "kubernetes":
+                continue
         if cfg_key == "cwd":
             raw_cwd = str(value or "").strip()
             if raw_cwd in {".", "auto", "cwd"}:

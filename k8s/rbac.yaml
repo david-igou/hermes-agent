@@ -39,18 +39,19 @@ metadata:
   name: hermes-session-exec
   namespace: <AGENT_NAMESPACE>
 rules:
-  # Lifecycle of session pods + their PVCs (persistent workspaces).
-  # `get` is also what resolves the agent's OWN pod for the ownerReference that
-  # garbage-collects session pods when the agent dies.
+  # Lifecycle of session pods. `get` also resolves the agent's OWN pod for the
+  # ownerReference that garbage-collects session pods when the agent dies, and
+  # reads pod status for readiness diagnostics (ImagePullBackOff,
+  # CreateContainerConfigError, SCC denial) and the container list.
   - apiGroups: [""]
-    resources: ["pods", "persistentvolumeclaims"]
+    resources: ["pods"]
     verbs: ["create", "get", "list", "delete"]
-  # Readiness diagnostics: the backend reports container waiting reasons
-  # (ImagePullBackOff, CreateContainerConfigError, SCC denial) instead of a
-  # bare timeout.
+  # PVCs backing persistent workspaces. NO delete: the backend deliberately
+  # never deletes a PVC (a persistent workspace must outlive the agent pod),
+  # so granting delete would only widen the blast radius.
   - apiGroups: [""]
-    resources: ["pods/log", "events"]
-    verbs: ["get", "list"]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "get", "list"]
   # Streaming exec into the session pod. `get` is load-bearing: the python
   # client upgrades via connect_get_namespaced_pod_exec (SPDY/WS GET).
   - apiGroups: [""]
@@ -82,19 +83,19 @@ metadata:
   name: hermes-session-sandbox
   namespace: <AGENT_NAMESPACE>
 rules:
+  # No `watch`: readiness is polled with get_namespaced_custom_object.
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
-    verbs: ["create", "get", "list", "watch", "delete"]
+    verbs: ["create", "get", "list", "delete"]
   # Only needed when terminal.kubernetes.sandbox.use_claim is true.
   - apiGroups: ["extensions.agents.x-k8s.io"]
     resources: ["sandboxclaims"]
-    verbs: ["create", "get", "list", "watch", "delete"]
-  - apiGroups: ["extensions.agents.x-k8s.io"]
-    resources: ["sandboxtemplates", "sandboxwarmpools"]
-    verbs: ["get", "list", "watch"]
-  # Resolve the reconciled pod and exec into it.
+    verbs: ["create", "get", "list", "delete"]
+  # NOTE: sandboxtemplates / sandboxwarmpools are deliberately absent — the
+  # backend never reads them; the operator resolves the template reference.
+  # Resolve the reconciled pod (name, readiness, container list) and exec.
   - apiGroups: [""]
-    resources: ["pods", "pods/log", "events"]
+    resources: ["pods"]
     verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["pods/exec"]
