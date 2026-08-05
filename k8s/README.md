@@ -106,7 +106,9 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
 
   **Two consequences of that, stated plainly.** Hermes neither writes nor reads the SandboxTemplate, so (a) it cannot vouch for the pod's hardening — `template_ref`/`use_claim` therefore always keep the dangerous-command approval prompts on, and `hermes doctor` says so; and (b) the pod carries `app.kubernetes.io/managed-by: hermes-agent` only if your template sets it, and without that label **neither NetworkPolicy in `networkpolicy.yaml` applies**. Put the label in the template's pod metadata.
 
-  `sandbox.spec_overrides` is a strategic-merge patch on the `Sandbox` **spec**. Its `podTemplate` key is treated as an ordinary pod-template override layer: it is rendered by the same builder, judged by the same hardening evaluator, and the managed-by label is re-stamped after it. It cannot be used to reach a pod shape the security checks did not see.
+  `sandbox.spec_overrides` is a strategic-merge patch on the `Sandbox` **spec**. Its `podTemplate` key is a declared pod-template override layer: rendered by the same builder, judged by the same hardening evaluator, with the managed-by label re-stamped after it. Its `sandboxTemplateRef` key is **rejected** by config validation — use `sandbox.template_ref`, which the hardening evaluator understands — and if one reaches the evaluator anyway it is treated as unjudgeable, i.e. not a throwaway sandbox.
+
+  Scope of that claim, precisely: it covers the pod shape **this backend renders**. It does not and cannot cover a pod built from a `SandboxTemplate` (see above), nor anything a compromised agent does by calling the Kubernetes API directly with its own credentials. Those are bounded by RBAC, the ValidatingAdmissionPolicy and NetworkPolicy — not by this backend.
 
 ## Workspace persistence
 

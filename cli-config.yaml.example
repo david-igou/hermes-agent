@@ -368,10 +368,16 @@ terminal:
 #     labels: {}
 #     annotations: {}
 #     env: {}                      # literal NON-SECRET env vars in the session
-#                                  # container. config.yaml is the non-secret half
-#                                  # of the split: put API keys in a Secret and
-#                                  # reference it by NAME through
-#                                  # pod_template_overrides (envFrom/secretKeyRef)
+#                                  # container. NOTE: referencing a Secret from
+#                                  # the session container (envFrom.secretRef /
+#                                  # env[].valueFrom.secretKeyRef via
+#                                  # pod_template_overrides) is DENIED by the
+#                                  # shipped k8s/validatingadmissionpolicy.yaml
+#                                  # and also marks the pod as not-a-throwaway-
+#                                  # sandbox (dangerous-command prompts stay on).
+#                                  # The session container is meant to hold no
+#                                  # credentials; if you must, relax the policy
+#                                  # deliberately — see that file's header.
 #     mount_path: "/workspace"
 #     pod_template_overrides: {}   # strategic-merge patch applied last: lists of
 #                                  # named objects (containers, volumes,

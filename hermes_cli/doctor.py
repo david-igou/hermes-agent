@@ -286,7 +286,7 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
     # deliberately grants NO pods create/delete (the operator owns the pod
     # lifecycle), so demanding them there fails a correctly configured
     # least-privilege deployment.
-    sandbox_mode = str(kcfg.get("provisioner")).lower() == "sandbox"
+    sandbox_mode = str(kcfg.get("provisioner") or "").strip().lower() == "sandbox"
     sandbox_cfg = kcfg.get("sandbox") or {}
     # `get`, not `create`: the only exec call this backend makes is
     # api.connect_get_namespaced_pod_exec, which the python client issues as a

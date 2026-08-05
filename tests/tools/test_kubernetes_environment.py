@@ -2133,3 +2133,55 @@ def test_doctor_probes_the_claim_group_the_backend_posts_to():
     source = inspect.getsource(doctor)
     assert "SandboxProvisioner.CLAIM_GROUP" in source
     assert '"extensions." + str(sandbox_group)' not in source
+
+
+def test_sandbox_template_ref_smuggled_through_spec_overrides_is_not_trusted():
+    """`sandboxTemplateRef` reaches the operator through spec_overrides just as
+    surely as through sandbox.template_ref, and the resulting pod is built from
+    a SandboxTemplate this backend never reads.
+
+    Round 3 closed the spec_overrides.podTemplate door but judged only the
+    config keys template_ref/use_claim, so this third door returned NO reasons
+    at all — a pod nothing had inspected kept the dangerous-command approval
+    skip.
+    """
+    from tools.environments.kubernetes import unhardened_reasons
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    kcfg = _sandbox_kcfg(spec_overrides={
+        "sandboxTemplateRef": {"name": "privileged-template"},
+    })
+    reasons = unhardened_reasons(kcfg)
+    assert any("SandboxTemplate" in reason for reason in reasons), reasons
+    assert any("spec_overrides.sandboxTemplateRef" in r for r in reasons), reasons
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+
+
+def test_sandbox_template_ref_in_spec_overrides_is_a_config_error():
+    """Defence in depth: the judge treats it as unjudgeable, but the config is
+    simply wrong — sandboxTemplateRef has a declared home (sandbox.template_ref)
+    and smuggling it through the overlay emits a Sandbox carrying BOTH a
+    podTemplate we rendered and a template reference we never read."""
+    from tools.environments.kubernetes import validate_kubernetes_config
+
+    problems = validate_kubernetes_config(_sandbox_kcfg(spec_overrides={
+        "sandboxTemplateRef": {"name": "privileged-template"},
+    }))
+    assert any("sandboxTemplateRef is not allowed" in p for p in problems), problems
+    # the declared key stays valid
+    assert not [
+        p for p in validate_kubernetes_config(_sandbox_kcfg(template_ref="t"))
+        if "sandboxTemplateRef" in p
+    ]
+
+
+def test_k8s_readme_does_not_claim_spec_overrides_is_unreachable():
+    """Rounds 2 and 3 each shipped an absolute security claim a reviewer then
+    disproved. Pin the retraction: the README may describe what the check
+    covers, but must not assert the pod shape cannot be reached."""
+    import pathlib
+
+    readme = pathlib.Path(__file__).resolve().parents[2] / "k8s" / "README.md"
+    text = readme.read_text()
+    assert "It cannot be used to reach a pod shape the security checks did not see." not in text
+    assert "sandboxTemplateRef` key is **rejected**" in text

@@ -289,6 +289,40 @@ def _pod_template_override_layers(kcfg: dict) -> "list[tuple[str, dict]]":
     return layers
 
 
+def _operator_authored_pod_shape(sb: dict) -> str:
+    """Reason the operator (not this backend) authors the pod, or "" if we do.
+
+    Three doors reach the same outcome — a pod built from a SandboxTemplate this
+    backend never reads and therefore cannot evaluate:
+
+    * ``sandbox.template_ref``
+    * ``sandbox.use_claim`` (a SandboxClaim resolves to a template)
+    * ``sandbox.spec_overrides.sandboxTemplateRef`` — the door round 3 missed.
+      ``validate_kubernetes_config`` rejects this one, but the judge must not
+      depend on validation having run: unknown is not hardened.
+
+    Callers treat a non-empty return as "not a throwaway sandbox".
+    """
+    if str(sb.get("template_ref") or "").strip():
+        return (
+            "sandbox.template_ref: the pod shape comes from a SandboxTemplate "
+            "this backend never reads and cannot evaluate"
+        )
+    if sb.get("use_claim"):
+        return (
+            "sandbox.use_claim: the pod shape comes from a SandboxTemplate "
+            "this backend never reads and cannot evaluate"
+        )
+    overrides = sb.get("spec_overrides")
+    if isinstance(overrides, dict) and overrides.get("sandboxTemplateRef"):
+        return (
+            "sandbox.spec_overrides.sandboxTemplateRef: the pod shape comes "
+            "from a SandboxTemplate this backend never reads and cannot "
+            "evaluate"
+        )
+    return ""
+
+
 def _is_rfc1123_name(value: str) -> bool:
     """RFC-1123 label check INCLUDING the 63-character bound.
 
@@ -366,6 +400,22 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
         problems.append(
             f"terminal.kubernetes.volume.claim_name={claim_name!r} is not a "
             "valid RFC-1123 name (lowercase alphanumeric, '-', max 63 chars)"
+        )
+
+    # sandboxTemplateRef must arrive through terminal.kubernetes.sandbox.
+    # template_ref, never through spec_overrides. Both reach the operator, but
+    # only the config key is a declared, documented mode; smuggling it through
+    # the overlay produced a Sandbox carrying BOTH a podTemplate we rendered and
+    # a template reference we never read. unhardened_reasons() also treats it as
+    # unjudgeable (defence in depth), but the config is simply wrong — say so.
+    sandbox_cfg = kcfg.get("sandbox") or {}
+    sandbox_overrides = sandbox_cfg.get("spec_overrides")
+    if isinstance(sandbox_overrides, dict) and "sandboxTemplateRef" in sandbox_overrides:
+        problems.append(
+            "terminal.kubernetes.sandbox.spec_overrides.sandboxTemplateRef is "
+            "not allowed; set terminal.kubernetes.sandbox.template_ref instead "
+            "(the config key is the declared mode and is evaluated by the "
+            "pod-hardening check)"
         )
 
     # The managed-by label is the selector for the shipped NetworkPolicy and
@@ -879,15 +929,12 @@ def unhardened_reasons(kcfg: dict) -> list[str]:
         reasons.append("persistent: true (durable PVC workspace)")
 
     if str(kcfg.get("provisioner") or "").strip().lower() == "sandbox":
-        sb = kcfg.get("sandbox") or {}
-        if str(sb.get("template_ref") or "").strip() or sb.get("use_claim"):
+        operator_authored = _operator_authored_pod_shape(kcfg.get("sandbox") or {})
+        if operator_authored:
             # Unconditional: the operator's SandboxTemplate supplies the whole
             # pod shape and Hermes never reads it, so no property below can be
             # established. Unknown is not hardened.
-            reasons.append(
-                "sandbox.template_ref/use_claim: the pod shape comes from a "
-                "SandboxTemplate this backend never reads and cannot evaluate"
-            )
+            reasons.append(operator_authored)
             return reasons
 
     try:
