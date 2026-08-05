@@ -3192,6 +3192,12 @@ TERMINAL_CONFIG_ENV_MAP = {
     "modal_image": "TERMINAL_MODAL_IMAGE",
     "daytona_image": "TERMINAL_DAYTONA_IMAGE",
     "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
+    # Nested block: the whole terminal.kubernetes.* mapping is bridged as ONE
+    # internal JSON env var (dict values are json.dumps'd by
+    # _terminal_env_value).  Nested keys are invisible to the .env mirror in
+    # set_config_value, which is exactly what keeps every Kubernetes setting in
+    # config.yaml where policy requires it.
+    "kubernetes": "TERMINAL_KUBERNETES",
     "ssh_host": "TERMINAL_SSH_HOST",
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
@@ -3212,6 +3218,18 @@ TERMINAL_CONFIG_ENV_MAP = {
     "sandbox_dir": "TERMINAL_SANDBOX_DIR",
     "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
 }
+
+
+# ``hermes config set terminal.X`` mirrors the bridged value into .env so
+# terminal_tool child processes see it.  These keys are excluded:
+#   terminal.cwd        — handled separately (placeholder resolution)
+#   terminal.kubernetes — .env is for SECRETS ONLY; every Kubernetes setting
+#                         must stay in config.yaml (this is the policy that
+#                         got upstream PR #37591 closed).  Nested paths like
+#                         terminal.kubernetes.namespace already return None
+#                         from terminal_config_env_var_for_key(); this guard
+#                         covers the whole-block form.
+_TERMINAL_ENV_MIRROR_EXCLUDED = frozenset({"terminal.cwd", "terminal.kubernetes"})
 
 
 def _terminal_env_value(value: Any) -> str:
@@ -4365,6 +4383,13 @@ def show_config():
     elif terminal.get('backend') == 'vercel_sandbox':
         print(f"  Vercel runtime: {terminal.get('vercel_runtime', 'node24')}")
         print(f"  Vercel auth:    {'configured' if get_env_value('VERCEL_OIDC_TOKEN') or (get_env_value('VERCEL_TOKEN') and get_env_value('VERCEL_PROJECT_ID') and get_env_value('VERCEL_TEAM_ID')) else '(not set)'}")
+    elif terminal.get('backend') == 'kubernetes':
+        k8s = terminal.get('kubernetes', {}) or {}
+        print(f"  Provisioner:  {k8s.get('provisioner', 'direct')}")
+        print(f"  Namespace:    {k8s.get('namespace') or '(from in-cluster ServiceAccount)'}")
+        print(f"  Image:        {k8s.get('image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+        print(f"  RuntimeClass: {k8s.get('runtime_class_name') or '(cluster default)'}")
+        print(f"  Persistent:   {bool(k8s.get('persistent', False))}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')
         ssh_user = get_env_value('TERMINAL_SSH_USER')
@@ -4997,7 +5022,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
-    if env_var and key != "terminal.cwd":
+    if env_var and key not in _TERMINAL_ENV_MIRROR_EXCLUDED:
         save_env_value(env_var, _terminal_env_value(value))
 
     # Setting display.skin is an explicit "apply NOW" — bump the skin file's
@@ -5111,7 +5136,7 @@ def unset_config_value(key: str):
 
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     env_var = terminal_config_env_var_for_key(key)
-    if env_var and key != "terminal.cwd":
+    if env_var and key not in _TERMINAL_ENV_MIRROR_EXCLUDED:
         removed = remove_env_value(env_var) or removed
 
     if not removed:

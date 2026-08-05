@@ -1,0 +1,157 @@
+# RBAC for the Kubernetes terminal backend (terminal.backend: kubernetes).
+#
+# Grants the agent's ServiceAccount the minimum verbs needed to create, exec
+# into, and delete session pods (and the PVCs that back persistent workspaces)
+# IN ITS OWN NAMESPACE only.
+#
+# Replace the placeholders before applying:
+#   <AGENT_NAMESPACE>   namespace where the Hermes pod runs (e.g. "hermes-agents")
+#   <AGENT_SA>          ServiceAccount Hermes runs as (e.g. "hermes")
+#
+# Two Role variants ship below. Apply exactly ONE, matching
+# terminal.kubernetes.provisioner:
+#
+#   provisioner: direct   -> hermes-session-exec        (pods + PVCs + exec)
+#   provisioner: sandbox  -> hermes-session-sandbox     (sandboxes + exec, NO
+#                            bare pods/create — a meaningful reduction, since
+#                            "create pods in a namespace" is close to
+#                            namespace-admin without admission constraints)
+#
+# Pair either with k8s/networkpolicy.yaml (session pods otherwise reach every
+# Service in the cluster) and, on non-OpenShift clusters, with
+# k8s/validatingadmissionpolicy.yaml.
+---
+# The session pods themselves run as this no-perms SA so they hold no cluster
+# credentials. The backend also sets automountServiceAccountToken: false on the
+# pod itself (terminal.kubernetes.automount_service_account_token).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hermes-session-noperms
+  namespace: <AGENT_NAMESPACE>
+automountServiceAccountToken: false
+
+---
+# ── provisioner: direct ──────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hermes-session-exec
+  namespace: <AGENT_NAMESPACE>
+rules:
+  # Lifecycle of session pods + their PVCs (persistent workspaces).
+  # `get` is also what resolves the agent's OWN pod for the ownerReference that
+  # garbage-collects session pods when the agent dies.
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims"]
+    verbs: ["create", "get", "list", "delete"]
+  # Readiness diagnostics: the backend reports container waiting reasons
+  # (ImagePullBackOff, CreateContainerConfigError, SCC denial) instead of a
+  # bare timeout.
+  - apiGroups: [""]
+    resources: ["pods/log", "events"]
+    verbs: ["get", "list"]
+  # Streaming exec into the session pod. `get` is load-bearing: the python
+  # client upgrades via connect_get_namespaced_pod_exec (SPDY/WS GET).
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hermes-session-exec
+  namespace: <AGENT_NAMESPACE>
+subjects:
+  - kind: ServiceAccount
+    name: <AGENT_SA>
+    namespace: <AGENT_NAMESPACE>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hermes-session-exec
+
+---
+# ── provisioner: sandbox (agent-sandbox-operator v0.9.0+) ────────────────────
+# Note the absence of pods create/delete: the operator owns pod lifecycle, so
+# the agent only needs to create the CR and exec into the resulting pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hermes-session-sandbox
+  namespace: <AGENT_NAMESPACE>
+rules:
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # Only needed when terminal.kubernetes.sandbox.use_claim is true.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    verbs: ["get", "list", "watch"]
+  # Resolve the reconciled pod and exec into it.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  # Only when terminal.kubernetes.persistent is true AND no SandboxTemplate
+  # supplies the volume.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hermes-session-sandbox
+  namespace: <AGENT_NAMESPACE>
+subjects:
+  - kind: ServiceAccount
+    name: <AGENT_SA>
+    namespace: <AGENT_NAMESPACE>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hermes-session-sandbox
+
+---
+# ── OpenShift only: SCC access for session pods ──────────────────────────────
+# With the shipped defaults (security_context.run_as_user: null) session pods
+# satisfy `restricted-v2`, which every authenticated SA already has via
+# system:authenticated — so you do NOT need this on OpenShift 4.21.
+#
+# You DO need it if you pin terminal.kubernetes.security_context.run_as_user to
+# a UID outside the namespace's openshift.io/sa.scc.uid-range, or if you set
+# terminal.kubernetes.runtime_class_name to a runtime whose SCC differs. In
+# that case create a custom SCC and bind `use` on it to the SESSION SA:
+#
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: hermes-session-scc
+#   namespace: <AGENT_NAMESPACE>
+# rules:
+#   - apiGroups: ["security.openshift.io"]
+#     resources: ["securitycontextconstraints"]
+#     resourceNames: ["<YOUR_CUSTOM_SCC>"]
+#     verbs: ["use"]
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: hermes-session-scc
+#   namespace: <AGENT_NAMESPACE>
+# subjects:
+#   - kind: ServiceAccount
+#     name: hermes-session-noperms
+#     namespace: <AGENT_NAMESPACE>
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: Role
+#   name: hermes-session-scc

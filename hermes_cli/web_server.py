@@ -877,7 +877,15 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "terminal.backend": {
         "type": "select",
         "description": "Terminal execution backend",
-        "options": ["local", "docker", "ssh", "modal", "daytona", "vercel_sandbox", "singularity"],
+        "options": ["local", "docker", "ssh", "modal", "daytona", "vercel_sandbox", "singularity", "kubernetes"],
+    },
+    "terminal.kubernetes.provisioner": {
+        "type": "select",
+        "description": "Kubernetes workspace provisioner",
+        # direct = raw Pod via the core API; sandbox = Sandbox CR reconciled by
+        # agent-sandbox-operator. Sync with VALID_PROVISIONERS in
+        # tools/environments/kubernetes.py.
+        "options": ["direct", "sandbox"],
     },
     "terminal.vercel_runtime": {
         "type": "select",
@@ -13823,6 +13831,11 @@ _TERMINAL_BACKENDS: List[Dict[str, str]] = [
         "description": "Run commands in a Daytona cloud sandbox.",
     },
     {
+        "name": "kubernetes",
+        "label": "Kubernetes",
+        "description": "Run commands in a per-session pod in a Kubernetes/OpenShift cluster.",
+    },
+    {
         "name": "ssh",
         "label": "SSH",
         "description": "Run commands on a remote host over SSH.",
@@ -13929,6 +13942,34 @@ def _probe_daytona_backend() -> tuple:
     return ("needs_setup", "Set DAYTONA_API_KEY to use the Daytona backend.")
 
 
+def _probe_kubernetes_backend(terminal_cfg: dict) -> tuple:
+    """Return ``(status, detail)`` for the kubernetes backend. Never raises."""
+    import importlib.util as _ilu
+
+    if _ilu.find_spec("kubernetes") is None:
+        return ("needs_setup", "kubernetes client not installed "
+                               "(pip install 'hermes-agent[kubernetes]')")
+    try:
+        from tools.environments.kubernetes import (
+            in_cluster,
+            merge_kubernetes_config,
+            validate_kubernetes_config,
+        )
+    except Exception as exc:
+        return ("unavailable", f"Backend import failed: {exc}")
+
+    kcfg = merge_kubernetes_config((terminal_cfg or {}).get("kubernetes"))
+    problems = validate_kubernetes_config(kcfg)
+    if problems:
+        return ("needs_setup", problems[0])
+    if in_cluster():
+        return ("ready", f"in-cluster ServiceAccount, provisioner: {kcfg['provisioner']}")
+    kubeconfig = kcfg.get("kubeconfig") or os.environ.get("KUBECONFIG") or ""
+    if kubeconfig or os.path.exists(os.path.expanduser("~/.kube/config")):
+        return ("ready", f"kubeconfig, provisioner: {kcfg['provisioner']}")
+    return ("needs_setup", "No in-cluster ServiceAccount and no kubeconfig found")
+
+
 def _probe_terminal_backend(name: str, terminal_cfg: dict) -> tuple:
     """Return ``(status, detail)`` for one backend. Never raises."""
     try:
@@ -13944,6 +13985,8 @@ def _probe_terminal_backend(name: str, terminal_cfg: dict) -> tuple:
             return _probe_modal_backend()
         if name == "daytona":
             return _probe_daytona_backend()
+        if name == "kubernetes":
+            return _probe_kubernetes_backend(terminal_cfg)
         return ("unavailable", f"Unknown backend: {name}")
     except Exception as exc:  # pragma: no cover — belt-and-braces guard
         return ("unavailable", f"Probe failed: {exc}")

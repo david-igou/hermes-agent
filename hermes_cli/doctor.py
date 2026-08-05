@@ -220,6 +220,104 @@ def _section(title: str) -> None:
     print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
 
 
+def _check_kubernetes_backend(issues: list[str]) -> None:
+    """Diagnose the kubernetes terminal backend.
+
+    RBAC is where in-cluster deployments actually fail, so this goes past a
+    "is the SDK installed" check and asks the API server whether the agent's
+    ServiceAccount may create pods, exec into them, and (in sandbox mode)
+    create Sandboxes.
+    """
+    if importlib.util.find_spec("kubernetes") is None:
+        _fail_and_issue(
+            "kubernetes client not installed",
+            "(pip install 'hermes-agent[kubernetes]')",
+            "Install the Kubernetes optional dependency: pip install 'hermes-agent[kubernetes]'",
+            issues,
+        )
+        return
+    check_ok("kubernetes client", "(installed)")
+
+    try:
+        from tools.environments.kubernetes import (
+            in_cluster,
+            load_kubernetes_apis,
+            merge_kubernetes_config,
+            resolve_namespace,
+            validate_kubernetes_config,
+        )
+        from tools.terminal_tool import _get_env_config
+
+        kcfg = merge_kubernetes_config(_get_env_config().get("kubernetes"))
+    except Exception as exc:
+        _fail_and_issue(
+            "kubernetes config unreadable", f"({exc})",
+            "Check the terminal.kubernetes block in config.yaml", issues,
+        )
+        return
+
+    problems = validate_kubernetes_config(kcfg)
+    for problem in problems:
+        _fail_and_issue("kubernetes config invalid", f"({problem})", problem, issues)
+    if problems:
+        return
+    check_ok("kubernetes config", f"(provisioner: {kcfg.get('provisioner')})")
+
+    check_info(
+        "kubernetes auth: in-cluster ServiceAccount"
+        if in_cluster()
+        else f"kubernetes auth: kubeconfig ({kcfg.get('kubeconfig') or 'KUBECONFIG/~/.kube/config'})"
+    )
+
+    try:
+        core_api, _custom_api = load_kubernetes_apis(kcfg)
+        namespace = resolve_namespace(kcfg)
+    except Exception as exc:
+        _fail_and_issue(
+            "kubernetes cluster unreachable", f"({exc})",
+            "Run Hermes in-cluster, or set terminal.kubernetes.kubeconfig / "
+            "terminal.kubernetes.namespace in config.yaml",
+            issues,
+        )
+        return
+    check_ok("kubernetes namespace", f"({namespace})")
+
+    checks = [("", "pods", "create"), ("", "pods/exec", "create")]
+    if str(kcfg.get("provisioner")).lower() == "sandbox":
+        sandbox_group = (kcfg.get("sandbox") or {}).get("api_group", "agents.x-k8s.io")
+        checks.append((sandbox_group, "sandboxes", "create"))
+    else:
+        checks.append(("", "pods", "delete"))
+    if kcfg.get("persistent"):
+        checks.append(("", "persistentvolumeclaims", "create"))
+
+    try:
+        from kubernetes import client as k8s_client
+
+        auth = k8s_client.AuthorizationV1Api(core_api.api_client)
+        for group, resource, verb in checks:
+            review = k8s_client.V1SelfSubjectAccessReview(
+                spec=k8s_client.V1SelfSubjectAccessReviewSpec(
+                    resource_attributes=k8s_client.V1ResourceAttributes(
+                        namespace=namespace, group=group,
+                        resource=resource, verb=verb,
+                    )
+                )
+            )
+            result = auth.create_self_subject_access_review(review)
+            label = f"RBAC {verb} {resource}" + (f".{group}" if group else "")
+            if getattr(result.status, "allowed", False):
+                check_ok(label, f"(in {namespace})")
+            else:
+                _fail_and_issue(
+                    label, "(denied)",
+                    f"Grant '{verb}' on '{resource}' in {namespace} — see k8s/rbac.yaml",
+                    issues,
+                )
+    except Exception as exc:
+        check_warn("kubernetes RBAC check skipped", f"({exc})")
+
+
 def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None:
     """Emit a check_fail and append the corresponding fix instruction."""
     check_fail(text, detail)
@@ -255,6 +353,15 @@ _DEPRECATED_ENV_VARS: tuple[tuple[str, str], ...] = (
     ("MESSAGING_CWD", "terminal.cwd in config.yaml"),
     ("QQ_HOME_CHANNEL", "QQBOT_HOME_CHANNEL"),
     ("QQ_HOME_CHANNEL_NAME", "QQBOT_HOME_CHANNEL_NAME"),
+    # Upstream PR #37591 advertised these six in .env.example before it was
+    # closed for exactly that reason. Anyone who copied that block gets a
+    # diagnosis instead of silence — none of them are read by this fork.
+    ("TERMINAL_KUBERNETES_NAMESPACE", "terminal.kubernetes.namespace in config.yaml — ignored"),
+    ("TERMINAL_KUBERNETES_IMAGE", "terminal.kubernetes.image in config.yaml — ignored"),
+    ("TERMINAL_KUBERNETES_POD_SA", "terminal.kubernetes.service_account in config.yaml — ignored"),
+    ("TERMINAL_KUBERNETES_PERSISTENT", "terminal.kubernetes.persistent in config.yaml — ignored"),
+    ("TERMINAL_KUBERNETES_ACTIVE_DEADLINE_SECONDS", "terminal.kubernetes.active_deadline_seconds in config.yaml — ignored"),
+    ("TERMINAL_KUBERNETES_PULL_SECRETS", "terminal.kubernetes.image_pull_secrets in config.yaml — ignored"),
 )
 
 
@@ -1819,6 +1926,10 @@ def run_doctor(args):
                 "Install daytona SDK: pip install daytona",
                 issues,
             )
+
+    # Kubernetes session pods (if using kubernetes backend)
+    if terminal_env == "kubernetes":
+        _check_kubernetes_backend(issues)
 
     # Vercel Sandbox (if using vercel_sandbox backend)
     if terminal_env == "vercel_sandbox":

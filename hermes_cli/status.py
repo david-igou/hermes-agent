@@ -439,6 +439,25 @@ def show_status(args):
     elif terminal_env == "daytona":
         daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
         print(f"  Daytona Image: {daytona_image}")
+    elif terminal_env == "kubernetes":
+        k8s_cfg = terminal_cfg.get("kubernetes", {}) or {}
+        sdk_ok = importlib.util.find_spec("kubernetes") is not None
+        sdk_label = (
+            "installed" if sdk_ok
+            else "missing (install: pip install 'hermes-agent[kubernetes]')"
+        )
+        auth = (
+            "in-cluster ServiceAccount"
+            if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token")
+            else (k8s_cfg.get("kubeconfig") or "KUBECONFIG / ~/.kube/config")
+        )
+        print(f"  Provisioner:  {k8s_cfg.get('provisioner', 'direct')}")
+        print(f"  Namespace:    {k8s_cfg.get('namespace') or '(from ServiceAccount)'}")
+        print(f"  Image:        {k8s_cfg.get('image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
+        print(f"  RuntimeClass: {k8s_cfg.get('runtime_class_name') or '(cluster default)'}")
+        print(f"  Persistent:   {bool(k8s_cfg.get('persistent', False))}")
+        print(f"  SDK:          {check_mark(sdk_ok)} {sdk_label}")
+        print(f"  Auth:         {auth}")
     elif terminal_env == "vercel_sandbox":
         runtime = os.getenv("TERMINAL_VERCEL_RUNTIME") or terminal_cfg.get("vercel_runtime") or "node24"
         persist = os.getenv("TERMINAL_CONTAINER_PERSISTENT")

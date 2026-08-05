@@ -1340,11 +1340,14 @@ def setup_terminal_backend(config: dict):
         "SSH - run on a remote machine",
         "Daytona - persistent cloud development environment",
         "Vercel Sandbox - cloud microVM with snapshot filesystem persistence",
+        "Kubernetes - per-session pod in a Kubernetes/OpenShift cluster",
     ]
-    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona", 5: "vercel_sandbox"}
-    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4, "vercel_sandbox": 5}
+    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona",
+                      5: "vercel_sandbox", 6: "kubernetes"}
+    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4,
+                      "vercel_sandbox": 5, "kubernetes": 6}
 
-    next_idx = 6
+    next_idx = 7
     if is_linux:
         terminal_choices.append("Singularity/Apptainer - HPC-friendly container")
         idx_to_backend[next_idx] = "singularity"
@@ -1591,6 +1594,59 @@ def setup_terminal_backend(config: dict):
                     print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
 
         _prompt_vercel_sandbox_settings(config)
+
+    elif selected_backend == "kubernetes":
+        print_success("Terminal backend: Kubernetes")
+        print_info("Each session runs in its own pod in your cluster.")
+        print_info("Requires the optional client: pip install 'hermes-agent[kubernetes]'")
+        print_info(
+            "ALL Kubernetes settings live in config.yaml under "
+            "terminal.kubernetes.* — nothing goes in .env."
+        )
+
+        if importlib.util.find_spec("kubernetes") is None:
+            print_warning(
+                "kubernetes client not installed — run: "
+                "pip install 'hermes-agent[kubernetes]' "
+                "(Hermes will also lazy-install it on first use)"
+            )
+
+        k8s_cfg = config["terminal"].setdefault("kubernetes", {})
+
+        provisioner_idx = prompt_choice(
+            "Workspace provisioner:",
+            [
+                "direct - raw Pod + optional PVC via the Kubernetes API (default)",
+                "sandbox - Sandbox CR reconciled by agent-sandbox-operator",
+            ],
+            0 if k8s_cfg.get("provisioner", "direct") == "direct" else 1,
+        )
+        k8s_cfg["provisioner"] = "direct" if provisioner_idx == 0 else "sandbox"
+
+        namespace = prompt(
+            "    Namespace (blank = use the in-cluster ServiceAccount namespace)",
+            default=k8s_cfg.get("namespace", ""),
+        )
+        k8s_cfg["namespace"] = (namespace or "").strip()
+
+        image = prompt(
+            "    Session pod image",
+            default=k8s_cfg.get("image", "nikolaik/python-nodejs:python3.11-nodejs20"),
+        )
+        if image:
+            k8s_cfg["image"] = image.strip()
+
+        runtime_class = prompt(
+            "    RuntimeClass (blank = cluster default; 'kata' for OpenShift "
+            "sandboxed containers)",
+            default=k8s_cfg.get("runtime_class_name", ""),
+        )
+        k8s_cfg["runtime_class_name"] = (runtime_class or "").strip()
+
+        print_info(
+            "  Apply k8s/rbac.yaml so the agent ServiceAccount can create and "
+            "exec into session pods, then run `hermes doctor` to verify RBAC."
+        )
 
     elif selected_backend == "ssh":
         print_success("Terminal backend: SSH")

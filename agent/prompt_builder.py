@@ -999,7 +999,7 @@ WSL_ENVIRONMENT_HINT = (
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
     "docker", "singularity", "modal", "daytona", "ssh",
-    "vercel_sandbox", "managed_modal",
+    "vercel_sandbox", "managed_modal", "kubernetes",
 })
 
 
@@ -1015,6 +1015,7 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "daytona": "a Daytona workspace (Linux)",
     "vercel_sandbox": "a Vercel sandbox (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
+    "kubernetes": "a Kubernetes session pod (Linux)",
 }
 
 
@@ -1074,6 +1075,8 @@ def _probe_remote_backend(env_type: str) -> str | None:
             image = config.get("modal_image", "")
         elif env_type == "daytona":
             image = config.get("daytona_image", "")
+        elif env_type == "kubernetes":
+            image = config.get("kubernetes_image", "")
         else:
             image = ""
 
@@ -1088,8 +1091,10 @@ def _probe_remote_backend(env_type: str) -> str | None:
             }
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+        if env_type in {"docker", "singularity", "modal", "daytona",
+                        "vercel_sandbox", "kubernetes"}:
             container_config = {
+                "kubernetes": config.get("kubernetes", {}),
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),

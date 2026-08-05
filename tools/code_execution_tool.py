@@ -318,6 +318,14 @@ def check_sandbox_requirements() -> bool:
     if config.get("env_type") == "vercel_sandbox":
         return _check_vercel_sandbox_requirements(config)
 
+    if config.get("env_type") == "kubernetes":
+        # Report unavailable up front rather than failing at dispatch.
+        import importlib.util
+
+        if importlib.util.find_spec("kubernetes") is None:
+            logger.debug("execute_code unavailable: kubernetes client not installed")
+            return False
+
     return True
 
 
@@ -831,14 +839,18 @@ def _get_or_create_env(task_id: str):
             image = overrides.get("modal_image") or config["modal_image"]
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
+        elif env_type == "kubernetes":
+            image = overrides.get("kubernetes_image") or config["kubernetes_image"]
         else:
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+        if env_type in {"docker", "singularity", "modal", "daytona",
+                        "vercel_sandbox", "kubernetes"}:
             container_config = {
+                "kubernetes": config.get("kubernetes", {}),
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),

@@ -256,8 +256,13 @@ export const ENUM_OPTIONS: Record<string, string[]> = {
   // shadow that and hide user-installed/pip providers (#49513).
   // Terminal execution backends — kept in sync with the dispatch ladder in
   // tools/terminal_tool.py::_create_environment (local/docker/singularity/
-  // modal/daytona/ssh). Remote backends need extra env (image, tokens, host).
-  'terminal.backend': ['local', 'docker', 'singularity', 'modal', 'daytona', 'ssh'],
+  // modal/daytona/ssh/kubernetes). Remote backends need extra env (image,
+  // tokens, host); kubernetes is configured entirely under terminal.kubernetes.*.
+  'terminal.backend': ['local', 'docker', 'singularity', 'modal', 'daytona', 'ssh', 'kubernetes'],
+  // direct = raw Pod via the core API; sandbox = Sandbox CR reconciled by
+  // agent-sandbox-operator. Sync with VALID_PROVISIONERS in
+  // tools/environments/kubernetes.py.
+  'terminal.kubernetes.provisioner': ['direct', 'sandbox'],
   'stt.elevenlabs.model_id': ['scribe_v2', 'scribe_v1'],
   'stt.local.model': ['tiny', 'base', 'small', 'medium', 'large-v3'],
   // Speech-to-text backends — kept in sync with the stt block in

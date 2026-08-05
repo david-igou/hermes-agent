@@ -668,6 +668,8 @@ def load_cli_config() -> Dict[str, Any]:
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
         "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
+        # Whole terminal.kubernetes.* block as one internal JSON env var.
+        "kubernetes": "TERMINAL_KUBERNETES",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",

@@ -326,8 +326,99 @@ terminal:
 #   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"
 #   container_disk: 10240          # Daytona max is 10GB per sandbox
 
+# -----------------------------------------------------------------------------
+# OPTION 7: Kubernetes session pods
+# Each session runs in its own pod in a Kubernetes / OpenShift cluster; every
+# command is exec'd into that pod.
+# Great for: running Hermes in-cluster with real workload isolation, kata /
+#            sandboxed-containers runtimes, cluster-managed quotas and storage
+# Requires: pip install 'hermes-agent[kubernetes]' (also lazy-installed on first
+#           use) and the RBAC in k8s/rbac.yaml
 #
-# --- Container resource limits (docker, singularity, modal, daytona -- ignored for local/ssh) ---
+# IMPORTANT: every setting for this backend lives HERE, in config.yaml. There
+# are no TERMINAL_KUBERNETES_* environment variables — .env is for secrets, and
+# this backend has no credential of its own: in-cluster auth is the projected
+# ServiceAccount token the kubelet mounts into the Hermes pod.
+# -----------------------------------------------------------------------------
+# terminal:
+#   backend: "kubernetes"
+#   cwd: "/workspace"              # should match kubernetes.mount_path
+#   timeout: 180
+#   lifetime_seconds: 300
+#   kubernetes:
+#     provisioner: "direct"        # direct = raw Pod (+PVC) via the core API
+#                                  # sandbox = Sandbox CR (agents.x-k8s.io/v1beta1)
+#                                  #           reconciled by agent-sandbox-operator
+#     namespace: ""                # "" -> the in-cluster ServiceAccount namespace
+#     kubeconfig: ""               # out-of-cluster dev only (a PATH, not a secret)
+#     context: ""
+#
+#     image: "nikolaik/python-nodejs:python3.11-nodejs20"
+#     image_pull_policy: "IfNotPresent"
+#     image_pull_secrets: []       # Secret NAMES, not secret values
+#     service_account: "hermes-session-noperms"
+#     automount_service_account_token: false
+#     runtime_class_name: ""       # "kata" for OpenShift sandboxed containers
+#     node_selector: {}
+#     tolerations: []
+#     labels: {}
+#     annotations: {}
+#     env: {}                      # literal env vars inside the session container
+#     mount_path: "/workspace"
+#     pod_template_overrides: {}   # strategic-merge patch applied last
+#
+#     persistent: false            # opt-in retained PVC per task; NOT inherited
+#                                  # from container_persistent
+#     volume:
+#       size: ""                   # "" -> {container_disk}Mi
+#       storage_class_name: ""     # "" -> cluster default StorageClass
+#       access_modes: ["ReadWriteOnce"]
+#     active_deadline_seconds: 14400   # ephemeral pods only (leak backstop)
+#     ready_timeout_seconds: 120       # raise for slow pulls / kata runtimes
+#     owner_reference: "auto"          # auto | off (GC session pods with the agent pod)
+#
+#     security_context:
+#       run_as_non_root: true
+#       # null omits runAsUser so OpenShift's restricted-v2 SCC assigns a UID
+#       # from the namespace range. On VANILLA Kubernetes set an integer (e.g.
+#       # 1000) plus fs_group, or runAsNonRoot rejects root-default images and
+#       # the workspace volume is not writable by the non-root uid.
+#       run_as_user: null
+#       fs_group: null
+#       seccomp_profile: "RuntimeDefault"
+#       allow_privilege_escalation: false
+#       drop_capabilities: ["ALL"]
+#       read_only_root_filesystem: false
+#
+#     # Kubernetes quantity strings; "" falls back to container_cpu /
+#     # container_memory / container_disk below. Set limits on OpenShift, where
+#     # a ResourceQuota covering limits.* rejects a requests-only pod.
+#     resources:
+#       requests: {cpu: "", memory: ""}
+#       limits: {cpu: "", memory: "", ephemeral_storage: ""}
+#
+#     sandbox:                     # only read when provisioner: sandbox
+#       api_group: "agents.x-k8s.io"
+#       api_version: "v1beta1"
+#       template_ref: ""           # SandboxTemplate name
+#       use_claim: false           # SandboxClaim (requires template_ref)
+#       ttl_seconds: null
+#       ready_condition: "Ready"
+#       spec_overrides: {}
+#
+# Minimal OpenShift 4.21 + kata example:
+# terminal:
+#   backend: "kubernetes"
+#   kubernetes:
+#     namespace: "hermes-agents"
+#     runtime_class_name: "kata"
+#     ready_timeout_seconds: 300
+#     resources:
+#       requests: {cpu: "500m", memory: "2Gi"}
+#       limits:   {cpu: "2",    memory: "4Gi"}
+
+#
+# --- Container resource limits (docker, singularity, modal, daytona, kubernetes -- ignored for local/ssh) ---
 # These settings apply to all container backends. They control the resources
 # allocated to the sandbox and whether its filesystem persists across sessions.
   container_cpu: 1              # CPU cores

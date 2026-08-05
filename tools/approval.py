@@ -3240,7 +3240,12 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     at that point a command like ``rm -rf /workspace`` reaches host files, so it
     must go through the normal approval flow.
     """
-    if env_type == "docker":
+    if env_type in ("docker", "kubernetes"):
+        # Kubernetes follows the Docker precedent rather than being blanket
+        # trusted: an ephemeral session pod with an emptyDir workspace is a
+        # throwaway sandbox, but a pod backed by a persistent PVC (or holding a
+        # mounted ServiceAccount token) can destroy durable state, so it keeps
+        # the guards. See terminal_tool._kubernetes_has_host_access.
         return not has_host_access
     return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
 

@@ -116,11 +116,11 @@ Before that stash step, Hermes also restores tracked `package-lock.json` diffs l
 
 ## Terminal Backend Configuration
 
-Hermes supports seven terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, a Vercel Sandbox, or a Singularity/Apptainer container.
+Hermes supports eight terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, a Vercel Sandbox, a Singularity/Apptainer container, or a per-session pod in a Kubernetes/OpenShift cluster.
 
 ```yaml
 terminal:
-  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | singularity
+  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | singularity | kubernetes
   cwd: "."          # Gateway/cron working directory (CLI always uses launch dir)
   font_family: ""   # Desktop terminal font; e.g. "MesloLGS NF"
   timeout: 180      # Per-command timeout in seconds
@@ -146,6 +146,7 @@ For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persi
 | **daytona** | Daytona workspace | Full (cloud container) | Managed cloud dev environments |
 | **vercel_sandbox** | Vercel Sandbox | Full (cloud microVM) | Cloud execution with snapshot-backed filesystem persistence |
 | **singularity** | Singularity/Apptainer container | Namespaces (--containall) | HPC clusters, shared machines |
+| **kubernetes** | Per-session pod in your cluster | Full (pod, no-perms SA, optional kata runtime) | Running Hermes in-cluster with cluster-managed quotas and storage |
 
 ### Local Backend
 
@@ -424,6 +425,50 @@ OIDC tokens are short-lived and should not be used as the documented deployment 
 **Background commands:** `terminal(background=true)` uses Hermes' generic non-local background process flow. You can spawn, poll, wait, view logs, and kill processes through the normal process tool while the sandbox is alive. Hermes does not provide native Vercel detached-process recovery after cleanup or restart.
 
 **Disk sizing:** Vercel Sandbox does not currently support Hermes' `container_disk` resource knob. Leave `container_disk` unset or at the shared default `51200`; non-default values fail diagnostics and backend creation instead of being silently ignored.
+
+### Kubernetes Backend
+
+Runs each session in its own pod in a Kubernetes or OpenShift cluster; every command is exec'd into that pod. Built for running Hermes itself in-cluster.
+
+**Every setting is a `config.yaml` key under `terminal.kubernetes.*`. There are no `TERMINAL_KUBERNETES_*` environment variables**, and none should be added — `.env` is for secrets, and this backend has no credential of its own: in-cluster authentication is the projected ServiceAccount token the kubelet mounts into the Hermes pod.
+
+```yaml
+terminal:
+  backend: kubernetes
+  cwd: /workspace                  # match kubernetes.mount_path
+  kubernetes:
+    provisioner: direct            # direct | sandbox
+    namespace: ""                  # "" -> the in-cluster ServiceAccount namespace
+    image: nikolaik/python-nodejs:python3.11-nodejs20
+    service_account: hermes-session-noperms
+    runtime_class_name: ""         # "kata" for OpenShift sandboxed containers
+    mount_path: /workspace
+    persistent: false              # opt-in retained PVC per task
+    ready_timeout_seconds: 120
+    resources:
+      requests: {cpu: "500m", memory: "2Gi"}
+      limits:   {cpu: "2",    memory: "4Gi"}
+```
+
+`cli-config.yaml.example` (OPTION 7) documents the full key set, including `node_selector`, `tolerations`, `labels`, `annotations`, `env`, `volume.*`, `security_context.*`, `pod_template_overrides`, and `sandbox.*`.
+
+**Required install:**
+
+```bash
+pip install 'hermes-agent[kubernetes]'
+```
+
+Hermes also lazy-installs the client on first use.
+
+**Required RBAC:** apply `k8s/rbac.yaml` (pick the Role matching your provisioner), then run `hermes doctor` — it issues `SelfSubjectAccessReview` checks for `create pods`, `create pods/exec`, and `create sandboxes.agents.x-k8s.io`. See [`k8s/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/k8s/README.md) for the network policy and admission-policy manifests.
+
+**Authentication:** in-cluster ServiceAccount first, then `terminal.kubernetes.kubeconfig`, then the ambient `KUBECONFIG` / `~/.kube/config` for out-of-cluster development.
+
+**Provisioners:** `direct` creates a raw `Pod` (plus a `PersistentVolumeClaim` when `persistent: true`). `sandbox` creates a `Sandbox` custom resource (`agents.x-k8s.io/v1beta1`) reconciled by agent-sandbox-operator and execs into the pod it produces; the agent ServiceAccount then needs `sandboxes` create/delete but not bare `pods` create/delete.
+
+**Persistence:** `terminal.kubernetes.persistent` is deliberately independent of the shared `container_persistent`. A cluster sandbox defaults to ephemeral (`emptyDir`). When enabled, the PVC is retained across sessions and is never deleted by Hermes, so reap old `hermes-ws-*` claims yourself.
+
+**OpenShift:** leave `security_context.run_as_user` unset so the `restricted-v2` SCC assigns a UID from the namespace range — a hard-coded value outside that range is rejected at admission. Set `resources.limits` when the namespace has a `ResourceQuota` covering `limits.*`.
 
 ### Singularity/Apptainer Backend
 
