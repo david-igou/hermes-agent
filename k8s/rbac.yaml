@@ -43,20 +43,28 @@ rules:
   # ownerReference that garbage-collects session pods when the agent dies, and
   # reads pod status for readiness diagnostics (ImagePullBackOff,
   # CreateContainerConfigError, SCC denial) and the container list.
+  # No `list`: the direct provisioner only ever addresses pods BY NAME, and
+  # `list pods` would let a compromised agent enumerate every pod in the
+  # namespace (the Hermes pod itself, any co-tenant) — which get-by-name does
+  # not.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["create", "get", "delete"]
   # PVCs backing persistent workspaces. NO delete: the backend deliberately
   # never deletes a PVC (a persistent workspace must outlive the agent pod),
-  # so granting delete would only widen the blast radius.
+  # so granting delete would only widen the blast radius. No `list` either —
+  # the claim is read by name.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "get", "list"]
-  # Streaming exec into the session pod. `get` is load-bearing: the python
-  # client upgrades via connect_get_namespaced_pod_exec (SPDY/WS GET).
+    verbs: ["create", "get"]
+  # Streaming exec into the session pod. `get` is the verb that is actually
+  # exercised: the python client upgrades via connect_get_namespaced_pod_exec,
+  # a websocket GET, which kube-apiserver authorizes as `get`. `create` is kept
+  # for kubectl-shaped tooling and client versions that POST; drop it if you
+  # only ever run Hermes against this Role.
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["create", "get"]
+    verbs: ["get", "create"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -83,28 +91,32 @@ metadata:
   name: hermes-session-sandbox
   namespace: <AGENT_NAMESPACE>
 rules:
-  # No `watch`: readiness is polled with get_namespaced_custom_object.
+  # No `watch` and no `list`: readiness is polled with
+  # get_namespaced_custom_object, and the CR is always addressed by name.
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["create", "get", "delete"]
   # Only needed when terminal.kubernetes.sandbox.use_claim is true.
   - apiGroups: ["extensions.agents.x-k8s.io"]
     resources: ["sandboxclaims"]
-    verbs: ["create", "get", "list", "delete"]
+    verbs: ["create", "get", "delete"]
   # NOTE: sandboxtemplates / sandboxwarmpools are deliberately absent — the
   # backend never reads them; the operator resolves the template reference.
   # Resolve the reconciled pod (name, readiness, container list) and exec.
+  # `list` IS used here (and only here): when the operator's status carries no
+  # podRef, _resolve_pod_name falls back to a label selector.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  # See the direct Role above: `get` is the verb the client actually exercises.
   - apiGroups: [""]
     resources: ["pods/exec"]
-    verbs: ["create", "get"]
+    verbs: ["get", "create"]
   # Only when terminal.kubernetes.persistent is true AND no SandboxTemplate
-  # supplies the volume.
+  # supplies the volume. Read by name; no `list`.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "get", "list"]
+    verbs: ["create", "get"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

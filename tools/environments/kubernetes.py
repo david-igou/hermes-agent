@@ -96,8 +96,15 @@ DEFAULT_KUBERNETES_CONFIG: dict[str, Any] = {
     "labels": {},
     "annotations": {},
     # Literal NON-SECRET env vars inside the session container. config.yaml is
-    # the non-secret half of the config split: put API keys in a Secret and
-    # reference it by NAME via pod_template_overrides (envFrom/secretKeyRef).
+    # the non-secret half of the config split, so never put an API key here.
+    #
+    # The session pod is credential-free BY DESIGN. You *can* reference a
+    # Secret by name through pod_template_overrides (envFrom / secretKeyRef),
+    # but know the two consequences: k8s/validatingadmissionpolicy.yaml DENIES
+    # secret-backed env and secret volumes alike (a pod that can name any
+    # Secret in the namespace can exfiltrate it), and unhardened_reasons()
+    # counts such a pod as not-a-throwaway-sandbox, so the dangerous-command
+    # approval prompts stay on.
     "env": {},
     "mount_path": "/workspace",
     # Strategic-merge patch applied last onto the built pod template. Lists of
@@ -188,11 +195,26 @@ def strategic_merge(base: dict, overlay: Any) -> dict:
     A plain deep merge replaces the whole ``containers`` list, silently
     dropping ``image``/``command``/``volumeMounts``/``securityContext`` and
     leaving a pod that never becomes Ready.  So lists whose elements are all
-    dicts with a ``name`` (containers, initContainers, volumes, volumeMounts,
-    env, imagePullSecrets, ...) merge element-wise on that key — the same
-    ``patchMergeKey: name`` Kubernetes itself uses for those fields.  Every
-    other list (tolerations, capabilities.drop, command, args) replaces
-    wholesale, as it does upstream.
+    dicts with a ``name`` merge element-wise on that key.  Every other list
+    (tolerations, capabilities.drop, command, args) replaces wholesale, as it
+    does upstream.
+
+    Fidelity caveat — ``name`` is used for EVERY such list, which is not what
+    the API server does for all of them:
+
+    * MATCHES upstream for ``containers``, ``initContainers``, ``volumes``,
+      ``env`` and ``imagePullSecrets``, whose ``patchMergeKey`` really is
+      ``name`` (``tolerations`` has no merge key upstream and replaces here
+      too, which also matches);
+    * DIVERGES for ``volumeMounts`` (upstream ``patchMergeKey: mountPath``) and
+      ``ports`` (upstream ``containerPort``).  An override that adds a
+      volumeMount with a NEW name but an EXISTING mountPath appends here and
+      would replace under a real ``kubectl patch``, giving a duplicate-mountPath
+      pod the kubelet rejects.
+
+    The divergence is deliberate (one keying rule is predictable and needs no
+    per-field table) but it is a divergence, so ``pod_template_overrides`` is
+    "strategic-merge shaped", not byte-for-byte strategic merge.
     """
     out = deepcopy(base)
     if not isinstance(overlay, dict):
@@ -223,6 +245,58 @@ def _dig_dict(obj: Any, *path: str) -> dict:
             return {}
         obj = obj.get(key)
     return obj if isinstance(obj, dict) else {}
+
+
+def _lookup(obj: Any, path: "tuple[str, ...]") -> "tuple[bool, Any]":
+    """Return ``(present, value)`` for *path* — distinguishing absent from null."""
+    for key in path:
+        if not isinstance(obj, dict) or key not in obj:
+            return False, None
+        obj = obj[key]
+    return True, obj
+
+
+def _pod_template_override_layers(kcfg: dict) -> "list[tuple[str, dict]]":
+    """EVERY override layer applied to the pod template, in application order.
+
+    THE single source of truth for "what can still change the pod after the
+    builder has run".  :func:`build_pod_template` applies exactly these layers
+    and :func:`unhardened_reasons` judges the result, so a new layer added here
+    is automatically both rendered and judged — and one added anywhere else is
+    caught by ``SandboxProvisioner.sandbox_manifest``, which re-asserts the
+    rendered template over its own merge output rather than producing a second
+    one, and by
+    ``test_the_judged_pod_template_is_the_submitted_pod_template``.
+
+    Round 2 shipped ``sandbox.spec_overrides`` as a SECOND override layer that
+    only the sandbox manifest builder applied: every security control that
+    inspected or stamped the builder's output (the hardening judge, the
+    managed-by re-stamp, the reserved-key validation) was bypassable by moving
+    the same YAML from ``pod_template_overrides`` into
+    ``sandbox.spec_overrides.podTemplate``.
+    """
+    layers: list[tuple[str, dict]] = []
+    overrides = kcfg.get("pod_template_overrides")
+    if isinstance(overrides, dict) and overrides:
+        layers.append(("pod_template_overrides", overrides))
+    if str(kcfg.get("provisioner") or "").strip().lower() == "sandbox":
+        spec_overrides = (kcfg.get("sandbox") or {}).get("spec_overrides")
+        if isinstance(spec_overrides, dict) and "podTemplate" in spec_overrides:
+            layers.append(
+                ("sandbox.spec_overrides.podTemplate",
+                 spec_overrides["podTemplate"]),
+            )
+    return layers
+
+
+def _is_rfc1123_name(value: str) -> bool:
+    """RFC-1123 label check INCLUDING the 63-character bound.
+
+    The bound is not cosmetic: without it the validator (and ``hermes doctor``)
+    passed a 70-character container_name that the API server then rejected at
+    create time, with an error the operator had to decode themselves.
+    """
+    return bool(value) and len(value) <= 63 and bool(_RFC1123_RE.match(value))
 
 
 def merge_kubernetes_config(user_config: Any) -> dict:
@@ -282,13 +356,13 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
     for field in ("namespace", "service_account", "runtime_class_name",
                   "container_name"):
         value = str(kcfg.get(field) or "")
-        if value and not _RFC1123_RE.match(value):
+        if value and not _is_rfc1123_name(value):
             problems.append(
                 f"terminal.kubernetes.{field}={value!r} is not a valid "
                 "RFC-1123 name (lowercase alphanumeric, '-', max 63 chars)"
             )
     claim_name = str((kcfg.get("volume") or {}).get("claim_name") or "")
-    if claim_name and not _RFC1123_RE.match(claim_name):
+    if claim_name and not _is_rfc1123_name(claim_name):
         problems.append(
             f"terminal.kubernetes.volume.claim_name={claim_name!r} is not a "
             "valid RFC-1123 name (lowercase alphanumeric, '-', max 63 chars)"
@@ -296,7 +370,8 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
 
     # The managed-by label is the selector for the shipped NetworkPolicy and
     # ValidatingAdmissionPolicy and for session-pod adoption. Overriding it
-    # silently drops the pod out of all three, so it is reserved.
+    # silently drops the pod out of all three, so it is reserved on EVERY
+    # override layer (see pod_template_override_layers).
     managed_by_key = next(iter(MANAGED_BY_LABEL))
     if managed_by_key in (kcfg.get("labels") or {}):
         problems.append(
@@ -304,13 +379,22 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
             "(k8s/networkpolicy.yaml, k8s/validatingadmissionpolicy.yaml and "
             "session-pod adoption all select on it); remove it"
         )
-    if managed_by_key in _dig_dict(
-        kcfg.get("pod_template_overrides") or {}, "metadata", "labels"
-    ):
-        problems.append(
-            "terminal.kubernetes.pod_template_overrides.metadata.labels: "
-            f"{managed_by_key!r} is reserved and cannot be overridden"
-        )
+    for layer_name, overlay in _pod_template_override_layers(kcfg):
+        if managed_by_key in _dig_dict(overlay, "metadata", "labels"):
+            problems.append(
+                f"terminal.kubernetes.{layer_name}.metadata.labels: "
+                f"{managed_by_key!r} is reserved and cannot be overridden"
+            )
+        # A scalar/null where the renderer expects a mapping used to surface as
+        # a raw AttributeError out of manifest construction while this
+        # validator — which exists to catch exactly that — reported no problem.
+        for path in (("metadata",), ("metadata", "labels"), ("spec",)):
+            present, node = _lookup(overlay, path)
+            if present and not isinstance(node, dict):
+                problems.append(
+                    f"terminal.kubernetes.{layer_name}.{'.'.join(path)} must be "
+                    f"a mapping (got {'null' if node is None else type(node).__name__})"
+                )
 
     sb = kcfg.get("sandbox") or {}
     if sb.get("use_claim") and not str(sb.get("template_ref") or "").strip():
@@ -378,7 +462,11 @@ def sanitize_name(raw: str, *, max_len: int = 40) -> str:
     slug = re.sub(r"[^a-z0-9-]+", "-", str(raw or "default").lower()).strip("-")
     if not slug:
         slug = "default"
-    if len(slug) > max_len or slug != str(raw or "").lower():
+    # Compared against the RAW input, not a lowercased copy: comparing against
+    # `raw.lower()` skipped the hash for case-only normalisation, so "Default"
+    # and "default" (two distinct RL/benchmark task ids) landed on the same pod
+    # AND the same PVC and silently shared one credential-file sync.
+    if len(slug) > max_len or slug != str(raw or ""):
         digest = hashlib.sha1(str(raw or "default").encode("utf-8")).hexdigest()[:6]
         slug = f"{slug[: max_len - 7].strip('-') or 'task'}-{digest}"
     return slug
@@ -559,11 +647,14 @@ def build_pod_template(
     labels: Optional[dict] = None,
     owned: bool = True,
 ) -> dict:
-    """Build the ``{"metadata": ..., "spec": ...}`` shared by both provisioners.
+    """Render THE final pod template — the artifact that reaches the API server.
 
-    ``DirectProvisioner`` posts this as a ``Pod``; ``SandboxProvisioner`` posts
-    it as ``Sandbox.spec.podTemplate``.  Keeping one builder is what makes
-    flipping ``terminal.kubernetes.provisioner`` a one-line change.
+    This is the ONE function that produces a pod template.  ``DirectProvisioner``
+    posts it as a ``Pod``; ``SandboxProvisioner`` posts it as
+    ``Sandbox.spec.podTemplate``.  Every override layer
+    (:func:`_pod_template_override_layers`) is applied HERE, so what
+    :func:`unhardened_reasons` judges is byte-for-byte what gets submitted —
+    there is no later layer for a security control to miss.
 
     *owned* is False when no ownerReference could be resolved — the one case
     where a persistent pod also needs the activeDeadlineSeconds backstop,
@@ -701,13 +792,35 @@ def build_pod_template(
         metadata["annotations"] = dict(kcfg["annotations"])
 
     template = {"metadata": metadata, "spec": spec}
-    overrides = kcfg.get("pod_template_overrides") or {}
-    if overrides:
-        template = strategic_merge(template, overrides)
-        # Re-stamp after the override merge, for the same reason.
-        template.setdefault("metadata", {}).setdefault("labels", {}).update(
-            MANAGED_BY_LABEL
-        )
+    for _layer_name, overlay in _pod_template_override_layers(kcfg):
+        template = strategic_merge(template, overlay)
+    # Re-stamp after the LAST override layer, for the same reason, and
+    # tolerating a layer that replaced metadata/labels with a scalar or null.
+    return _stamp_managed_by(template)
+
+
+def _stamp_managed_by(template: Any) -> dict:
+    """Force ``MANAGED_BY_LABEL`` onto *template*'s metadata.labels.
+
+    Runs after the last override layer.  Written defensively because
+    ``strategic_merge`` faithfully replaces a dict with whatever the overlay
+    supplies: ``metadata: null`` or ``labels: 7`` used to raise a bare
+    ``AttributeError`` out of manifest construction.  The label is not
+    negotiable — it is the selector for k8s/networkpolicy.yaml and for the
+    ValidatingAdmissionPolicy matchCondition — so a malformed layer loses its
+    metadata, it does not lose the label.
+    """
+    if not isinstance(template, dict):
+        template = {}
+    metadata = template.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        template["metadata"] = metadata
+    labels = metadata.get("labels")
+    if not isinstance(labels, dict):
+        labels = {}
+        metadata["labels"] = labels
+    labels.update(MANAGED_BY_LABEL)
     return template
 
 
@@ -721,22 +834,61 @@ def build_pod_template(
 _SANDBOX_VOLUME_TYPES = frozenset({"emptyDir"})
 
 
+def _container_pulls_in_a_secret(container: dict) -> bool:
+    """True when a container reads a Secret through env rather than a volume."""
+    for source in (container.get("envFrom") or []):
+        if isinstance(source, dict) and source.get("secretRef"):
+            return True
+    for entry in (container.get("env") or []):
+        if not isinstance(entry, dict):
+            continue
+        if _dig_dict(entry, "valueFrom").get("secretKeyRef"):
+            return True
+    return False
+
+
 def unhardened_reasons(kcfg: dict) -> list[str]:
-    """Why the pod this config BUILDS is not a throwaway sandbox (empty = it is).
+    """Why the pod this config SUBMITS is not a throwaway sandbox (empty = it is).
 
     ``tools.approval`` skips the dangerous-command guards for backends whose
     workload cannot touch anything durable.  The justification for putting
     ``kubernetes`` on that path is an ephemeral, non-root, drop-ALL,
-    token-less, emptyDir pod — so the verdict must be derived from the
-    RENDERED pod template, not from a hand-picked subset of config keys.
-    ``security_context`` and ``pod_template_overrides`` (merged last) can
-    re-grant every one of those properties, and anything short of full
-    hardening has to keep the guards.
+    token-less, secret-free, emptyDir pod.
+
+    This is the ONE judge, and it judges the FINAL rendered pod template — the
+    exact artifact :func:`build_pod_template` hands to whichever provisioner is
+    selected, after every override layer in
+    :func:`_pod_template_override_layers`.  Judging the builder's output while a
+    provisioner applied a further layer is what let ``provisioner: sandbox``
+    keep the approval skip with ``hostPID``, ``hostNetwork``, a hostPath ``/``
+    volume and a privileged container, purely by writing them under
+    ``sandbox.spec_overrides.podTemplate`` instead of
+    ``pod_template_overrides``.
+
+    When the pod shape is NOT authored here at all (``sandbox.template_ref`` /
+    ``sandbox.use_claim``: agent-sandbox-operator builds the pod from a
+    SandboxTemplate that Hermes never reads) there is nothing to judge, and
+    "cannot be evaluated" must never read as "hardened".
+
+    Any exception fails closed — see ``_kubernetes_has_host_access``, which
+    also treats a raise as untrusted.
     """
     reasons: list[str] = []
     if kcfg.get("persistent"):
         # `rm -rf /workspace` would destroy a PVC the user asked to keep.
         reasons.append("persistent: true (durable PVC workspace)")
+
+    if str(kcfg.get("provisioner") or "").strip().lower() == "sandbox":
+        sb = kcfg.get("sandbox") or {}
+        if str(sb.get("template_ref") or "").strip() or sb.get("use_claim"):
+            # Unconditional: the operator's SandboxTemplate supplies the whole
+            # pod shape and Hermes never reads it, so no property below can be
+            # established. Unknown is not hardened.
+            reasons.append(
+                "sandbox.template_ref/use_claim: the pod shape comes from a "
+                "SandboxTemplate this backend never reads and cannot evaluate"
+            )
+            return reasons
 
     try:
         template = build_pod_template(
@@ -749,7 +901,9 @@ def unhardened_reasons(kcfg: dict) -> list[str]:
     except Exception as exc:  # unrenderable config -> assume untrusted
         return reasons + [f"pod template could not be rendered ({exc})"]
 
-    spec = template.get("spec") or {}
+    spec = template.get("spec")
+    if not isinstance(spec, dict):
+        return reasons + ["pod template has no spec mapping"]
     if (spec.get("securityContext") or {}).get("runAsNonRoot") is not True:
         reasons.append("pod securityContext.runAsNonRoot is not true")
     if spec.get("automountServiceAccountToken") is not False:
@@ -788,6 +942,15 @@ def unhardened_reasons(kcfg: dict) -> list[str]:
         if capabilities.get("add"):
             reasons.append(
                 f"container {name} adds capabilities {list(capabilities['add'])}"
+            )
+        # Secret VOLUMES are flagged below; env is the same exfiltration
+        # surface with none of the visibility, and it is the shape the config
+        # docs suggest for provider keys. A pod holding namespace credentials
+        # is not a throwaway sandbox, whichever door they came through.
+        if _container_pulls_in_a_secret(entry):
+            reasons.append(
+                f"container {name} pulls a Secret into its environment "
+                "(envFrom.secretRef / env[].valueFrom.secretKeyRef)"
             )
 
     for volume in (spec.get("volumes") or []):
@@ -913,13 +1076,47 @@ class _BaseProvisioner(WorkspaceProvisioner):
             "spec": spec,
         }
 
+    def _assert_pvc_is_ours(self, pvc, name: str) -> None:
+        """Refuse to adopt a PVC this backend did not create.
+
+        Adoption is not free: the claim is mounted at ``mount_path``, which is
+        the agent's cwd, and ``KubernetesEnvironment`` immediately syncs its
+        credential files into ``<cwd>/.hermes`` — i.e. into this claim, at
+        rest, on a volume Hermes never deletes.  Pod adoption was hardened in
+        round 2 (``DirectProvisioner._is_ours``); this path had no check at
+        all, so a claim someone else created under the conventional name was
+        adopted silently.
+
+        The check is the managed-by label, NOT an ownerReference: the claim
+        deliberately carries none (it must outlive the agent pod) and is
+        deliberately task-scoped rather than instance-scoped, so sharing it
+        between Hermes instances running the same task id is the DESIGNED
+        behaviour — see ``pvc_name`` and k8s/README.md.  What we can and do
+        refuse is a claim that is not a Hermes workspace at all.
+        """
+        labels = getattr(getattr(pvc, "metadata", None), "labels", None)
+        if labels is None and isinstance(pvc, dict):
+            labels = _dig_dict(pvc, "metadata").get("labels")
+        labels = labels or {}
+        managed_by_key, managed_by_value = next(iter(MANAGED_BY_LABEL.items()))
+        if labels.get(managed_by_key) != managed_by_value:
+            raise RuntimeError(
+                f"persistentvolumeclaim {name} already exists and is not a "
+                f"Hermes workspace ({managed_by_key}="
+                f"{labels.get(managed_by_key)!r}); refusing to mount it. The "
+                "agent's credential files are synced into this claim. Set "
+                "terminal.kubernetes.volume.claim_name to a name of your own."
+            )
+
     def _ensure_pvc(self, task_id: str, resources: Resources) -> None:
         from kubernetes.client.exceptions import ApiException
 
+        name = self.pvc_name(task_id)
         try:
-            self._api.read_namespaced_persistent_volume_claim(
-                name=self.pvc_name(task_id), namespace=self.namespace
+            existing = self._api.read_namespaced_persistent_volume_claim(
+                name=name, namespace=self.namespace
             )
+            self._assert_pvc_is_ours(existing, name)
             return
         except ApiException as exc:
             if exc.status != 404:
@@ -929,10 +1126,20 @@ class _BaseProvisioner(WorkspaceProvisioner):
                 namespace=self.namespace, body=self.pvc_manifest(task_id, resources)
             )
         except ApiException as exc:
-            # Lost a create race with a concurrent session — the PVC exists,
-            # which is exactly what we wanted.
+            # Lost a create race — the PVC exists, which is what we wanted, but
+            # the winner still has to be a Hermes workspace.
             if exc.status != 409:
                 raise
+            try:
+                raced = self._api.read_namespaced_persistent_volume_claim(
+                    name=name, namespace=self.namespace
+                )
+            except Exception as read_exc:
+                raise RuntimeError(
+                    f"persistentvolumeclaim {name} already exists but could not "
+                    f"be read ({read_exc}); refusing to mount it."
+                ) from read_exc
+            self._assert_pvc_is_ours(raced, name)
 
     # -- readiness ------------------------------------------------------
     def _pod_failure_detail(self, pod) -> str:
@@ -1158,12 +1365,16 @@ class SandboxProvisioner(_BaseProvisioner):
         self, task_id: str, persistent: bool, image: str, resources: Resources
     ) -> dict:
         spec: dict[str, Any] = {}
+        pod_template: Optional[dict] = None
         if self.template_ref:
             # The operator's template supplies the pod shape; the shared
             # terminal.kubernetes.* pod keys are intentionally not sent.
             spec["sandboxTemplateRef"] = {"name": self.template_ref}
         else:
-            spec["podTemplate"] = build_pod_template(
+            # build_pod_template already applied
+            # sandbox.spec_overrides.podTemplate (it is a declared override
+            # layer), so this IS the final, judged template.
+            pod_template = build_pod_template(
                 self.kcfg,
                 persistent=persistent,
                 image=image,
@@ -1171,10 +1382,25 @@ class SandboxProvisioner(_BaseProvisioner):
                 pvc_name=self.pvc_name(task_id),
                 owned=self._owner_reference is not None,
             )
+            spec["podTemplate"] = pod_template
         if self.ttl_seconds:
             spec["ttlSeconds"] = int(self.ttl_seconds)
         if self.spec_overrides:
             spec = strategic_merge(spec, self.spec_overrides)
+            # Re-assert the rendered template over the merge result. Without
+            # this, spec_overrides is a SECOND pod-template layer that the
+            # hardening judge and the managed-by re-stamp never see — the root
+            # cause of the sandbox-mode bypass. Re-assertion is a no-op for a
+            # well-formed config (the layer was already applied above) and
+            # makes it structurally impossible for this merge to emit a pod
+            # template nothing judged.
+            if pod_template is not None:
+                spec["podTemplate"] = pod_template
+            elif isinstance(spec.get("podTemplate"), dict):
+                # template_ref mode: we author no template, so an overlay one
+                # is stamped but NOT trusted — unhardened_reasons returns an
+                # unconditional reason for template_ref/use_claim.
+                spec["podTemplate"] = _stamp_managed_by(spec["podTemplate"])
 
         metadata: dict[str, Any] = {
             "name": self.workspace_name(task_id),
@@ -1288,7 +1514,7 @@ class SandboxProvisioner(_BaseProvisioner):
                 return value
         return None
 
-    def _resolve_pod_name(self, sandbox: dict, sandbox_name: str) -> Optional[str]:
+    def _resolve_pod_name(self, sandbox: dict, sandbox_name: str) -> "tuple[str, bool]":
         """Find the pod agent-sandbox-operator reconciled for this Sandbox.
 
         Status field names differ across operator releases, so probe the known
@@ -1296,10 +1522,15 @@ class SandboxProvisioner(_BaseProvisioner):
         the pod is named after the Sandbox.  Called ONCE, after readiness: the
         label fallback issues three LISTs, and running it on every 0.5s poll
         meant up to 720 LISTs per session provisioning.
+
+        Returns ``(pod_name, proven)``.  ``proven`` is False for the pure
+        name-convention fallback, where nothing tied the pod to our Sandbox —
+        the name is guessable by anything that can list pods in the namespace,
+        and the next thing that happens is a credential-file upload into it.
         """
         from_status = self._pod_name_from_status(sandbox)
         if from_status:
-            return from_status
+            return from_status, True
 
         if self._api is not None:
             for selector in (
@@ -1315,8 +1546,8 @@ class SandboxProvisioner(_BaseProvisioner):
                     continue
                 items = getattr(pods, "items", None) or []
                 if items:
-                    return items[0].metadata.name
-        return sandbox_name
+                    return items[0].metadata.name, True
+        return sandbox_name, False
 
     def _wait_sandbox(self, plural: str, name: str, group: str) -> dict:
         """Poll a Sandbox/SandboxClaim until it reports Ready (or times out)."""
@@ -1382,29 +1613,44 @@ class SandboxProvisioner(_BaseProvisioner):
             sandbox_name = name
 
         sandbox = self._wait_sandbox("sandboxes", sandbox_name, self.group)
-        pod_name = self._resolve_pod_name(sandbox, sandbox_name)
+        pod_name, proven = self._resolve_pod_name(sandbox, sandbox_name)
         pod = self.wait_pod_ready(pod_name)
-        self._assert_pod_belongs(pod, pod_name, sandbox, sandbox_name)
+        self._assert_pod_belongs(pod, pod_name, sandbox, sandbox_name,
+                                 proven=proven)
         # The pod was built by the operator (SandboxTemplate/warm pool) or by
         # us (podTemplate), so the container name must come from the pod.
         return PodRef(self.namespace, pod_name, self.pick_container(pod))
 
     def _assert_pod_belongs(self, pod, pod_name: str, sandbox: dict,
-                            sandbox_name: str) -> None:
+                            sandbox_name: str, *, proven: bool = True) -> None:
         """Refuse to exec into a pod that something else owns.
 
-        Only ``status.podRef`` is authoritative; the label lookup and the
-        name convention are guesses.  If the pod declares owners and none of
-        them is our Sandbox we resolved the wrong pod — and the very next
-        thing that happens is a credential-file upload into it.
+        Only ``status.podRef`` (and the operator's own labels) tie a pod to our
+        Sandbox; the bare name convention is a guess.  If the pod declares
+        owners and none of them is our Sandbox we resolved the wrong pod — and
+        the very next thing that happens is a credential-file upload into it.
+
+        *proven* is False on the name-convention path, where ownership must be
+        POSITIVELY established: an unowned pod under a guessable name is
+        exactly what a co-tenant's workload looks like, so "declares no
+        owners" stops being a free pass there.
         """
         sandbox_uid = _dig_dict(sandbox, "metadata").get("uid")
         owners = getattr(
             getattr(pod, "metadata", None), "owner_references", None
         ) or []
-        if not sandbox_uid or not owners:
+        if sandbox_uid and any(
+            getattr(o, "uid", None) == sandbox_uid for o in owners
+        ):
             return
-        if any(getattr(o, "uid", None) == sandbox_uid for o in owners):
+        if not proven:
+            raise RuntimeError(
+                f"pod {pod_name} was resolved only by name convention from "
+                f"sandbox {sandbox_name} and does not carry an ownerReference "
+                "to it; refusing to exec into it. The operator's status shape "
+                "is unrecognised — file it, or use provisioner: direct."
+            )
+        if not sandbox_uid or not owners:
             return
         raise RuntimeError(
             f"pod {pod_name} is not owned by sandbox {sandbox_name} "
@@ -1441,6 +1687,41 @@ class SandboxProvisioner(_BaseProvisioner):
 # ---------------------------------------------------------------------------
 
 
+class _ExecState:
+    """Cancellation state for ONE exec — never for the environment.
+
+    Why per-exec rather than a per-environment execution lock:
+
+    ``BaseEnvironment.execute()`` deliberately has no serialising lock, and the
+    handle it hands back is the caller's to ``kill()`` at any time.  Crucially
+    ``_wait_for_process`` calls ``_kill_process()`` on an ORDINARY TIMEOUT, not
+    only on a user interrupt — so with a single-slot ``_active_stream`` /
+    ``_cancelled`` per environment, command A timing out closed whatever stream
+    happened to be registered, which under the concurrency this backend already
+    documents as routine (gateway/TUI/desktop collapse the terminal to one
+    "default" environment; ACP runs each session in its own thread) was command
+    B's.  B returned rc=130 "interrupted" with truncated output while A ran on.
+
+    Serialising execs on the environment would fix the race but change the
+    contract every other backend implements: local/docker run overlapping
+    commands, ``cleanup()`` is called from the idle-reaper thread while an exec
+    may be in flight, and a lock held for the full duration of a long command
+    would block that teardown (and any concurrent session) for minutes.  Binding
+    the state to the exec keeps the contract and makes kill() address exactly
+    the command whose handle was killed.
+
+    The environment lock still guards these two fields: the worker thread
+    publishes ``stream`` while the caller's thread may be reading it in
+    ``cancel()``.
+    """
+
+    __slots__ = ("stream", "cancelled")
+
+    def __init__(self) -> None:
+        self.stream = None
+        self.cancelled = False
+
+
 class KubernetesEnvironment(BaseEnvironment):
     """Exec-into-session-pod backend. Lifecycle delegated to a provisioner."""
 
@@ -1467,8 +1748,6 @@ class KubernetesEnvironment(BaseEnvironment):
         self._resources = resources or Resources()
         self._exec_api = api  # configured CoreV1Api; falls back to a fresh one
         self._lock = threading.Lock()
-        self._active_stream = None
-        self._cancelled = False
         self._sync_manager = None
         # Captured once: the agent may `cd` away, but the synced ~/.hermes tree
         # must stay where the first sync put it.
@@ -1542,7 +1821,6 @@ class KubernetesEnvironment(BaseEnvironment):
         )
         with self._lock:
             self._pod_ref = pod_ref
-            self._cancelled = False
         # A fresh pod has none of the synced files or the env snapshot.
         if self._sync_manager is not None:
             try:
@@ -1582,6 +1860,13 @@ class KubernetesEnvironment(BaseEnvironment):
         from a background thread while an exec may be in flight.  So exec
         never touches the shared client — it gets its own, whose only job is
         to build the request.
+
+        Deliberately NOT cached per environment: one cached exec client would
+        be shared by exactly the overlapping execs this exists to separate,
+        reintroducing the interleaved save/restore.  ``ApiClient.__init__``
+        also builds a ``RESTClientObject``/``PoolManager`` that is never used
+        here and that ``close()`` does not tear down, so each exec leaves one
+        for the GC — no sockets are opened, and correctness beats the churn.
         """
         from kubernetes.client import ApiClient, CoreV1Api
 
@@ -1710,11 +1995,11 @@ class KubernetesEnvironment(BaseEnvironment):
         # is a backstop under _wait_for_process's own timeout, so a wedged
         # websocket cannot pin the worker thread forever.
         deadline = time.monotonic() + max(1, int(timeout or 0)) + _EXEC_GRACE_SECONDS
-        # Reset BEFORE the worker thread starts: doing it inside exec_fn (after
-        # _open_stream returned) erased a kill() that landed while the stream
-        # was still opening.
-        with self._lock:
-            self._cancelled = False
+        # Cancellation state belongs to THIS exec, not to the environment.
+        # Created before the worker thread starts: setting it inside exec_fn
+        # (after _open_stream returned) erased a kill() that landed while the
+        # stream was still opening.
+        state = _ExecState()
 
         def exec_fn() -> tuple[str, int]:
             chunks: list[str] = []
@@ -1723,8 +2008,8 @@ class KubernetesEnvironment(BaseEnvironment):
             try:
                 resp = self._open_stream(command)
                 with self._lock:
-                    self._active_stream = resp
-                    already_cancelled = self._cancelled
+                    state.stream = resp
+                    already_cancelled = state.cancelled
                 if already_cancelled:
                     # kill() landed while the stream was opening.
                     return "", 130
@@ -1741,7 +2026,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 # _ThreadedProcessHandle only writes to the output pipe on the
                 # success path.
                 with self._lock:
-                    cancelled = self._cancelled
+                    cancelled = state.cancelled
                 if not cancelled:
                     logger.warning("k8s: exec stream error: %s", exc)
                     chunks.append(f"\n[kubernetes exec error: {exc}]")
@@ -1749,14 +2034,14 @@ class KubernetesEnvironment(BaseEnvironment):
                 return "".join(chunks), (130 if cancelled else 1)
             finally:
                 with self._lock:
-                    self._active_stream = None
+                    state.stream = None
                 if resp is not None:
                     try:
                         resp.close()
                     except Exception:
                         pass
             with self._lock:
-                cancelled = self._cancelled
+                cancelled = state.cancelled
             if cancelled:
                 return "".join(chunks), 130
             if timed_out:
@@ -1772,8 +2057,8 @@ class KubernetesEnvironment(BaseEnvironment):
 
         def cancel() -> None:
             with self._lock:
-                self._cancelled = True
-                stream = self._active_stream
+                state.cancelled = True
+                stream = state.stream
             # Closing the websocket is the whole interrupt: the kubelet
             # terminates the exec'd process when the stream goes away.
             #

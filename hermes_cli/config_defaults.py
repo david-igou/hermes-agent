@@ -397,9 +397,12 @@ DEFAULT_CONFIG = {
             "labels": {},
             "annotations": {},
             # Literal NON-SECRET env vars in the session container. config.yaml
-            # is the non-secret half of the split: put API keys in a Secret and
-            # reference it by NAME through pod_template_overrides
-            # (envFrom / valueFrom.secretKeyRef).
+            # is the non-secret half of the split, so never put an API key
+            # here. The session pod is credential-free by design: you CAN
+            # reference a Secret through pod_template_overrides (envFrom /
+            # valueFrom.secretKeyRef), but k8s/validatingadmissionpolicy.yaml
+            # denies secret-backed env and secret volumes alike, and such a pod
+            # keeps the dangerous-command approval prompts on.
             "env": {},
             "mount_path": "/workspace",
             # Strategic-merge patch applied last onto the built pod template —

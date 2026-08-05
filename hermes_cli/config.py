@@ -3283,6 +3283,24 @@ def apply_terminal_config_to_env(
     # backfill-only.
     explicit_keys = terminal_cfg.keys() if config is not None else raw_terminal_cfg.keys()
 
+    # Effective backend = the value TERMINAL_ENV will actually carry, because
+    # that is what tools.terminal_tool._get_env_config() selects on. Reading
+    # terminal_cfg["backend"] instead was wrong twice over: in the merged
+    # config it ALWAYS defaults to "local" (a truthy value), which made the
+    # TERMINAL_ENV fallback dead code, so selecting the backend by environment
+    # variable silently dropped the entire terminal.kubernetes.* block and the
+    # backend ran on DEFAULT_KUBERNETES_CONFIG with nothing logged. This
+    # mirrors the same precedence the loop below applies to the backend key
+    # itself.
+    if "backend" in terminal_cfg and (
+        (should_override and "backend" in explicit_keys)
+        or "TERMINAL_ENV" not in target
+    ):
+        effective_backend = terminal_cfg.get("backend")
+    else:
+        effective_backend = target.get("TERMINAL_ENV") or terminal_cfg.get("backend")
+    effective_backend = str(effective_backend or "").strip().lower()
+
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
             continue
@@ -3290,11 +3308,10 @@ def apply_terminal_config_to_env(
         if cfg_key == "kubernetes":
             # Only the kubernetes backend reads this ~1.2KB JSON blob. Exporting
             # it unconditionally put it in the environment of every child
-            # process the agent spawns, for every backend.
-            backend = str(
-                terminal_cfg.get("backend") or target.get("TERMINAL_ENV") or ""
-            ).strip().lower()
-            if backend != "kubernetes":
+            # process the agent spawns, for every backend. (This gate is a size
+            # optimisation on THIS path only — cli.py and gateway/run.py export
+            # the blob unconditionally, which is harmless; dropping it is not.)
+            if effective_backend != "kubernetes":
                 continue
         if cfg_key == "cwd":
             raw_cwd = str(value or "").strip()

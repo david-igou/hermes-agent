@@ -288,22 +288,34 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
     # least-privilege deployment.
     sandbox_mode = str(kcfg.get("provisioner")).lower() == "sandbox"
     sandbox_cfg = kcfg.get("sandbox") or {}
+    # `get`, not `create`: the only exec call this backend makes is
+    # api.connect_get_namespaced_pod_exec, which the python client issues as a
+    # websocket-upgrading GET, so kube-apiserver authorizes it as verb `get`.
+    # Probing `create` failed a correctly minimal Role (pushing operators to
+    # widen the grant) and passed the kubectl-shaped `create`-only Role that
+    # then 403s on the first command.
+    exec_check = ("", "pods/exec", "get")
     if sandbox_mode:
         sandbox_group = sandbox_cfg.get("api_group", "agents.x-k8s.io")
         checks = [
             (sandbox_group, "sandboxes", "create"),
             (sandbox_group, "sandboxes", "delete"),
             ("", "pods", "get"),
-            ("", "pods/exec", "create"),
+            exec_check,
         ]
         if sandbox_cfg.get("use_claim"):
-            checks.append(("extensions." + str(sandbox_group), "sandboxclaims",
+            # The backend posts SandboxClaims to SandboxProvisioner.CLAIM_GROUP,
+            # a constant that ignores sandbox.api_group — deriving the group
+            # from api_group here probed a group the backend never calls.
+            from tools.environments.kubernetes import SandboxProvisioner
+
+            checks.append((SandboxProvisioner.CLAIM_GROUP, "sandboxclaims",
                            "create"))
     else:
         checks = [
             ("", "pods", "create"),
             ("", "pods", "delete"),
-            ("", "pods/exec", "create"),
+            exec_check,
         ]
     if kcfg.get("persistent") and not (sandbox_mode and sandbox_cfg.get("template_ref")):
         checks.append(("", "persistentvolumeclaims", "create"))

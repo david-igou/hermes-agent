@@ -479,10 +479,21 @@ def test_ensure_persistent_creates_pvc_then_pod():
     api.create_namespaced_pod.assert_called_once()
 
 
+def _hermes_pvc(labels=None):
+    """A PVC as the API returns it, carrying the labels pvc_manifest stamps."""
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            name="hermes-ws-mytask",
+            labels={"app.kubernetes.io/managed-by": "hermes-agent"}
+            if labels is None else labels,
+        )
+    )
+
+
 def test_ensure_persistent_skips_existing_pvc():
     api = MagicMock()
     api.read_namespaced_pod.return_value = _running_pod()
-    api.read_namespaced_persistent_volume_claim.return_value = SimpleNamespace()
+    api.read_namespaced_persistent_volume_claim.return_value = _hermes_pvc()
     p = _provisioner_with_api(api)
 
     p.ensure("mytask", persistent=True, image="img:1", resources=Resources())
@@ -1776,3 +1787,349 @@ def test_kubernetes_blob_is_only_bridged_for_the_kubernetes_backend():
         override=True,
     )
     assert json.loads(k8s_env["TERMINAL_KUBERNETES"])["namespace"] == "x"
+
+
+# ---------------------------------------------------------------------------
+# Round-3 regressions
+#
+# Every test below fails against a02cbd58 (`git archive a02cbd58`) and passes
+# at HEAD.  The theme is one root cause: sandbox.spec_overrides was a SECOND
+# pod-template override layer that only the sandbox manifest builder applied,
+# so every control that inspected or stamped the builder's output was
+# bypassable by moving the same YAML into it.
+# ---------------------------------------------------------------------------
+
+K8S_DIR = __import__("pathlib").Path(__file__).resolve().parents[2] / "k8s"
+
+
+def _sandbox_kcfg(**sandbox):
+    return _kcfg(provisioner="sandbox", sandbox=sandbox)
+
+
+_DEHARDENING_OVERRIDE = {
+    "spec": {
+        "hostPID": True,
+        "hostNetwork": True,
+        "automountServiceAccountToken": True,
+        "serviceAccountName": "cluster-admin-sa",
+        "containers": [
+            {"name": "workspace",
+             "securityContext": {"privileged": True, "runAsUser": 0,
+                                 "allowPrivilegeEscalation": True}},
+        ],
+        "volumes": [{"name": "host", "hostPath": {"path": "/"}}],
+    }
+}
+
+
+def test_sandbox_spec_overrides_cannot_hide_a_dehardened_pod():
+    """THE root cause. `sandbox.spec_overrides.podTemplate` is applied by
+    sandbox_manifest() AFTER build_pod_template(), so a pod with hostPID,
+    hostNetwork, a hostPath '/' volume, a privileged root container and a
+    mounted token still counted as a trusted throwaway sandbox and kept the
+    dangerous-command approval SKIP."""
+    from tools.environments.kubernetes import unhardened_reasons
+
+    kcfg = _sandbox_kcfg(spec_overrides={"podTemplate": _DEHARDENING_OVERRIDE})
+    reasons = unhardened_reasons(kcfg)
+    for expected in ("hostPID", "hostNetwork", "automountServiceAccountToken",
+                     "serviceAccountName", "privileged", "host"):
+        assert any(expected in reason for reason in reasons), (expected, reasons)
+
+    from tools.terminal_tool import _kubernetes_has_host_access
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+
+    # And the whole chain: the guards must actually stay on.
+    from tools.approval import check_all_command_guards
+    verdict = check_all_command_guards("rm -rf /", "kubernetes",
+                                       has_host_access=True)
+    assert verdict.get("approved") is not True or verdict.get("message")
+
+
+def test_the_judged_pod_template_is_the_submitted_pod_template():
+    """One renderer, one judge: what unhardened_reasons() evaluates must be
+    byte-identical to what the selected provisioner POSTs — for both of them."""
+    kcfg = _sandbox_kcfg(spec_overrides={"podTemplate": _DEHARDENING_OVERRIDE})
+    judged = build_pod_template(
+        kcfg, persistent=False, image="i:1", resources=Resources(),
+        pvc_name="hermes-ws",
+    )
+    submitted = SandboxProvisioner(
+        kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
+    ).sandbox_manifest("abc", persistent=False, image="i:1",
+                       resources=Resources())["spec"]["podTemplate"]
+    assert submitted == judged
+    # The bypass, concretely: the submitted pod really is de-hardened.
+    assert submitted["spec"]["hostPID"] is True
+
+
+def test_sandbox_spec_overrides_is_a_declared_pod_template_layer():
+    """Structural guard: the layer list is the single source of truth that both
+    the renderer and the judge walk, so a future layer cannot be added to one
+    without the other."""
+    from tools.environments.kubernetes import _pod_template_override_layers
+
+    names = [name for name, _ in _pod_template_override_layers(
+        _sandbox_kcfg(spec_overrides={"podTemplate": {"spec": {}}}))]
+    assert "sandbox.spec_overrides.podTemplate" in names
+    # Not a layer for the direct provisioner — it never reads sandbox.*.
+    direct_names = [name for name, _ in _pod_template_override_layers(
+        _kcfg(sandbox={"spec_overrides": {"podTemplate": {"spec": {}}}}))]
+    assert "sandbox.spec_overrides.podTemplate" not in direct_names
+
+
+@pytest.mark.parametrize("sandbox", [
+    {"template_ref": "privileged-template"},
+    {"template_ref": "warm", "use_claim": True},
+])
+def test_operator_supplied_pod_shapes_are_never_trusted(sandbox):
+    """With template_ref/use_claim the pod is built by agent-sandbox-operator
+    from a SandboxTemplate Hermes never reads. 'Cannot be evaluated' must not
+    read as 'hardened' — it used to return no reasons at all, which skipped the
+    guards for a pod shape nothing had inspected."""
+    from tools.environments.kubernetes import unhardened_reasons
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    kcfg = _sandbox_kcfg(**sandbox)
+    reasons = unhardened_reasons(kcfg)
+    assert any("SandboxTemplate" in reason for reason in reasons), reasons
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+
+
+def test_managed_by_label_survives_sandbox_spec_overrides():
+    """That label is the SOLE selector for both NetworkPolicies and for the
+    ValidatingAdmissionPolicy matchCondition. spec_overrides could rewrite it
+    with validate_kubernetes_config() reporting no problem at all."""
+    kcfg = _sandbox_kcfg(spec_overrides={
+        "podTemplate": {"metadata": {"labels": {
+            "app.kubernetes.io/managed-by": "not-hermes"}}}
+    })
+    manifest = SandboxProvisioner(
+        kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
+    ).sandbox_manifest("abc", persistent=False, image="i:1",
+                       resources=Resources())
+    labels = manifest["spec"]["podTemplate"]["metadata"]["labels"]
+    assert labels["app.kubernetes.io/managed-by"] == "hermes-agent"
+
+    problems = validate_kubernetes_config(kcfg)
+    assert any("spec_overrides" in p and "reserved" in p for p in problems), problems
+
+
+def test_label_restamp_survives_a_null_metadata_override():
+    """strategic_merge faithfully replaces a dict with a scalar/None, and the
+    round-2 re-stamp then raised a bare AttributeError out of manifest
+    construction while the offline validator said the config was fine."""
+    for overlay in ({"metadata": None}, {"metadata": {"labels": None}},
+                    {"metadata": {"labels": 7}}):
+        kcfg = _kcfg(pod_template_overrides=overlay)
+        template = build_pod_template(
+            kcfg, persistent=False, image="i:1", resources=Resources(),
+            pvc_name="hermes-ws",
+        )
+        assert template["metadata"]["labels"][
+            "app.kubernetes.io/managed-by"] == "hermes-agent"
+        problems = validate_kubernetes_config(kcfg)
+        assert any("must be a mapping" in p for p in problems), (overlay, problems)
+
+
+def test_secret_bearing_env_is_not_a_throwaway_sandbox():
+    """The policy blocks secret VOLUMES because a pod that can mount Secrets can
+    exfiltrate the namespace. envFrom/secretKeyRef is the same surface, and it
+    is the shape the shipped config docs describe."""
+    from tools.environments.kubernetes import unhardened_reasons
+
+    for overlay in (
+        {"spec": {"containers": [
+            {"name": "workspace",
+             "envFrom": [{"secretRef": {"name": "hermes-provider-keys"}}]}]}},
+        {"spec": {"containers": [
+            {"name": "workspace", "env": [
+                {"name": "AWS_SECRET_ACCESS_KEY",
+                 "valueFrom": {"secretKeyRef": {"name": "aws", "key": "sk"}}}]}]}},
+    ):
+        reasons = unhardened_reasons(_kcfg(pod_template_overrides=overlay))
+        assert any("Secret" in reason for reason in reasons), (overlay, reasons)
+
+
+def test_validatingadmissionpolicy_does_not_claim_the_label_is_unconfigurable():
+    """A false security claim in shipped docs is worse than the bug: the round-2
+    header asserted the matchCondition 'cannot be configured away', which
+    sandbox.spec_overrides disproved."""
+    text = (K8S_DIR / "validatingadmissionpolicy.yaml").read_text(encoding="utf-8")
+    assert "cannot be configured away" not in text
+    assert "retracted" in text
+    assert "template_ref" in text
+
+
+def test_validatingadmissionpolicy_covers_secret_backed_env():
+    text = (K8S_DIR / "validatingadmissionpolicy.yaml").read_text(encoding="utf-8")
+    assert "envFrom" in text and "secretRef" in text
+    assert "secretKeyRef" in text
+
+
+def test_networkpolicy_states_the_template_ref_gap():
+    """With sandbox.template_ref the operator's pod carries the selector label
+    only if the TEMPLATE sets it — so neither policy applies. The README
+    documented the NetworkPolicy as unconditional."""
+    text = (K8S_DIR / "networkpolicy.yaml").read_text(encoding="utf-8")
+    assert "template_ref" in text
+    readme = (K8S_DIR / "README.md").read_text(encoding="utf-8")
+    assert "credential files at rest" in readme
+
+
+def test_pvc_adoption_refuses_a_foreign_claim():
+    """The PVC is mounted at the agent's cwd and the session-start sync writes
+    credential files into it, yet adoption had no ownership or label check at
+    all — and pvc_name() is deliberately not instance-scoped."""
+    api = MagicMock()
+    api.read_namespaced_persistent_volume_claim.return_value = _hermes_pvc(
+        labels={"owner": "someone-else"}
+    )
+    p = _provisioner_with_api(api)
+    with pytest.raises(RuntimeError, match="not a Hermes workspace"):
+        p.ensure("mytask", persistent=True, image="img:1", resources=Resources())
+    api.create_namespaced_pod.assert_not_called()
+
+
+def test_rfc1123_validation_enforces_the_length_it_promises():
+    """The error message promised 'max 63 chars'; the regex had no bound, so a
+    70-character name passed `hermes doctor` and was rejected by the API server
+    at create time instead."""
+    long_name = "a" * 70
+    assert any("container_name" in p
+               for p in validate_kubernetes_config(_kcfg(container_name=long_name)))
+    assert any("claim_name" in p for p in validate_kubernetes_config(
+        _kcfg(volume={"claim_name": long_name})))
+
+
+def test_sanitize_name_hashes_case_only_normalisation():
+    """The collision guard compared the slug against a LOWERCASED copy of the
+    input, so case-only normalisation never got the hash suffix and two task ids
+    differing only in case shared one pod AND one PVC."""
+    assert sanitize_name("Default") != sanitize_name("default")
+    assert sanitize_name("Foo-Bar") != sanitize_name("foo-bar")
+    assert sanitize_name("default") == "default"
+
+
+def test_kill_cancels_only_its_own_exec(monkeypatch):
+    """_active_stream/_cancelled were single-slot per environment. Because
+    _wait_for_process calls _kill_process() on an ORDINARY TIMEOUT (base.py),
+    command A timing out closed command B's websocket: B returned rc=130
+    'interrupted' with truncated output while A ran on untouched."""
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    # update_sleep keeps both execs genuinely in flight while kill() lands.
+    clients = {"a": _FakeWSClient(open_cycles=10_000, update_sleep=0.01),
+               "b": _FakeWSClient(open_cycles=10_000, update_sleep=0.01)}
+    handed: list[str] = []
+    opened = {"a": threading.Event(), "b": threading.Event()}
+    lock = threading.Lock()
+
+    def fake_stream(*args, **kwargs):
+        with lock:
+            key = "a" if "a" not in handed else "b"
+            handed.append(key)
+        client = clients[key]
+        opened[key].set()
+        return client
+
+    monkeypatch.setattr("kubernetes.stream.stream", fake_stream)
+    handle_a = env._run_bash("sleep 3600")
+    assert opened["a"].wait(5)
+    handle_b = env._run_bash("sleep 3600")
+    assert opened["b"].wait(5)
+    time.sleep(0.1)  # let B's worker publish its stream
+
+    handle_a.kill()
+    assert handle_a.wait(timeout=5) == 130
+    assert clients["a"].closed is True
+    assert clients["b"].closed is False, "kill() closed an unrelated exec"
+    assert handle_b.poll() is None, "an unrelated exec was reported interrupted"
+    handle_b.kill()
+
+
+def test_sandbox_refuses_a_pod_resolved_only_by_name_convention():
+    """_resolve_pod_name falls back to the name convention, and
+    _assert_pod_belongs returned early on a pod with no ownerReferences — so a
+    co-tenant's pod under a guessable name was accepted, and the next action is
+    a credential-file upload into it."""
+    custom = MagicMock()
+    custom.get_namespaced_custom_object.return_value = {
+        "metadata": {"uid": "sandbox-uid"},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+    }
+    api = MagicMock()
+    api.list_namespaced_pod.return_value = SimpleNamespace(items=[])
+    api.read_namespaced_pod.return_value = _running_pod(owners=[])
+
+    p = _sandbox_provisioner(api=api, custom=custom)
+    with pytest.raises(RuntimeError, match="name convention"):
+        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+
+
+def test_strategic_merge_docstring_admits_the_volume_mount_divergence():
+    """The docstring claimed the same `patchMergeKey: name` Kubernetes uses for
+    those fields — untrue for volumeMounts (mountPath) and ports
+    (containerPort), and pod_template_overrides is documented to users as a
+    strategic-merge patch."""
+    from tools.environments.kubernetes import strategic_merge
+
+    doc = strategic_merge.__doc__ or ""
+    assert "mountPath" in doc and "DIVERGES" in doc
+    # ...and the divergence itself, so the doc stays pinned to the behaviour.
+    merged = strategic_merge(
+        {"volumeMounts": [{"name": "workspace", "mountPath": "/workspace"}]},
+        {"volumeMounts": [{"name": "other", "mountPath": "/workspace"}]},
+    )
+    assert len(merged["volumeMounts"]) == 2
+
+
+def test_kubernetes_blob_survives_a_backend_selected_by_env_var():
+    """terminal.backend ALWAYS defaults to 'local' in the merged config, so the
+    round-2 gate's TERMINAL_ENV fallback was dead code: selecting the kubernetes
+    backend by environment variable silently dropped the whole
+    terminal.kubernetes.* block and the backend ran on DEFAULT_KUBERNETES_CONFIG
+    with nothing logged."""
+    from hermes_cli.config import apply_terminal_config_to_env
+
+    merged_like = {"terminal": {"backend": "local",
+                                "kubernetes": {"namespace": "hermes-agents"}}}
+    out = apply_terminal_config_to_env(
+        env={"TERMINAL_ENV": "kubernetes"}, config=merged_like, override=False,
+    )
+    assert json.loads(out["TERMINAL_KUBERNETES"])["namespace"] == "hermes-agents"
+
+    # An EXPLICIT config backend still wins over the ambient env var, so the
+    # gate keeps doing its job.
+    gated = apply_terminal_config_to_env(
+        env={"TERMINAL_ENV": "kubernetes"}, config=merged_like, override=True,
+    )
+    assert "TERMINAL_KUBERNETES" not in gated
+
+
+def test_doctor_probes_the_exec_verb_the_client_actually_issues():
+    """connect_get_namespaced_pod_exec is a websocket-upgrading GET, authorized
+    as verb `get`. Probing `create` failed a truly minimal Role (pushing
+    operators to widen it) and passed the kubectl-shaped create-only Role that
+    then 403s on the first command."""
+    import inspect
+
+    from hermes_cli import doctor
+
+    source = inspect.getsource(doctor)
+    assert '("", "pods/exec", "get")' in source
+    assert '("", "pods/exec", "create")' not in source
+    readme = (K8S_DIR / "README.md").read_text(encoding="utf-8")
+    assert "get    pods/exec" in readme
+
+
+def test_doctor_probes_the_claim_group_the_backend_posts_to():
+    """SandboxProvisioner.CLAIM_GROUP is a constant that ignores
+    sandbox.api_group, so deriving the group from api_group made doctor report
+    a pass/fail about a resource the backend never calls."""
+    import inspect
+
+    from hermes_cli import doctor
+
+    source = inspect.getsource(doctor)
+    assert "SandboxProvisioner.CLAIM_GROUP" in source
+    assert '"extensions." + str(sandbox_group)' not in source

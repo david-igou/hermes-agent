@@ -6,8 +6,19 @@
 # API endpoint, every ClusterIP Service in the cluster, and any internal admin
 # UI on the pod network.
 #
-# This policy is the network half. It selects session pods by the label the
-# backend stamps on every one of them.
+# This policy is the network half. It selects session pods by
+# `app.kubernetes.io/managed-by: hermes-agent`, which the backend stamps as the
+# LAST step of pod-template rendering, after every override layer, and which
+# terminal.kubernetes config cannot remove (the reserved-key validation rejects
+# it in `labels`, in `pod_template_overrides` and in
+# `sandbox.spec_overrides.podTemplate`).
+#
+# ONE CASE IS NOT COVERED: `provisioner: sandbox` with `sandbox.template_ref` or
+# `sandbox.use_claim`. There the pod is built by agent-sandbox-operator from a
+# SandboxTemplate that Hermes neither writes nor reads, so it carries this label
+# only if the TEMPLATE sets it — and if it does not, NEITHER policy below
+# applies and the session pod has full cluster-network access. Put the label in
+# your SandboxTemplate's pod metadata, or stay on `provisioner: direct`.
 #
 # Replace <AGENT_NAMESPACE>. Requires a NetworkPolicy-capable CNI (OVN-Kubernetes
 # on OpenShift qualifies).

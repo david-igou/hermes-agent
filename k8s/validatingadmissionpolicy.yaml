@@ -12,7 +12,7 @@
 #
 # So this version:
 #   * keeps only the rules SCC does NOT give you (ServiceAccount allowlist,
-#     no Secret/projected volumes, token unmounted),
+#     no Secret/projected volumes, no secret-backed env, token unmounted),
 #   * scopes the binding with a namespaceSelector instead of matchResources: {},
 #   * is OPTIONAL on OpenShift and RECOMMENDED on vanilla Kubernetes.
 #
@@ -33,14 +33,33 @@
 #     terminal.kubernetes.automount_service_account_token
 #   * `runAsNonRoot: true` pins
 #     terminal.kubernetes.security_context.run_as_non_root
-# (Hermes refuses to strip `app.kubernetes.io/managed-by`, so the matchCondition
-# itself cannot be configured away.)
+#
+# On the matchCondition label, precisely: Hermes stamps
+# `app.kubernetes.io/managed-by` as the LAST step of pod-template rendering,
+# after every override layer, and its config validation rejects the key in
+# `labels`, in `pod_template_overrides.metadata.labels` and in
+# `sandbox.spec_overrides.podTemplate.metadata.labels`. So configuration cannot
+# strip it from a pod template Hermes RENDERS. It is NOT strip-proof in general:
+# with `sandbox.template_ref` / `sandbox.use_claim` the pod comes from a
+# SandboxTemplate Hermes never writes, and a compromised agent talking to the
+# API server directly is not bound by any of this (see the Honest limitation
+# above). An earlier revision of this file claimed the matchCondition "cannot be
+# configured away" — that claim was false and is retracted.
 #
 # NOT COVERED: `provisioner: sandbox`. This policy matches pods CREATE, and in
 # sandbox mode the pod is created by agent-sandbox-operator from the Sandbox CR
 # under the operator's identity, so the match conditions may not hold.
 # Constrain the Sandbox CR instead (or stay on provisioner: direct) if you rely
 # on this policy.
+#
+# CONSEQUENCE OF THE SECRET RULES BELOW: they deny secret-backed ENV as well as
+# secret volumes, so a `pod_template_overrides` block that injects provider API
+# keys into the session container (envFrom.secretRef / valueFrom.secretKeyRef)
+# is DENIED wherever this policy is bound. That is deliberate — the session pod
+# is credential-free by design — but it means "reference the Secret by name"
+# is not a way around it. If a session pod genuinely needs a key, drop the
+# corresponding validation here and accept that the pod can then name any Secret
+# in the namespace.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -83,6 +102,21 @@ spec:
         !has(object.spec.volumes) ||
         object.spec.volumes.all(v, !has(v.secret) && !has(v.projected))
       message: "session pods must not mount secret or projected volumes"
+    # Same exfiltration surface as a secret volume, through a different door:
+    # envFrom.secretRef / valueFrom.secretKeyRef also let the pod name any
+    # Secret in the namespace. Covering only volumes left the documented
+    # "reference the Secret by name" pattern wide open.
+    - expression: >-
+        (object.spec.containers +
+         (has(object.spec.initContainers) ? object.spec.initContainers : [])).all(c,
+          !has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef)))
+      message: "session pods must not pull Secrets in through envFrom.secretRef"
+    - expression: >-
+        (object.spec.containers +
+         (has(object.spec.initContainers) ? object.spec.initContainers : [])).all(c,
+          !has(c.env) || c.env.all(e,
+            !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef)))
+      message: "session pods must not read Secrets through env valueFrom.secretKeyRef"
     # --- rules SCC also covers (kept for vanilla Kubernetes) -----------------
     - expression: "!has(object.spec.hostNetwork) || object.spec.hostNetwork == false"
       message: "hostNetwork is not allowed for session pods"
