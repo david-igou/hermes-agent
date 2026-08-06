@@ -20,6 +20,24 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+#: Directories a tree-wide scan must not descend into (build output, vendored
+#: dependencies, virtualenvs) — none of them is Hermes source.
+_SKIP_DIRS = {
+    ".git", ".venv", "venv", "node_modules", "__pycache__", ".ruff_cache",
+    ".pytest_cache", "dist", "build", ".mypy_cache", "site-packages",
+}
+
+
+def _tracked_files(*suffixes: str):
+    """Every repo file with one of *suffixes*, skipping build/vendor trees."""
+    wanted = set(suffixes)
+    for path in REPO_ROOT.rglob("*"):
+        if not path.is_file() or path.suffix not in wanted:
+            continue
+        if _SKIP_DIRS & set(path.relative_to(REPO_ROOT).parts):
+            continue
+        yield path
+
 
 def test_default_config_mirrors_the_backend_schema():
     """hermes_cli/config_defaults.py must carry a literal copy of the backend's
@@ -33,6 +51,33 @@ def test_default_config_mirrors_the_backend_schema():
     from tools.environments.kubernetes import DEFAULT_KUBERNETES_CONFIG
 
     assert DEFAULT_CONFIG["terminal"]["kubernetes"] == DEFAULT_KUBERNETES_CONFIG
+
+
+def test_the_web_settings_provisioner_enum_cannot_drift():
+    """The `direct` -> `pod` rename had to touch a SECOND Python-side copy of
+    the enum, held in sync by nothing but a comment. When the two drift the web
+    settings dropdown offers a value validate_kubernetes_config rejects, and the
+    operator learns about it as a ValueError at first session rather than at
+    config time.
+
+    Asserted as derivation, not as equality-today: equality passes trivially
+    while the copy is still a literal. Patching the source of truth and
+    re-reading the options proves the schema FOLLOWS it."""
+    import tools.environments.kubernetes as k8s
+    from hermes_cli.web_server import (
+        _SCHEMA_OVERRIDES,
+        _kubernetes_provisioner_options,
+    )
+
+    assert (_SCHEMA_OVERRIDES["terminal.kubernetes.provisioner"]["options"]
+            == list(k8s.VALID_PROVISIONERS))
+
+    saved = k8s.VALID_PROVISIONERS
+    try:
+        k8s.VALID_PROVISIONERS = ("pod", "sandbox", "kata-vm")
+        assert _kubernetes_provisioner_options() == ["pod", "sandbox", "kata-vm"]
+    finally:
+        k8s.VALID_PROVISIONERS = saved
 
 
 def test_kubernetes_is_bridged_by_all_three_config_paths():
@@ -89,24 +134,29 @@ def test_no_per_setting_kubernetes_env_vars_exist():
     TERMINAL_KUBERNETES_<SETTING> names anywhere in the tree."""
     pattern = re.compile(r"TERMINAL_KUBERNETES_[A-Z0-9_]+")
     offenders = []
-    scanned = [
-        REPO_ROOT / "tools" / "terminal_tool.py",
-        REPO_ROOT / "tools" / "environments" / "kubernetes.py",
-        REPO_ROOT / "hermes_cli" / "config.py",
-        REPO_ROOT / "hermes_cli" / "config_defaults.py",
-        REPO_ROOT / "hermes_cli" / "setup.py",
-        REPO_ROOT / "hermes_cli" / "status.py",
-        REPO_ROOT / "cli.py",
-        REPO_ROOT / "gateway" / "run.py",
-        REPO_ROOT / "cli-config.yaml.example",
-        REPO_ROOT / ".env.example",
-        REPO_ROOT / "k8s" / "README.md",
-    ]
-    for path in scanned:
-        if not path.exists():
+    # A hardcoded file list does not cover "anywhere in the tree" — this
+    # refactor ADDED tools/environments/kubernetes_sandbox.py and changed
+    # hermes_cli/web_server.py, none of which the old list named. Walk the
+    # tracked files instead, so new modules are covered by construction.
+    exempt = {
+        # Names them as DEPRECATED so anyone who copied PR #37591's .env block
+        # gets a diagnosis instead of silence (the assertion below says so).
+        "hermes_cli/doctor.py",
+        # These tests quote the forbidden names in order to forbid them.
+        "tests/tools/test_kubernetes_config_schema.py",
+        "tests/tools/test_kubernetes_environment.py",
+    }
+    for path in _tracked_files(".py", ".md", ".yaml", ".yml", ".example", ".ts",
+                              ".tsx", ".json"):
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        if relative in exempt:
             continue
-        for match in pattern.findall(path.read_text(encoding="utf-8")):
-            offenders.append(f"{path.relative_to(REPO_ROOT)}: {match}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for match in pattern.findall(text):
+            offenders.append(f"{relative}: {match}")
 
     assert not offenders, (
         "Kubernetes settings must live in config.yaml under terminal.kubernetes.*, "
@@ -228,6 +278,16 @@ def test_the_migration_deletes_the_hard_cut_keys_and_renames_the_provisioner():
     assert "podTemplate" not in kube["sandbox"]["spec"]
     # The user is TOLD what was dropped rather than discovering it at runtime.
     assert any("runtime_class_name" in w for w in results["warnings"]), results
+
+    # And the migration's OUTPUT must satisfy the validator that now rejects
+    # unknown keys — a migration that leaves the file failing validation just
+    # moves the loud failure somewhere less useful.
+    from tools.environments.kubernetes import (
+        merge_kubernetes_config,
+        validate_kubernetes_config,
+    )
+
+    assert validate_kubernetes_config(merge_kubernetes_config(kube)) == []
 
 
 def test_deprecated_upstream_env_vars_are_diagnosed():

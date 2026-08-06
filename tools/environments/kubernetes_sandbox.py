@@ -31,6 +31,7 @@ from tools.environments.kubernetes import (
     _BaseProvisioner,
     _dig_dict,
     render_pod_template,
+    reserved_sandbox_spec_violations,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,9 +76,19 @@ class SandboxProvisioner(_BaseProvisioner):
         ``spec.podTemplate`` is ASSIGNED, never merged: the Sandbox CRD is
         itself ``spec.podTemplate.spec``, so the same dict feeds both
         provisioners and there is no second layer for a security control to
-        miss.  ``sandbox.spec.podTemplate`` is rejected at validation, so the
-        assignment cannot be clobbering a user value.
+        miss.
+
+        Raises ``ValueError`` when ``sandbox.spec`` claims a reserved key.
+        That is belt-and-braces over ``validate_kubernetes_config`` and it is
+        exactly what ``render_pod_template`` does for ``pod_template``: an
+        UNVALIDATED config must not be able to post a ``sandboxTemplateRef``
+        (an operator-authored pod Hermes never renders) or a second
+        ``podTemplate`` alongside the one Hermes rendered and judged.
         """
+        violations = reserved_sandbox_spec_violations(self.cr_spec)
+        if violations:
+            raise ValueError("; ".join(violations))
+
         spec: dict[str, Any] = deepcopy(self.cr_spec)
         spec["podTemplate"] = render_pod_template(
             self.kcfg,

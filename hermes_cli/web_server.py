@@ -842,6 +842,27 @@ def _memory_provider_options() -> List[str]:
     return list(dict.fromkeys(options))
 
 
+def _kubernetes_provisioner_options() -> List[str]:
+    """The ``terminal.kubernetes.provisioner`` select, DERIVED not duplicated.
+
+    ``pod`` = raw Pod via the core API; ``sandbox`` = a Sandbox CR reconciled
+    by agent-sandbox-operator. This used to be a second literal copy of the
+    enum kept in sync by a comment: when the two drift, the web settings
+    dropdown offers a value ``validate_kubernetes_config`` rejects and the
+    operator learns about it as a ``ValueError`` at first session instead of at
+    config time. Importing the single source of truth makes that impossible.
+
+    The import is function-local and failure-tolerant so a build without the
+    kubernetes extra still renders the settings page.
+    """
+    try:
+        from tools.environments.kubernetes import VALID_PROVISIONERS
+
+        return list(VALID_PROVISIONERS)
+    except Exception:
+        return ["pod", "sandbox"]
+
+
 def _timezone_options() -> List[str]:
     """Return sorted IANA timezone identifiers, cached at import time."""
     try:
@@ -882,10 +903,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "terminal.kubernetes.provisioner": {
         "type": "select",
         "description": "Kubernetes workspace provisioner",
-        # pod = raw Pod via the core API; sandbox = Sandbox CR reconciled by
-        # agent-sandbox-operator. Sync with VALID_PROVISIONERS in
-        # tools/environments/kubernetes.py.
-        "options": ["pod", "sandbox"],
+        "options": _kubernetes_provisioner_options(),
     },
     "terminal.vercel_runtime": {
         "type": "select",

@@ -207,7 +207,9 @@ def test_default_config_is_valid():
 
 def test_hard_cut_keys_are_not_in_the_schema():
     """The ~30 PodSpec-shaped keys collapsed into pod_template. No aliases, no
-    shim: the schema is the 12 top-level keys the backend reasons about."""
+    shim: the schema is the 14 top-level keys the backend reasons about
+    (19 leaves counting volume.* and sandbox.*)."""
+    assert len(DEFAULT_KUBERNETES_CONFIG) == 14, sorted(DEFAULT_KUBERNETES_CONFIG)
     gone = {
         "image_pull_policy", "image_pull_secrets", "service_account",
         "automount_service_account_token", "runtime_class_name",
@@ -1052,15 +1054,33 @@ def test_factory_selects_sandbox_provisioner(monkeypatch):
     assert "sandbox" in seen
 
 
-def test_factory_rejects_invalid_config(monkeypatch):
+@pytest.mark.parametrize("kubernetes_config, expected", [
+    ({"provisioner": "operator"}, "provisioner"),
+    # A reserved pod_template field. Nothing may be provisioned from a config
+    # whose reserved core Hermes would otherwise have to overwrite.
+    ({"pod_template": {"spec": {"restartPolicy": "Always"}}}, "restartPolicy"),
+    ({"pod_template": {"spec": {"containers": [
+        {"name": "workspace", "args": ["--boom"]}]}}}, "args"),
+    # An operator-authored pod shape. The judge now also flags this, but the
+    # factory refusing it FIRST is what makes the whole path safe, and nothing
+    # tested that: if the validate-then-raise in _create_environment were ever
+    # moved or made advisory, the suite stayed green while an unjudgeable pod
+    # reached the cluster.
+    ({"provisioner": "sandbox",
+      "sandbox": {"spec": {"sandboxTemplateRef": {"name": "privileged"}}}},
+     "sandboxTemplateRef"),
+    # A key the hard cut deleted.
+    ({"runtime_class_name": "kata"}, "runtime_class_name"),
+])
+def test_factory_rejects_invalid_config(monkeypatch, kubernetes_config, expected):
     import tools.terminal_tool as tt
 
     _install_fake_backend(monkeypatch)
-    with pytest.raises(ValueError, match="provisioner"):
+    with pytest.raises(ValueError, match=expected):
         tt._create_environment(
             env_type="kubernetes", image="img:1", cwd="/workspace", timeout=30,
             container_config={"kubernetes": {"namespace": "hermes",
-                                             "provisioner": "operator"}},
+                                             **kubernetes_config}},
             task_id="abc",
         )
 
@@ -1339,9 +1359,18 @@ def test_exec_container_prefers_the_configured_name_when_the_pod_has_it():
     assert p.exec_container(pod) == "workspace"
 
 
-def test_exec_container_falls_back_to_the_configured_name_without_a_spec():
+def test_exec_container_refuses_a_pod_whose_container_list_is_unreadable():
+    """Fail-open is the wrong default for a check whose whole purpose is to
+    prove the RUNNING pod matches the submitted one. "We could not establish
+    that the pod carries the container we rendered" is the same failure as "it
+    carries a different one" — most plausible on the sandbox path, where the
+    pod is resolved from an operator status shape or a label lookup rather
+    than from an object this backend created."""
     p = _provisioner_with_api(MagicMock())
-    assert p.exec_container(SimpleNamespace()) == "workspace"
+    with pytest.raises(RuntimeError, match="did not render"):
+        p.exec_container(SimpleNamespace())
+    with pytest.raises(RuntimeError, match="did not render"):
+        p.exec_container(SimpleNamespace(spec=SimpleNamespace(containers=[])))
 
 
 def test_exec_container_refuses_a_pod_that_lacks_the_rendered_container():
@@ -1619,6 +1648,14 @@ MANAGED_BY = "app.kubernetes.io/managed-by"
     # R4 — the long-running command that outlives the session.
     ({"spec": {"containers": [{"name": "workspace", "command": ["bash"]}]}},
      "containers[name=workspace].command"),
+    # ...and its other half. The kubelet builds the process as command + args,
+    # so `args` alone turns the pinned `sleep infinity` into
+    # `sleep infinity --boom`: the container exits non-zero at once and, under
+    # the pinned restartPolicy: Never, the pod goes Failed. A pod that starts
+    # and can never serve a command is precisely what reserving `command` was
+    # supposed to prevent, so reserving only `command` did not deliver it.
+    ({"spec": {"containers": [{"name": "workspace", "args": ["--boom"]}]}},
+     "containers[name=workspace].args"),
     # R5 — the workspace mount cwd resolves against.
     ({"spec": {"containers": [{"name": "workspace", "volumeMounts": [
         {"name": "mine", "mountPath": "/workspace"}]}]}},
@@ -1626,6 +1663,11 @@ MANAGED_BY = "app.kubernetes.io/managed-by"
     # R6 — the other half of R5.
     ({"spec": {"volumes": [{"name": "workspace", "hostPath": {"path": "/"}}]}},
      "spec.volumes[name=workspace]"),
+    # R1b — pod_manifest() only OVERWRITES ownerReferences when an agent
+    # identity was resolvable, so out-of-cluster a supplied list was copied
+    # verbatim into the submitted Pod, unreserved and unjudged.
+    ({"metadata": {"ownerReferences": [{"uid": "attacker"}]}},
+     "pod_template.metadata.ownerReferences"),
 ])
 def test_reserved_pod_template_fields_are_rejected(pod_template, expected):
     """Hermes owns the fields that make exec possible. A config that sets one
@@ -1656,6 +1698,129 @@ def test_reserved_sandbox_spec_fields_are_rejected(cr_spec, expected):
         _kcfg(provisioner="sandbox", sandbox={"spec": cr_spec})
     )
     assert any(expected in p and "reserved" in p for p in problems), problems
+    # ...and the CR builder re-checks, so an unvalidated config cannot post it.
+    with pytest.raises(ValueError):
+        _sandbox_cls()(
+            _kcfg(provisioner="sandbox", sandbox={"spec": cr_spec}), "hermes",
+            api=None, owner_reference=OWNER_REF, custom_api=None,
+        ).sandbox_manifest("abc", persistent=False, image="i:1",
+                           resources=Resources())
+
+
+def test_the_session_container_cannot_be_made_to_exit():
+    """The reserved core exists so the session pod outlives the session. With
+    only `command` reserved, `args` reached the manifest and the rendered
+    container became `sleep infinity --boom` — a pod that starts, fails, and
+    can never serve a command, passing both the validator and the judge in
+    silence."""
+    from tools.environments.kubernetes import unhardened_reasons
+
+    kcfg = _kcfg(pod_template={"spec": {"containers": [
+        {"name": "workspace", "args": ["--boom"]}]}})
+    assert any("args" in p for p in validate_kubernetes_config(kcfg))
+    # Fails closed in the judge too, via the renderer's re-check.
+    assert unhardened_reasons(kcfg)
+    # And on the sandbox path, whose podTemplate is the same rendered object.
+    sandbox = dict(kcfg, provisioner="sandbox")
+    assert any("args" in p for p in validate_kubernetes_config(sandbox))
+    assert unhardened_reasons(sandbox)
+
+
+# ---------------------------------------------------------------------------
+# The hard cut is LOUD (issue requirement 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("overrides, expected", [
+    # The deleted keys. Silently accepting them made the cut a no-op:
+    # `security_context.read_only_root_filesystem: true` simply became false.
+    ({"security_context": {"read_only_root_filesystem": True}},
+     "terminal.kubernetes.security_context"),
+    ({"node_selector": {"a": "b"}}, "terminal.kubernetes.node_selector"),
+    ({"runtime_class_name": "kata"}, "terminal.kubernetes.runtime_class_name"),
+    # The renamed user layer.
+    ({"pod_template_overrides": {"spec": {"hostPID": True}}},
+     "terminal.kubernetes.pod_template_overrides"),
+    # A plain typo.
+    ({"totally_bogus_key": 1}, "terminal.kubernetes.totally_bogus_key"),
+    # Enumerated sub-blocks are checked too...
+    ({"volume": {"storageClassName": "fast"}},
+     "terminal.kubernetes.volume.storageClassName"),
+    ({"sandbox": {"template_ref": "t"}}, "terminal.kubernetes.sandbox.template_ref"),
+])
+def test_unknown_and_removed_config_keys_are_rejected_loudly(overrides, expected):
+    """The API layer posts everything with field_validation=Strict precisely so
+    nothing user-supplied is silently dropped. The config layer must not do the
+    opposite: a config.yaml still carrying a deleted key validated clean,
+    rendered without it and said nothing. `_migrate_to_34` is not a substitute —
+    it fires once, only through hermes_cli, and only below _config_version 34,
+    so a hand-authored, gateway-bridged, read-only-mounted or already-migrated
+    config kept its stale keys forever."""
+    problems = validate_kubernetes_config(_kcfg(**overrides))
+    assert any(expected in p for p in problems), problems
+
+
+def test_the_free_form_nodes_stay_open():
+    """pod_template and sandbox.spec are free-form by construction — the
+    unknown-key rule must not turn the ONE user layer into an enumerated
+    schema, which is the design this refactor removed."""
+    assert validate_kubernetes_config(_kcfg(pod_template={"spec": {
+        "nodeSelector": {"kubernetes.io/arch": "amd64"},
+        "runtimeClassName": "kata",
+        "tolerations": [{"key": "sandbox", "operator": "Exists"}],
+    }})) == []
+    assert validate_kubernetes_config(
+        _kcfg(provisioner="sandbox", sandbox={"spec": {"ttlSeconds": 900}})
+    ) == []
+    assert validate_kubernetes_config(merge_kubernetes_config({})) == []
+
+
+def test_a_root_uid_request_is_caught_offline():
+    """The hardened base pins runAsNonRoot: true, so uid 0 is refused by the
+    kubelet with CreateContainerConfigError. That used to be a named offline
+    validation error; after the collapse it produced a pod stuck in
+    CreateContainerConfigError instead. doctor's dry_run="All" + Strict cannot
+    catch it either — the object is schema-valid, and Strict only rejects
+    UNKNOWN fields."""
+    for template in (
+        {"spec": {"securityContext": {"runAsUser": 0}}},
+        {"spec": {"containers": [
+            {"name": "workspace", "securityContext": {"runAsUser": 0}}]}},
+    ):
+        problems = validate_kubernetes_config(_kcfg(pod_template=template))
+        assert any("runAsUser=0" in p and "runAsNonRoot" in p
+                   for p in problems), (template, problems)
+
+    # A non-zero uid is the DOCUMENTED way to run a root-default image, so it
+    # must stay clean...
+    assert validate_kubernetes_config(
+        _kcfg(pod_template={"spec": {"securityContext": {"runAsUser": 1000}}})
+    ) == []
+    # ...and an explicit runAsNonRoot: false is a hardening question, not a
+    # kubelet-rejection question: the judge owns that one.
+    assert validate_kubernetes_config(_kcfg(pod_template={"spec": {
+        "securityContext": {"runAsUser": 0, "runAsNonRoot": False}}})) == []
+
+
+def test_a_malformed_pod_template_is_rejected_not_discarded():
+    """`pod_template:` written as a YAML list (a plausible mistake given the old
+    "overrides" framing) used to be dropped whole by merge_pod_template's
+    non-dict early return: the bare hardened base was submitted and the user's
+    entire layer vanished with no message anywhere."""
+    for bad in ([{"spec": {"hostPID": True}}], "hostPID: true", 42):
+        problems = validate_kubernetes_config(_kcfg(pod_template=bad))
+        assert any("must be a mapping" in p for p in problems), (bad, problems)
+
+
+def test_mount_path_cannot_collide_with_the_tmp_emptydir():
+    """The /tmp emptyDir is unconditional (init_session() writes its env
+    snapshot there), so mount_path=/tmp renders a duplicate-mountPath pod the
+    API server rejects at create time. Catching that offline is exactly what
+    this validator is for — it already bounds container_name at 63 chars for
+    the same reason."""
+    problems = validate_kubernetes_config(_kcfg(mount_path="/tmp"))
+    assert any("/tmp" in p for p in problems), problems
+    assert validate_kubernetes_config(_kcfg(mount_path="/srv/work")) == []
 
 
 def test_reserved_rejection_does_not_kill_the_feature_it_secures():
@@ -2004,31 +2169,110 @@ def test_a_dehardened_pod_template_cannot_hide_from_the_judge():
     assert verdict.get("approved") is not True or verdict.get("message")
 
 
-def test_the_judged_pod_template_is_the_submitted_pod_template():
-    """One renderer, one judge: what unhardened_reasons() evaluates must be
-    byte-identical to what the selected provisioner POSTs — for BOTH of them."""
-    kcfg = _kcfg(pod_template=_DEHARDENING_TEMPLATE)
-    judged = render_pod_template(
-        kcfg, persistent=False, image="i:1", resources=Resources(),
-        pvc_name="hermes-ws",
-    )
+def test_the_judged_pod_template_is_the_submitted_pod_template(monkeypatch):
+    """Requirement 2, proven by RUNNING the judge — not by handing the same
+    literals to both sides.
 
-    sandbox_kcfg = dict(kcfg, provisioner="sandbox")
-    submitted_sandbox = _sandbox_cls()(
-        sandbox_kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
+    The previous version of this test called ``render_pod_template`` itself with
+    hand-chosen kwargs and compared that to the provisioners called with the
+    SAME hand-chosen kwargs, so it proved only that the provisioners agree with
+    the renderer. It never imported ``unhardened_reasons``, and it could not
+    have detected judged-vs-submitted drift, which is the entire bug class
+    requirement 2 exists to eliminate.
+
+    What is asserted here, for BOTH provisioners:
+      1. the real judge and the real provisioner render from the SAME kcfg
+         object, through the one renderer, exactly once each;
+      2. the template the provisioner POSTs IS (object identity) the renderer's
+         return value — nothing runs after the renderer;
+      3. judging the actually-submitted artifact with ``template_reasons``
+         yields the same verdict the config-level judge reached.
+    """
+    import tools.environments.kubernetes as k8s_mod
+    import tools.environments.kubernetes_sandbox as sandbox_mod
+    from tools.environments.kubernetes import template_reasons, unhardened_reasons
+
+    real_render = k8s_mod.render_pod_template
+
+    for provisioner in ("pod", "sandbox"):
+        kcfg = _kcfg(provisioner=provisioner, pod_template=_DEHARDENING_TEMPLATE)
+        calls: list[tuple] = []
+
+        def _recording(cfg, **kwargs):
+            rendered = real_render(cfg, **kwargs)
+            calls.append((cfg, kwargs, rendered))
+            return rendered
+
+        monkeypatch.setattr(k8s_mod, "render_pod_template", _recording)
+        monkeypatch.setattr(sandbox_mod, "render_pod_template", _recording)
+
+        # (1) The REAL judge, driven through the real path.
+        config_verdict = unhardened_reasons(kcfg)
+        assert len(calls) == 1, calls
+        judged_cfg, _, judged = calls[0]
+        assert judged_cfg is kcfg
+
+        # (2) The REAL provisioner, and the object it would POST.
+        if provisioner == "sandbox":
+            body = _sandbox_cls()(
+                kcfg, "hermes", api=None, owner_reference=OWNER_REF,
+                custom_api=None,
+            ).sandbox_manifest("abc", persistent=False, image="i:1",
+                               resources=Resources())
+            submitted = body["spec"]["podTemplate"]
+        else:
+            body = PodProvisioner(
+                kcfg, "hermes", api=None, owner_reference=OWNER_REF,
+            ).pod_manifest("abc", persistent=False, image="i:1",
+                           resources=Resources())
+            submitted = {"metadata": body["metadata"], "spec": body["spec"]}
+
+        assert len(calls) == 2, calls
+        submitted_cfg, _, rendered = calls[1]
+        assert submitted_cfg is kcfg
+        # Object identity, not equality: proves no layer ran after the renderer.
+        assert submitted["spec"] is rendered["spec"]
+
+        # (3) Judging the SUBMITTED artifact reaches the same verdict as
+        # judging the config. If a provisioner ever re-authored the spec, the
+        # two verdicts would part company here.
+        assert template_reasons(submitted) == template_reasons(judged)
+        assert template_reasons(submitted) == config_verdict
+
+        # The de-hardening is real, so this is not vacuously true on [].
+        assert submitted["spec"]["hostPID"] is True
+        assert config_verdict
+
+
+def test_the_judge_sees_the_whole_sandbox_cr_not_just_its_pod_template():
+    """On the sandbox path the artifact SUBMITTED is the Sandbox CR, and
+    ``sandbox.spec`` is deep-copied into it verbatim. Requirement 2 therefore
+    only holds there if every CR-spec key is rendered by Hermes, reviewed by
+    Hermes, or judged as unknown. A two-name denylist is not that: the CRD
+    coordinates are themselves user config, so a CRD version whose pod-authoring
+    field has another name walks straight past it."""
+    from tools.environments.kubernetes import unhardened_reasons
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    kcfg = _sandbox_kcfg(spec={"networkPolicy": {"egress": "allow-all"},
+                               "hostAccess": True})
+    reasons = unhardened_reasons(kcfg)
+    for key in ("networkPolicy", "hostAccess"):
+        assert any(key in reason for reason in reasons), (key, reasons)
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+
+    # ...and every one of those keys really is submitted verbatim.
+    submitted = _sandbox_cls()(
+        kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
     ).sandbox_manifest("abc", persistent=False, image="i:1",
-                       resources=Resources())["spec"]["podTemplate"]
-    assert submitted_sandbox == judged
+                       resources=Resources())["spec"]
+    assert submitted["hostAccess"] is True
 
-    submitted_pod = PodProvisioner(
-        kcfg, "hermes", api=None, owner_reference=OWNER_REF,
-    ).pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
-    # The Pod adds only object identity on top of the judged template.
-    assert submitted_pod["spec"] == judged["spec"]
-    assert submitted_pod["metadata"]["labels"] == judged["metadata"]["labels"]
-
-    # The bypass, concretely: the submitted pod really is de-hardened.
-    assert submitted_sandbox["spec"]["hostPID"] is True
+    # The reviewed key is not noise: ttlSeconds only ever SHORTENS the
+    # workspace's life, so it stays hardened.
+    assert unhardened_reasons(_sandbox_kcfg(spec={"ttlSeconds": 60})) == []
+    # And the pod path is untouched by the sandbox arm.
+    assert unhardened_reasons(_kcfg()) == []
 
 
 def test_there_is_exactly_one_pod_template_source():
@@ -2059,11 +2303,14 @@ def test_a_second_pod_template_source_is_a_config_error_not_a_merge():
     problems = validate_kubernetes_config(kcfg)
     assert any("sandbox.spec.podTemplate" in p and "reserved" in p
                for p in problems), problems
-    # ...and it never reaches the manifest even unvalidated.
-    manifest = _sandbox_cls()(
-        kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
-    ).sandbox_manifest("abc", persistent=False, image="i:1", resources=Resources())
-    assert manifest["spec"]["podTemplate"]["spec"]["hostPID"] is False
+    # ...and the manifest builder REFUSES it even unvalidated, exactly as
+    # render_pod_template refuses a reserved pod_template field. Silently
+    # overwriting the user's key would still have posted the CR.
+    with pytest.raises(ValueError, match="podTemplate"):
+        _sandbox_cls()(
+            kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
+        ).sandbox_manifest("abc", persistent=False, image="i:1",
+                           resources=Resources())
 
 
 def test_an_operator_authored_pod_shape_has_no_door_left():
@@ -2078,18 +2325,25 @@ def test_an_operator_authored_pod_shape_has_no_door_left():
     problems = validate_kubernetes_config(kcfg)
     assert any("sandboxTemplateRef" in p and "reserved" in p for p in problems)
 
-    # Defence in depth: the judge must not depend on validation having run.
+    # Defence in depth: the judge must NOT depend on validation having run. A
+    # SandboxTemplate makes the operator author a pod this backend never
+    # renders, so the pod shape is unknowable — and unknown is not hardened.
+    # (Round 3 established exactly this; the collapse dropped the arm and the
+    # judge started returning [] for a config it cannot evaluate.)
     from tools.environments.kubernetes import unhardened_reasons
     from tools.terminal_tool import _kubernetes_has_host_access
 
-    manifest = _sandbox_cls()(
-        kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
-    ).sandbox_manifest("abc", persistent=False, image="i:1", resources=Resources())
-    # The CR still carries the ref (we do not silently strip user data), but the
-    # podTemplate is ours, so what runs is what was judged.
-    assert manifest["spec"]["podTemplate"]["spec"]["restartPolicy"] == "Never"
-    assert unhardened_reasons(kcfg) == []
-    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is False
+    reasons = unhardened_reasons(kcfg)
+    assert any("sandboxTemplateRef" in reason for reason in reasons), reasons
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+
+    # And the ref never reaches the API server at all: the manifest builder
+    # refuses to post a CR carrying a pod source Hermes did not render.
+    with pytest.raises(ValueError, match="sandboxTemplateRef"):
+        _sandbox_cls()(
+            kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
+        ).sandbox_manifest("abc", persistent=False, image="i:1",
+                           resources=Resources())
 
 
 def test_secret_bearing_env_is_not_a_throwaway_sandbox():
@@ -2109,6 +2363,44 @@ def test_secret_bearing_env_is_not_a_throwaway_sandbox():
     ):
         reasons = unhardened_reasons(_kcfg(pod_template=overlay))
         assert any("Secret" in reason for reason in reasons), (overlay, reasons)
+
+
+@pytest.mark.parametrize("overlay, expected", [
+    # The base pins seccompProfile: RuntimeDefault; pod_template is the
+    # documented layer sitting on top of it, so every axis that switches the
+    # runtime confinement off has to cost the approval skip.
+    ({"spec": {"securityContext": {"seccompProfile": {"type": "Unconfined"}}}},
+     "seccompProfile"),
+    ({"spec": {"containers": [{"name": "workspace", "securityContext": {
+        "seccompProfile": {"type": "Unconfined"}}}]}}, "seccompProfile"),
+    ({"spec": {"containers": [{"name": "workspace", "securityContext": {
+        "procMount": "Unmasked"}}]}}, "procMount"),
+    ({"spec": {"containers": [{"name": "workspace", "securityContext": {
+        "appArmorProfile": {"type": "Unconfined"}}}]}}, "appArmorProfile"),
+    # spc_t is the well-known OpenShift escape.
+    ({"spec": {"containers": [{"name": "workspace", "securityContext": {
+        "seLinuxOptions": {"type": "spc_t"}}}]}}, "seLinuxOptions"),
+    ({"spec": {"shareProcessNamespace": True}}, "shareProcessNamespace"),
+    # postStart runs as the container's user with the pod's network and mounts,
+    # and nothing in this backend renders or reviews it.
+    ({"spec": {"containers": [{"name": "workspace", "lifecycle": {
+        "postStart": {"exec": {"command": ["curl", "http://evil"]}}}}]}},
+     "lifecycle"),
+    # uid 0 at POD level: the container-level check never saw it.
+    ({"spec": {"securityContext": {"runAsUser": 0}}}, "runAsUser"),
+])
+def test_confinement_relaxations_cost_the_approval_skip(overlay, expected):
+    """The approval-guard skip is earned by a THROWAWAY sandbox. Each of these
+    renders into the submitted pod verbatim and each one relaxes the hardened
+    base, so a judge that does not see them hands the skip to a pod that no
+    longer qualifies for it."""
+    from tools.environments.kubernetes import unhardened_reasons
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    kcfg = _kcfg(pod_template=overlay)
+    reasons = unhardened_reasons(kcfg)
+    assert any(expected in reason for reason in reasons), (overlay, reasons)
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
 
 
 def test_validatingadmissionpolicy_does_not_claim_the_label_is_unconfigurable():
@@ -2281,6 +2573,17 @@ def test_doctor_probes_the_exec_verb_the_client_actually_issues():
     assert "get    pods/exec" in readme
 
 
+def test_doctor_submits_every_access_review_with_strict_field_validation():
+    """Requirement 4 says Strict on every create this backend issues. The three
+    provisioner creates and both doctor dry-runs carried it; the RBAC probe's
+    SelfSubjectAccessReviews did not. A rule with an undocumented carve-out is
+    a rule nobody can check, so close the carve-out rather than the rule."""
+    reviews = _doctor_rbac_reviews(_kcfg(namespace="hermes",
+                                         provisioner="sandbox"))
+    assert reviews, reviews
+    assert set(reviews.field_validations) == {"Strict"}, reviews.field_validations
+
+
 def test_doctor_probes_the_sandbox_group_the_backend_posts_to():
     reviews = _doctor_rbac_reviews(
         _kcfg(namespace="hermes", provisioner="sandbox",
@@ -2299,7 +2602,13 @@ def _doctor_rbac_reviews(kcfg):
     import kubernetes.client as kclient
     from hermes_cli import doctor
 
-    seen: list[tuple] = []
+    class _Seen(list):
+        """The recorded (group, resource, verb) triples, plus the
+        field_validation each review was submitted with."""
+        field_validations: list = []
+
+    seen = _Seen()
+    seen.field_validations = []
 
     class _Attrs:
         def __init__(self, namespace=None, group=None, resource=None, verb=None):
@@ -2317,9 +2626,10 @@ def _doctor_rbac_reviews(kcfg):
         def __init__(self, api_client=None):
             pass
 
-        def create_self_subject_access_review(self, review):
+        def create_self_subject_access_review(self, review, **kwargs):
             attrs = review.spec.resource_attributes
             seen.append((attrs.group, attrs.resource, attrs.verb))
+            seen.field_validations.append(kwargs.get("field_validation"))
             return SimpleNamespace(status=SimpleNamespace(allowed=True))
 
     core = MagicMock()

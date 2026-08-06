@@ -102,10 +102,12 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
 
   Security upside: the agent SA needs `sandboxes` create/delete but **not** bare `pods` create/delete.
 
-  `terminal.kubernetes.sandbox.spec` is the `Sandbox` **spec** (`ttlSeconds`, `networkPolicy`, …). Two keys in it are **rejected** by config validation:
+  `terminal.kubernetes.sandbox.spec` is the `Sandbox` **spec**, and on this path it — not just the pod template — is the artifact submitted to the API server. Two keys in it are **rejected** by config validation, and by `sandbox_manifest()` itself so an unvalidated config cannot post them either:
 
   * `podTemplate` — the provisioner assigns the one rendered template here. A second source is precisely how the object that was security-checked comes to differ from the object that was submitted.
   * `sandboxTemplateRef` — a `SandboxTemplate` makes the operator author a pod this backend never renders, so its hardening cannot be established and the managed-by label the NetworkPolicy selects on would be present only if the template happened to set it. There is deliberately no config key for it.
+
+  Every **other** key you put in `sandbox.spec` is submitted verbatim. Hermes has reviewed `ttlSeconds` only (it can only shorten the workspace's life), so anything else counts as *unreviewed* and `unhardened_reasons()` reports it: the pod stops qualifying as a throwaway sandbox and the dangerous-command approval prompts stay on. That is the deliberate trade — a CRD is extensible by design and its coordinates (`sandbox.api_group` / `api_version`) are themselves user config, so a two-name denylist cannot be complete. Unknown is not hardened, and it costs the approval skip rather than passing invisibly.
 
   Scope of that claim, precisely: it covers the pod shape **this backend renders**, which under this schema is every pod it creates. It does not cover anything a compromised agent does by calling the Kubernetes API directly with its own credentials. That is bounded by RBAC, the ValidatingAdmissionPolicy and NetworkPolicy — not by this backend.
 
@@ -118,13 +120,14 @@ Hermes owns the fields that make exec possible and **rejects** a template that s
 | Reserved | Why |
 | --- | --- |
 | `metadata.labels['app.kubernetes.io/managed-by']` | the selector `networkpolicy.yaml`, `validatingadmissionpolicy.yaml` and session-pod adoption all match on |
+| `metadata.ownerReferences` | Hermes owns pod adoption and GC; `_is_ours()` reads it to decide whether an existing object may be reused. Use `owner_reference: off` to opt out |
 | `spec.restartPolicy` | pinned `Never`; a restart swaps the container out from under an open exec session |
 | a `spec.containers` list omitting `container_name` | Hermes execs into that container |
-| that container's `command` | pinned `["sleep","infinity"]` so the pod outlives the session |
+| that container's `command` **and `args`** | pinned `["sleep","infinity"]` so the pod outlives the session. Both halves: the kubelet builds the process as `command + args`, so `args` alone turns it into `sleep infinity --whatever`, which exits at once and (under the pinned `restartPolicy: Never`) leaves a Failed pod |
 | that container's `volumeMounts[mountPath=<mount_path>]` | the workspace mount `terminal.cwd` resolves against |
 | `spec.volumes[name=workspace]` | built from `persistent` and `volume.*` |
 
-Everything else in the `PodSpec` is yours. Every create this backend issues passes `fieldValidation=Strict`, so an unknown or duplicated field is a `400` naming the path rather than a silent drop (the python client discards the API server's `Warning: 299 - unknown field` header, which makes the default `Warn` behaviour indistinguishable from success). `hermes doctor` submits your rendered pod as a `dry_run=All` create for the same reason.
+Everything else in the `PodSpec` is yours. Keys that are **not** in the `terminal.kubernetes.*` schema at all — including every key the pod_template collapse deleted — are rejected by name, so a stale `config.yaml` fails loudly instead of having its settings quietly stop applying. Every create this backend issues passes `fieldValidation=Strict`, so an unknown or duplicated field is a `400` naming the path rather than a silent drop (the python client discards the API server's `Warning: 299 - unknown field` header, which makes the default `Warn` behaviour indistinguishable from success). `hermes doctor` submits your rendered pod as a `dry_run=All` create for the same reason.
 
 ## Workspace persistence
 

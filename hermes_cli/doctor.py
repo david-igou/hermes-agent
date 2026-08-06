@@ -332,6 +332,7 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
 
     try:
         from kubernetes import client as k8s_client
+        from tools.environments.kubernetes import STRICT_FIELD_VALIDATION
 
         auth = k8s_client.AuthorizationV1Api(core_api.api_client)
         for group, resource, verb in checks:
@@ -343,7 +344,11 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
                     )
                 )
             )
-            result = auth.create_self_subject_access_review(review)
+            # Strict on EVERY create this backend issues, without exception —
+            # a rule with a carve-out is a rule nobody can check.
+            result = auth.create_self_subject_access_review(
+                review, **STRICT_FIELD_VALIDATION
+            )
             label = f"RBAC {verb} {resource}" + (f".{group}" if group else "")
             if getattr(result.status, "allowed", False):
                 check_ok(label, f"(in {namespace})")
@@ -367,7 +372,9 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
                 )
             )
             if getattr(
-                auth.create_self_subject_access_review(review).status,
+                auth.create_self_subject_access_review(
+                    review, **STRICT_FIELD_VALIDATION
+                ).status,
                 "allowed", False,
             ):
                 check_warn(

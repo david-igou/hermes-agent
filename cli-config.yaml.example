@@ -424,9 +424,17 @@ terminal:
 #     sandbox:                     # only read when provisioner: sandbox
 #       api_group: "agents.x-k8s.io"
 #       api_version: "v1beta1"
-#       spec: {}                   # Sandbox CR spec (e.g. ttlSeconds,
-#                                  # networkPolicy). podTemplate is injected
-#                                  # from pod_template above and is reserved.
+#       spec: {}                   # Sandbox CR spec, submitted VERBATIM.
+#                                  # podTemplate is injected from pod_template
+#                                  # above and is reserved; so is
+#                                  # sandboxTemplateRef (an operator-authored
+#                                  # pod this backend never renders). Hermes has
+#                                  # reviewed ttlSeconds only — any OTHER key
+#                                  # here is submitted but cannot be evaluated,
+#                                  # so it marks the pod as not-a-throwaway-
+#                                  # sandbox and the dangerous-command prompts
+#                                  # stay on. That is deliberate: unknown is not
+#                                  # hardened.
 #
 # Minimal OpenShift 4.21 + kata example — note that runtimeClassName and
 # resources are plain PodSpec, so they go in pod_template:
