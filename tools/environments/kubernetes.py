@@ -222,16 +222,42 @@ _MERGE_KEYS: dict[tuple, str] = {
 }
 
 
+#: Identity keys whose value is a filesystem path. A path is not a string for
+#: identity purposes: ``/workspace/``, ``//workspace`` and ``/workspace/.`` all
+#: name the directory ``/workspace``, and the kubelet mounts them at the same
+#: place. Comparing the raw string let a second volumeMount shadow the reserved
+#: workspace mount: the alias missed the merge index, so it was appended rather
+#: than merged, no duplicate was detected, and the reserved diff still saw its
+#: own untouched entry at the exact key. Normalise before every comparison so
+#: an alias collides with the entry it aliases.
+_PATH_VALUED_KEYS = frozenset({"mountPath", "devicePath"})
+
+
+def _identity(key: str, value: Any) -> Any:
+    """The value of *key* as used for identity, not as written."""
+    if key in _PATH_VALUED_KEYS and isinstance(value, str):
+        norm = posixpath.normpath(value)
+        # normpath preserves exactly two leading slashes ("//workspace"),
+        # because POSIX leaves that case implementation-defined. The kubelet
+        # does not: it mounts at /workspace. Collapse them or the alias
+        # survives normalisation and shadows the reserved mount anyway.
+        if norm.startswith("//"):
+            norm = "/" + norm.lstrip("/")
+        return norm
+    return value
+
+
 def _merge_keyed_list(base: list, overlay: list, key: str, path: tuple) -> list:
     """Merge *overlay* into *base* element-wise on *key*; append unmatched."""
     merged = [deepcopy(item) for item in base]
     index = {
-        item[key]: pos
+        _identity(key, item[key]): pos
         for pos, item in enumerate(merged)
         if isinstance(item, dict) and key in item
     }
     for item in overlay:
         ident = item.get(key) if isinstance(item, dict) else None
+        ident = _identity(key, ident) if ident is not None else None
         if ident is not None and ident in index:
             merged[index[ident]] = merge_pod_template(
                 merged[index[ident]], item, path + ("*",)
@@ -334,7 +360,8 @@ def duplicate_keyed_entry_problems(
             counts: dict[Any, int] = {}
             for item in value:
                 if isinstance(item, dict) and merge_key in item:
-                    ident = item[merge_key]
+                    # Normalised: '/workspace/' duplicates '/workspace'.
+                    ident = _identity(merge_key, item[merge_key])
                     try:
                         counts[ident] = counts.get(ident, 0) + 1
                     except TypeError:  # unhashable key value
@@ -416,8 +443,10 @@ def _elements(node: Any) -> list:
 
 
 def _find_by(items: list, key: str, value: Any) -> Optional[dict]:
+    """First element whose *key* identifies *value* (paths normalised)."""
+    wanted = _identity(key, value)
     for item in items:
-        if isinstance(item, dict) and item.get(key) == value:
+        if isinstance(item, dict) and _identity(key, item.get(key)) == wanted:
             return item
     return None
 

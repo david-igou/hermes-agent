@@ -3209,3 +3209,55 @@ def test_pvc_adoption_across_instances_stays_possible_but_is_logged(caplog):
     assert any("another0" in record.getMessage() for record in caplog.records), (
         caplog.records
     )
+
+
+@pytest.mark.parametrize("alias", [
+    "/workspace/", "//workspace", "///workspace", "/workspace/.",
+    "/workspace/../workspace", "/./workspace",
+])
+def test_a_path_alias_cannot_shadow_the_reserved_workspace_mount(alias):
+    """A mountPath is a path, not a string.
+
+    Round 5 of this review found that '/workspace/' missed the merge index, so
+    the entry was APPENDED rather than merged: no duplicate was detected, the
+    reserved diff still saw its own untouched entry at the exact key, and the
+    submitted container ended up with two bind mounts over the same directory
+    with the attacker's winning. Every spelling of the same directory has to
+    collide with the entry it aliases.
+
+    Written as a contract over the outcome, not over the aliases: whatever the
+    spelling, either the config is refused or the submitted pod still carries
+    exactly Hermes' own workspace mount.
+    """
+    from tools.environments.kubernetes import (
+        merge_kubernetes_config, validate_kubernetes_config, unhardened_reasons,
+    )
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    kube = {"pod_template": {"spec": {"containers": [
+        {"name": "workspace", "volumeMounts": [{"mountPath": alias, "name": "tmp"}]},
+    ]}}}
+    kcfg = merge_kubernetes_config(kube)
+
+    assert validate_kubernetes_config(kcfg), f"{alias!r} accepted silently"
+    assert unhardened_reasons(kcfg), f"{alias!r} judged hardened"
+    assert _kubernetes_has_host_access(
+        {"env_type": "kubernetes", "kubernetes": kube}
+    ) is True, f"{alias!r} kept the dangerous-command approval skip"
+
+
+def test_path_identity_is_normalised_for_duplicate_detection():
+    """The same normalisation must govern devicePath, not just mountPath."""
+    from tools.environments.kubernetes import (
+        merge_kubernetes_config, validate_kubernetes_config,
+    )
+
+    kube = {"pod_template": {"spec": {"containers": [{
+        "name": "workspace",
+        "volumeDevices": [
+            {"devicePath": "/dev/x/", "name": "a"},
+            {"devicePath": "/dev/x", "name": "b"},
+        ],
+    }]}}}
+    problems = validate_kubernetes_config(merge_kubernetes_config(kube))
+    assert any("devicePath" in p for p in problems), problems
