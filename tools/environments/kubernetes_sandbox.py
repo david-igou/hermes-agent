@@ -42,6 +42,13 @@ logger = logging.getLogger(__name__)
 _SANDBOX_READY_CONDITION = "Ready"
 
 
+def _singular(plural: str) -> str:
+    """``sandboxes`` -> ``sandbox``. ``plural[:-1]`` said "sandboxe"."""
+    if plural.endswith("es") and plural[:-2].endswith(("s", "x", "z", "ch", "sh")):
+        return plural[:-2]
+    return plural[:-1] if plural.endswith("s") else plural
+
+
 class SandboxProvisioner(_BaseProvisioner):
     """Provisions session workspaces as ``Sandbox`` custom resources.
 
@@ -57,14 +64,18 @@ class SandboxProvisioner(_BaseProvisioner):
                  custom_api=None):
         super().__init__(kcfg, namespace, api=api, owner_reference=owner_reference)
         self._custom = custom_api
-        sb = kcfg.get("sandbox") or {}
+        sb = kcfg.get("sandbox")
+        sb = sb if isinstance(sb, dict) else {}
         self.group = str(sb.get("api_group") or "agents.x-k8s.io")
         self.version = str(sb.get("api_version") or "v1beta1")
         # terminal.kubernetes.sandbox.spec — the Sandbox CR spec, minus the
-        # podTemplate this provisioner injects (a reserved key).
-        self.cr_spec = sb.get("spec") or {}
-        # CR names this provisioner created, so destroy() deletes the right
-        # object even when the reconciled pod has a different name.
+        # podTemplate this provisioner injects (a reserved key). A non-mapping
+        # is kept as-is so sandbox_manifest() can REJECT it by name rather than
+        # dying with a TypeError on item assignment.
+        self.cr_spec = sb.get("spec") if sb.get("spec") is not None else {}
+        # CR names this provisioner created (or proved were ours), so destroy()
+        # deletes the right object even when the reconciled pod has a different
+        # name — and deletes NOTHING when there is no such name.
         self._created_names: set[str] = set()
 
     # -- manifests ------------------------------------------------------
@@ -156,19 +167,19 @@ class SandboxProvisioner(_BaseProvisioner):
         try:
             existing = self._get_object(group, plural, name)
         except Exception as exc:
-            raise RuntimeError(
-                f"{plural[:-1]} {name} already exists but could not be read "
-                f"({exc}); refusing to reuse it."
-            ) from exc
+            raise self._refuse(name, (
+                f"{_singular(plural)} {name} already exists but could not be "
+                f"read ({exc}); refusing to reuse or delete it."
+            )) from exc
         owners = _dig_dict(existing, "metadata").get("ownerReferences") or []
         our_uid = self._owner_reference.get("uid")
         if not any(
             isinstance(o, dict) and o.get("uid") == our_uid for o in owners
         ):
-            raise RuntimeError(
-                f"{plural[:-1]} {name} already exists and was not created by "
-                "this Hermes instance; refusing to reuse it."
-            )
+            raise self._refuse(name, (
+                f"{_singular(plural)} {name} already exists and was not created "
+                "by this Hermes instance; refusing to reuse it."
+            ))
 
     @staticmethod
     def _dig(obj: Any, *path: str) -> Any:
@@ -319,8 +330,16 @@ class SandboxProvisioner(_BaseProvisioner):
 
         # Deleting the CR is what tears the pod down — the operator owns it.
         # The reconciled pod may be named after the CR or resolved via labels,
-        # so delete by the CR names we actually created.
-        names = list(self._created_names) or [pod_ref.pod_name]
+        # so delete by the CR names we actually created — and ONLY those. The
+        # old `or [pod_ref.pod_name]` fallback fired precisely when _assert_ours
+        # had refused to adopt a foreign CR (nothing had been recorded), so the
+        # refusal to reuse it was followed by deleting it.
+        names = sorted(self._created_names)
+        if not names:
+            logger.warning(
+                "k8s: not deleting sandbox %s: this provisioner never created "
+                "or adopted it.", pod_ref.pod_name,
+            )
         for name in names:
             try:
                 self._custom.delete_namespaced_custom_object(

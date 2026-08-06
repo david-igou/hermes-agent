@@ -30,9 +30,23 @@ and there is no layer after it: :class:`PodProvisioner` wraps its result in a
 the object that was security-checked drift from the object that was submitted.
 
 The handful of fields that make exec possible at all (the exec container and its
-``command``, ``restartPolicy``, the workspace mount/volume, the managed-by
-label) are REJECTED rather than silently overwritten — see
-:func:`reserved_violations`.
+``command``/``args``, ``restartPolicy``, the workspace mount/volume, the
+managed-by label and ``metadata.ownerReferences``) are REJECTED rather than
+silently overwritten.
+
+Where that rejection is DECIDED matters, and it is the one design rule this
+module keeps re-learning: **judge and enforce on the artifact that is actually
+submitted, never on the user's input.**  :func:`rendered_reserved_violations`
+compares the MERGED template against the hardened base Hermes built and rejects
+any difference in the reserved core, so a violation is defined as "the rendered
+pod is not the pod Hermes owns" rather than as a list of input shapes that are
+known to produce one.  Input shapes are unbounded (a duplicate key in a merge-
+keyed list, an alias, a merge quirk, whatever is found next); the rendered
+artifact is one object with one set of values, so checking it closes the class.
+:func:`reserved_violations` still reads the user's dict, but only as an EARLY,
+FRIENDLY diagnostic that can name the offending config key — it is never the
+thing that makes the guarantee, and every path that renders a template also
+runs the rendered check.
 
 Auth resolution order: in-cluster ServiceAccount →
 ``terminal.kubernetes.kubeconfig`` → ambient ``KUBECONFIG`` / ``~/.kube/config``.
@@ -88,6 +102,10 @@ _EXEC_GRACE_SECONDS = 15
 _SYNC_SENTINEL = "__HERMES_TAR_EOF__"
 _STDIN_CHUNK_BYTES = 64 * 1024
 MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "hermes-agent"}
+# Stamped on every workspace PVC Hermes creates, and required before one is
+# adopted. A PVC cannot carry an ownerReference (it must outlive the agent
+# pod), so this is the only provenance an adopting agent can read.
+PVC_INSTANCE_ANNOTATION = "hermes.nousresearch.com/created-by-instance"
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +276,87 @@ def merge_pod_template(base: dict, overlay: Any, _path: tuple = ()) -> dict:
     return out
 
 
+#: Every list inside a PodTemplateSpec that Kubernetes itself keys, and the key
+#: it uses.  Superset of :data:`_MERGE_KEYS` (which is only about MERGE
+#: semantics): a duplicate key is invalid in ALL of these, whether or not
+#: Hermes merges the list element-wise.
+#:
+#: Duplicates are rejected because the merge HIDES them: ``_merge_keyed_list``
+#: folds every overlay element with the same key into one base entry, so two
+#: ``containers`` entries named ``workspace`` reach the API server as a single
+#: container the server has no duplicate to complain about.  Rejecting them is
+#: defence in depth behind :func:`rendered_reserved_violations` (which catches
+#: the resulting artifact whatever route produced it), and it also stops a
+#: non-reserved duplicate — two ``env`` entries named ``PATH``, say — from
+#: silently collapsing into whichever one happens to win.
+_KEYED_LIST_KEYS: dict[tuple, str] = {
+    ("spec", "containers"): "name",
+    ("spec", "initContainers"): "name",
+    ("spec", "ephemeralContainers"): "name",
+    ("spec", "volumes"): "name",
+    ("spec", "imagePullSecrets"): "name",
+}
+for _field in ("containers", "initContainers", "ephemeralContainers"):
+    _KEYED_LIST_KEYS[("spec", _field, "*", "volumeMounts")] = "mountPath"
+    _KEYED_LIST_KEYS[("spec", _field, "*", "volumeDevices")] = "devicePath"
+    _KEYED_LIST_KEYS[("spec", _field, "*", "env")] = "name"
+    _KEYED_LIST_KEYS[("spec", _field, "*", "ports")] = "containerPort"
+del _field
+
+
+def _display_path(path: tuple) -> str:
+    """``("spec", "containers", "*", "env")`` -> ``spec.containers[].env``."""
+    out = ""
+    for part in path:
+        if part == "*":
+            out += "[]"
+        else:
+            out += f".{part}" if out else str(part)
+    return out
+
+
+def duplicate_keyed_entry_problems(
+    node: Any, label: str = "terminal.kubernetes.pod_template", _path: tuple = ()
+) -> list[str]:
+    """Duplicate keys in any list Kubernetes keys (empty when clean)."""
+    problems: list[str] = []
+    if not isinstance(node, dict):
+        return problems
+    for key, value in node.items():
+        path = _path + (key,)
+        if isinstance(value, dict):
+            problems.extend(duplicate_keyed_entry_problems(value, label, path))
+            continue
+        if not isinstance(value, list):
+            continue
+        merge_key = _KEYED_LIST_KEYS.get(path)
+        if merge_key is not None:
+            counts: dict[Any, int] = {}
+            for item in value:
+                if isinstance(item, dict) and merge_key in item:
+                    ident = item[merge_key]
+                    try:
+                        counts[ident] = counts.get(ident, 0) + 1
+                    except TypeError:  # unhashable key value
+                        continue
+            for ident, count in counts.items():
+                if count > 1:
+                    problems.append(
+                        f"{label}.{_display_path(path)} declares {count} entries "
+                        f"with {merge_key}={ident!r}. Kubernetes keys this list "
+                        f"on {merge_key}, so duplicates are invalid — and the "
+                        "Hermes merge folds them into ONE entry, which is how a "
+                        "second entry reaches the pod without being read as a "
+                        "second entry. Declare it once."
+                    )
+        for item in value:
+            if isinstance(item, dict):
+                problems.extend(
+                    duplicate_keyed_entry_problems(item, label, path + ("*",))
+                )
+    return problems
+
+
 def _dig_dict(obj: Any, *path: str) -> dict:
     """Walk *path* through nested mappings, returning ``{}`` when absent."""
     for key in path:
@@ -328,9 +427,16 @@ def reserved_violations(
 ) -> list[str]:
     """Reserved-core problems in the USER's ``pod_template`` (empty when clean).
 
+    An EARLY, FRIENDLY diagnostic, not the enforcement point. It reads the
+    user's dict so it can name the exact config key to delete, which the
+    rendered comparison cannot do — but it is checking an input shape, and
+    input shapes are unbounded. :func:`rendered_reserved_violations` is what
+    makes the guarantee; it runs on every render, and a clean result here never
+    stands in for a clean result there.
+
     Scans the user's dict only, never the merged result: the hardened base
-    legitimately sets every reserved path, so judging the merge output would
-    flag itself.
+    legitimately sets every reserved path, so judging the merge output as
+    "present" would flag itself.
 
     Detection is by PRESENCE, not value — setting ``restartPolicy: Never``, the
     same value the base uses, is still a violation. That is the only rule that
@@ -432,6 +538,170 @@ def reserved_violations(
     return problems
 
 
+_RENDERED_PREFIX = (
+    "the rendered pod template's {path} is not the value the kubernetes "
+    "backend owns"
+)
+
+
+def _reserved_field_problem(path: str, got: Any, want: Any, why: str) -> str:
+    return (
+        f"{_RENDERED_PREFIX.format(path=path)}: terminal.kubernetes.pod_template "
+        f"renders it as {got!r}, Hermes renders it as {want!r}. {why} Remove "
+        "whatever in pod_template reaches that field."
+    )
+
+
+def rendered_reserved_violations(
+    base: dict, rendered: Any, *, container_name: str, mount_path: str
+) -> list[str]:
+    """Reserved core on the SUBMITTED artifact — the enforcement point.
+
+    Compares the merged template against the hardened base Hermes built from
+    backend state and reports every reserved field the merge changed. It is
+    stated as a property of the OUTPUT ("the pod that will be posted still
+    carries Hermes' exec contract"), so it does not care what input shape
+    produced the difference: a plain key, a duplicate entry in a merge-keyed
+    list that ``_merge_keyed_list`` folded into the base entry, an alias, or
+    anything not yet invented. Round 4 was exactly that — two ``containers``
+    entries named ``workspace``, of which the input-side check read only the
+    first while the merge applied both.
+
+    Reserved paths, and why each is the pod's exec contract rather than pod
+    shape (see :data:`_RESERVED_RATIONALE`):
+
+    * ``metadata.labels[app.kubernetes.io/managed-by]`` — the selector for the
+      NetworkPolicy, the admission policy and pod adoption;
+    * ``metadata.ownerReferences`` — session-pod adoption and GC;
+    * ``spec.restartPolicy`` — a restart swaps the workspace out mid-session;
+    * the exec container: it must exist EXACTLY once, and its ``command`` /
+      ``args`` are the process that outlives the session;
+    * that container's mount at ``mount_path`` — the path ``terminal.cwd``
+      resolves against;
+    * ``spec.volumes[name=workspace]`` — the other half of that mount.
+    """
+    problems: list[str] = []
+    if not isinstance(rendered, dict):
+        return [
+            "the rendered pod template is not a mapping "
+            f"(got {type(rendered).__name__})"
+        ]
+
+    # A1 — the managed-by label. Absent only when the whole metadata/labels node
+    # was replaced by a non-mapping, which _shape_problems reports and
+    # render_pod_template repairs by re-stamping.
+    want_key = MANAGED_BY_KEY
+    present, value = _lookup(rendered, ("metadata", "labels", want_key))
+    _, want = _lookup(base, ("metadata", "labels", want_key))
+    if present and value != want:
+        problems.append(_reserved_field_problem(
+            f"metadata.labels[{want_key}]", value, want,
+            "k8s/networkpolicy.yaml, k8s/validatingadmissionpolicy.yaml and "
+            "session-pod adoption all select on that label.",
+        ))
+
+    # A2 — ownerReferences. The base never sets them; pod_manifest() adds the
+    # agent's own reference when one was resolvable.
+    metadata = rendered.get("metadata")
+    if isinstance(metadata, dict) and "ownerReferences" in metadata:
+        problems.append(_reserved_field_problem(
+            "metadata.ownerReferences", metadata["ownerReferences"], None,
+            _RESERVED_RATIONALE["ownerReferences"],
+        ))
+
+    spec = rendered.get("spec")
+    base_spec = base.get("spec")
+    if not isinstance(spec, dict) or not isinstance(base_spec, dict):
+        return problems + ["the rendered pod template has no spec mapping"]
+
+    # A3 — restartPolicy.
+    if spec.get("restartPolicy") != base_spec.get("restartPolicy"):
+        problems.append(_reserved_field_problem(
+            "spec.restartPolicy", spec.get("restartPolicy"),
+            base_spec.get("restartPolicy"),
+            _RESERVED_RATIONALE["restartPolicy"],
+        ))
+
+    # A4 — the exec container, ONCE, with Hermes' process.
+    targets = [
+        entry for entry in _elements(spec.get("containers"))
+        if isinstance(entry, dict) and entry.get("name") == container_name
+    ]
+    base_target = _find_by(
+        _elements(base_spec.get("containers")), "name", container_name
+    ) or {}
+    if len(targets) != 1:
+        problems.append(
+            f"the rendered pod template declares {len(targets)} containers "
+            f"named {container_name!r}; Hermes execs into exactly one "
+            "(terminal.kubernetes.container_name). A pod that carries none is "
+            "a pod no session can use, and duplicates are invalid to the API "
+            "server, so this backend will not submit either."
+        )
+    else:
+        # Kubernetes requires container names to be unique across all three
+        # lists, and exec_container() resolves the name against the running
+        # pod, so a same-named init/ephemeral container is both invalid and
+        # ambiguous about which process the session would land in.
+        for field in ("initContainers", "ephemeralContainers"):
+            if any(
+                isinstance(entry, dict) and entry.get("name") == container_name
+                for entry in _elements(spec.get(field))
+            ):
+                problems.append(
+                    f"the rendered pod template declares spec.{field}"
+                    f"[name={container_name}] alongside the exec container of "
+                    "the same name. Container names are unique across "
+                    "containers, initContainers and ephemeralContainers; give "
+                    "it another name."
+                )
+        target = targets[0]
+        for key in ("command", "args"):
+            got_present, got = _lookup(target, (key,))
+            want_present, wanted = _lookup(base_target, (key,))
+            if (got_present, got) != (want_present, wanted):
+                problems.append(_reserved_field_problem(
+                    f"spec.containers[name={container_name}].{key}",
+                    got if got_present else None,
+                    wanted if want_present else None,
+                    _RESERVED_RATIONALE[key],
+                ))
+        # A5 — the workspace mount terminal.cwd resolves against.
+        got_mounts = [
+            m for m in _elements(target.get("volumeMounts"))
+            if isinstance(m, dict) and m.get("mountPath") == mount_path
+        ]
+        want_mount = _find_by(
+            _elements(base_target.get("volumeMounts")), "mountPath", mount_path
+        )
+        if got_mounts != ([want_mount] if want_mount is not None else []):
+            problems.append(_reserved_field_problem(
+                f"spec.containers[name={container_name}]"
+                f".volumeMounts[mountPath={mount_path}]",
+                got_mounts, want_mount,
+                "That mount is the workspace terminal.cwd resolves against. "
+                "Mount additional volumes at other paths, or change "
+                "terminal.kubernetes.mount_path.",
+            ))
+
+    # A6 — the workspace volume itself.
+    got_volumes = [
+        v for v in _elements(spec.get("volumes"))
+        if isinstance(v, dict) and v.get("name") == WORKSPACE_VOLUME_NAME
+    ]
+    want_volume = _find_by(
+        _elements(base_spec.get("volumes")), "name", WORKSPACE_VOLUME_NAME
+    )
+    if got_volumes != ([want_volume] if want_volume is not None else []):
+        problems.append(_reserved_field_problem(
+            f"spec.volumes[name={WORKSPACE_VOLUME_NAME}]",
+            got_volumes, want_volume,
+            "Hermes builds it from terminal.kubernetes.persistent and "
+            "terminal.kubernetes.volume.*.",
+        ))
+    return problems
+
+
 #: Keys of the ``Sandbox`` CR spec that Hermes has actually reviewed and can
 #: reason about — the allowlist half of the sandbox rule.
 #:
@@ -441,7 +711,19 @@ def reserved_violations(
 #: CRD is a third party's, ``sandbox.api_group``/``api_version`` are themselves
 #: user config, and a two-name denylist cannot survive a CRD version whose
 #: pod-authoring field has another name.
-_REVIEWED_SANDBOX_SPEC_KEYS = frozenset({"ttlSeconds"})
+#:
+#: Keyed by name AND shape: the ttlSeconds rationale ("it only ever SHORTENS
+#: the workspace's life") is a claim about an integer, not about the name, so
+#: an object smuggled under that key is unreviewed like anything else.
+_REVIEWED_SANDBOX_SPEC_KEYS: dict[str, tuple] = {"ttlSeconds": (int, float)}
+
+
+def _is_reviewed_sandbox_value(key: str, value: Any) -> bool:
+    types = _REVIEWED_SANDBOX_SPEC_KEYS.get(key)
+    if types is None:
+        return False
+    # bool is an int subclass, and `ttlSeconds: true` is not a TTL.
+    return isinstance(value, types) and not isinstance(value, bool)
 
 
 def unreviewed_sandbox_spec_keys(cr_spec: Any) -> list[str]:
@@ -465,8 +747,8 @@ def unreviewed_sandbox_spec_keys(cr_spec: Any) -> list[str]:
         return []
     reserved = {"podTemplate", "sandboxTemplateRef"}
     return sorted(
-        key for key in cr_spec
-        if key not in _REVIEWED_SANDBOX_SPEC_KEYS and key not in reserved
+        key for key, value in cr_spec.items()
+        if not _is_reviewed_sandbox_value(key, value) and key not in reserved
     )
 
 
@@ -478,6 +760,14 @@ def sandbox_spec_reasons(cr_spec: Any) -> list[str]:
     ``podTemplate`` decouples judged from submitted), and unreviewed keys are
     CR spec Hermes never read. Both are "unknown", and unknown is not hardened.
     """
+    if cr_spec is not None and not isinstance(cr_spec, dict):
+        # Unknown is not hardened, and a scalar here is a CR body this backend
+        # cannot read at all (it also used to crash the manifest builder with a
+        # bare TypeError while the judge said nothing).
+        return [
+            f"sandbox.spec is not a mapping (got {type(cr_spec).__name__}); this "
+            "backend cannot establish what would be submitted"
+        ]
     reasons = [
         f"sandbox.spec.{key} is an unreviewed Sandbox CR field: it is submitted "
         "verbatim and this backend cannot establish what it does to the pod"
@@ -499,10 +789,14 @@ def sandbox_spec_reasons(cr_spec: Any) -> list[str]:
 
 def reserved_sandbox_spec_violations(cr_spec: Any) -> list[str]:
     """Reserved-core problems in ``terminal.kubernetes.sandbox.spec``."""
+    base = "terminal.kubernetes.sandbox.spec"
+    if cr_spec is not None and not isinstance(cr_spec, dict):
+        # Fail loudly HERE rather than as a TypeError from
+        # `spec["podTemplate"] = ...` in the CR builder.
+        return [f"{base} must be a mapping (got {type(cr_spec).__name__})"]
     if not isinstance(cr_spec, dict):
         return []
     problems: list[str] = []
-    base = "terminal.kubernetes.sandbox.spec"
     if "podTemplate" in cr_spec:
         # S1 — a second pod-template source is the round-2/round-3 bypass:
         # the object that was security-checked stops being the object that is
@@ -643,6 +937,36 @@ def _unknown_key_problems(kcfg: Any) -> list[str]:
     return problems
 
 
+def _mapping(node: Any, key: str) -> dict:
+    """``node[key]`` when it is a mapping, else ``{}``.
+
+    ``(kcfg.get("volume") or {})`` is not the same thing: a scalar written where
+    a block belongs sails through ``or`` and made the VALIDATOR — the function
+    whose whole job is to turn that into a message — raise AttributeError
+    instead. :func:`_block_shape_problems` reports it; this keeps the rest of
+    the checks running so the user gets the full list.
+    """
+    value = node.get(key) if isinstance(node, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
+def _block_shape_problems(kcfg: dict) -> list[str]:
+    """Scalars written where an enumerated sub-block belongs."""
+    problems: list[str] = []
+    if not isinstance(kcfg, dict):
+        return problems
+    for block in _ENUMERATED_SUBTREES:
+        value = kcfg.get(block)
+        if value is not None and not isinstance(value, dict):
+            problems.append(
+                f"terminal.kubernetes.{block} must be a mapping (got "
+                f"{type(value).__name__})"
+            )
+    # sandbox.spec has its own reporter (reserved_sandbox_spec_violations), so
+    # it is deliberately not repeated here.
+    return problems
+
+
 def _root_uid_problems(kcfg: dict) -> list[str]:
     """uid 0 requested against a base that pins ``runAsNonRoot: true``.
 
@@ -650,6 +974,17 @@ def _root_uid_problems(kcfg: dict) -> list[str]:
     so this is a config error, not a privilege escape — but it is one the
     offline validator is here to catch. ``dry_run="All"`` + Strict cannot: the
     object is schema-valid, and Strict only rejects UNKNOWN fields.
+
+    Judged on the EFFECTIVE value the kubelet computes — the container's
+    ``securityContext`` falling back to the pod's — not per scope in isolation.
+    Per-scope was blind to the most natural "let this session run as root"
+    config there is: ``spec.securityContext: {runAsNonRoot: false, runAsUser:
+    0}``. The pod scope is skipped because that scope's own ``runAsNonRoot`` is
+    false, the container scope is skipped because that scope has no
+    ``runAsUser`` — while the kubelet pairs the container's ``runAsNonRoot:
+    true`` (which the hardened base pins) with the uid 0 it inherits from the
+    pod, and refuses the pod. Setting it on the CONTAINER is the way to run as
+    root, because that is the scope the kubelet actually reads.
     """
     try:
         template = render_pod_template(
@@ -666,24 +1001,33 @@ def _root_uid_problems(kcfg: dict) -> list[str]:
     if not isinstance(spec, dict):
         return []
     problems: list[str] = []
-    scopes: list[tuple[str, Any]] = [("spec.securityContext", spec.get("securityContext"))]
+    pod_sctx = spec.get("securityContext")
+    pod_sctx = pod_sctx if isinstance(pod_sctx, dict) else {}
     for field in ("containers", "initContainers"):
         for entry in _elements(spec.get(field)):
-            if isinstance(entry, dict):
-                scopes.append((
-                    f"spec.{field}[name={entry.get('name')}].securityContext",
-                    entry.get("securityContext"),
-                ))
-    for label, sctx in scopes:
-        if not isinstance(sctx, dict):
-            continue
-        if sctx.get("runAsUser") == 0 and sctx.get("runAsNonRoot") is not False:
-            problems.append(
-                f"terminal.kubernetes.pod_template.{label}: runAsUser=0 is "
-                "incompatible with the hardened base's runAsNonRoot: true "
-                "(the kubelet rejects the pod). Drop runAsUser, or pick a "
-                "non-zero uid."
-            )
+            if not isinstance(entry, dict):
+                continue
+            sctx = entry.get("securityContext")
+            sctx = sctx if isinstance(sctx, dict) else {}
+            # The kubelet's rule: the container's value when it has one, the
+            # pod's otherwise. Each half can come from a different scope.
+            uid_present, uid = _lookup(sctx, ("runAsUser",))
+            if not uid_present:
+                uid_present, uid = _lookup(pod_sctx, ("runAsUser",))
+            nonroot_present, nonroot = _lookup(sctx, ("runAsNonRoot",))
+            if not nonroot_present:
+                nonroot_present, nonroot = _lookup(pod_sctx, ("runAsNonRoot",))
+            if uid_present and uid == 0 and nonroot is not False:
+                problems.append(
+                    "terminal.kubernetes.pod_template.spec."
+                    f"{field}[name={entry.get('name')}]: the EFFECTIVE "
+                    "securityContext is runAsUser=0 with runAsNonRoot true "
+                    "(either scope's value counts, and the hardened base pins "
+                    "runAsNonRoot: true on the container), which the kubelet "
+                    "rejects with CreateContainerConfigError. Pick a non-zero "
+                    "uid, or set runAsNonRoot: false on the CONTAINER — the "
+                    "scope the kubelet reads."
+                )
     return problems
 
 
@@ -692,9 +1036,11 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
 
     Cheap, offline checks only — used by ``hermes doctor`` and by the backend
     itself before it ever talks to a cluster.  Reserved-core rejection lives
-    here (:func:`reserved_violations`), so a config that tries to own a field
+    here (:func:`pod_template_problems`), so a config that tries to own a field
     Hermes owns fails loudly with the exact dotted path instead of having its
-    YAML silently overwritten.
+    YAML silently overwritten.  It is the SAME function the renderer raises
+    from, evaluated against the same rendered artifact, so "validates clean"
+    and "renders" cannot come apart.
 
     Unknown and REMOVED keys are rejected too (:func:`_unknown_key_problems`):
     a hard cut that accepts the keys it cut is a silent no-op, which is the
@@ -703,6 +1049,7 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
     """
     problems: list[str] = []
     problems.extend(_unknown_key_problems(kcfg))
+    problems.extend(_block_shape_problems(kcfg))
     provisioner = str(kcfg.get("provisioner") or "").strip().lower()
     if provisioner not in VALID_PROVISIONERS:
         problems.append(
@@ -710,7 +1057,7 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
             f"{', '.join(VALID_PROVISIONERS)} (got {provisioner!r})"
         )
 
-    vol_size = (kcfg.get("volume") or {}).get("size")
+    vol_size = _mapping(kcfg, "volume").get("size")
     if vol_size and not _QUANTITY_RE.match(str(vol_size)):
         problems.append(
             f"terminal.kubernetes.volume.size={vol_size!r} is not a valid "
@@ -724,7 +1071,7 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
                 f"terminal.kubernetes.{field}={value!r} is not a valid "
                 "RFC-1123 name (lowercase alphanumeric, '-', max 63 chars)"
             )
-    claim_name = str((kcfg.get("volume") or {}).get("claim_name") or "")
+    claim_name = str(_mapping(kcfg, "volume").get("claim_name") or "")
     if claim_name and not _is_rfc1123_name(claim_name):
         problems.append(
             f"terminal.kubernetes.volume.claim_name={claim_name!r} is not a "
@@ -743,19 +1090,9 @@ def validate_kubernetes_config(kcfg: dict) -> list[str]:
             "server rejects duplicate mountPaths; pick another path."
         )
 
-    pod_template = kcfg.get("pod_template")
+    problems.extend(pod_template_problems(kcfg))
     problems.extend(
-        _shape_problems(pod_template, "terminal.kubernetes.pod_template")
-    )
-    problems.extend(
-        reserved_violations(
-            pod_template,
-            container_name=container_name(kcfg),
-            mount_path=mount_path(kcfg),
-        )
-    )
-    problems.extend(
-        reserved_sandbox_spec_violations((kcfg.get("sandbox") or {}).get("spec"))
+        reserved_sandbox_spec_violations(_mapping(kcfg, "sandbox").get("spec"))
     )
     problems.extend(_root_uid_problems(kcfg))
     return problems
@@ -997,7 +1334,7 @@ def mount_path(kcfg: dict) -> str:
     return str(kcfg.get("mount_path") or "").strip() or "/workspace"
 
 
-def render_pod_template(
+def _hardened_base(
     kcfg: dict,
     *,
     persistent: bool,
@@ -1006,39 +1343,14 @@ def render_pod_template(
     pvc_name: str,
     owned: bool = True,
 ) -> dict:
-    """Render THE pod template — the artifact that reaches the API server.
+    """The pod template Hermes owns, before any user layer.
 
-    This is the ONE function that produces a pod template, and NOTHING runs
-    after it.  :class:`PodProvisioner` wraps the result in a ``Pod``; the
-    sandbox provisioner ASSIGNS it to ``Sandbox.spec.podTemplate`` (assignment,
-    never a merge, so there is no second source);
-    :func:`unhardened_reasons` calls it with the same config.  What is judged
-    is therefore byte-for-byte what is submitted, for both provisioners.
-
-    A hardened base is built from backend state (image, resources, the
-    workspace volume, the exec container), then ``terminal.kubernetes.
-    pod_template`` is merged over it exactly once by :func:`merge_pod_template`.
-
-    Raises ``ValueError`` when ``pod_template`` claims a reserved field.  That
-    is belt-and-braces over :func:`validate_kubernetes_config` and it buys the
-    fail-closed path for free: :func:`unhardened_reasons` converts the raise
-    into "could not be rendered", so an unvalidated violating config keeps the
-    dangerous-command guards on rather than earning the approval skip.
-
-    *owned* is False when no ownerReference could be resolved — the one case
-    where a persistent pod also needs the activeDeadlineSeconds backstop,
-    because nothing else would ever reap it.
+    Split out of :func:`render_pod_template` so the reserved-core check can
+    compare the RENDERED artifact against the values this function produced,
+    rather than against a second hand-written copy of them that could drift.
     """
     exec_container = container_name(kcfg)
     workspace_path = mount_path(kcfg)
-
-    violations = reserved_violations(
-        kcfg.get("pod_template"),
-        container_name=exec_container,
-        mount_path=workspace_path,
-    )
-    if violations:
-        raise ValueError("; ".join(violations))
 
     # --- the hardened base --------------------------------------------
     # Everything below is what a throwaway session sandbox looks like, and is
@@ -1115,17 +1427,117 @@ def render_pod_template(
         # stays top-level instead of folding into pod_template.
         spec["activeDeadlineSeconds"] = deadline
 
-    base = {"metadata": {"labels": dict(MANAGED_BY_LABEL)}, "spec": spec}
+    return {"metadata": {"labels": dict(MANAGED_BY_LABEL)}, "spec": spec}
+
+
+def pod_template_problems(kcfg: Any) -> list[str]:
+    """Every ``pod_template`` problem, judged on the artifact it RENDERS.
+
+    One implementation shared by :func:`validate_kubernetes_config` (which
+    reports) and :func:`render_pod_template` (which raises), so the two can
+    never disagree about what is acceptable — the config that validates clean
+    is exactly the config that renders.
+
+    The render arguments here are representative: they change the base's image,
+    PVC name and deadline, none of which is reserved. The reserved comparison is
+    always base-versus-rendered from the SAME base, so it is exact either way.
+    """
+    if not isinstance(kcfg, dict):
+        return []
+    base = _hardened_base(
+        kcfg,
+        persistent=bool(kcfg.get("persistent")),
+        image=str(kcfg.get("image") or ""),
+        resources=Resources(),
+        pvc_name="hermes-ws",
+    )
+    rendered = merge_pod_template(base, kcfg.get("pod_template"))
+    return (
+        _shape_problems(kcfg.get("pod_template"), "terminal.kubernetes.pod_template")
+        + _reserved_problems(kcfg, base, rendered)
+    )
+
+
+def _reserved_problems(kcfg: dict, base: dict, rendered: Any) -> list[str]:
+    """Duplicate-key + reserved-core problems for one rendered template.
+
+    Deliberately NOT the shape checks: a malformed ``metadata`` is repaired by
+    the re-stamp in :func:`render_pod_template` and reported by
+    :func:`_shape_problems`, so it must not also make rendering fail.
+    """
+    pod_template = kcfg.get("pod_template")
+    problems = duplicate_keyed_entry_problems(pod_template)
+    # The friendly, input-side diagnostic (names the config key to delete)...
+    problems.extend(reserved_violations(
+        pod_template,
+        container_name=container_name(kcfg),
+        mount_path=mount_path(kcfg),
+    ))
+    # ...and the one that makes the guarantee, on what would be submitted.
+    problems.extend(rendered_reserved_violations(
+        base, rendered,
+        container_name=container_name(kcfg),
+        mount_path=mount_path(kcfg),
+    ))
+    return problems
+
+
+def render_pod_template(
+    kcfg: dict,
+    *,
+    persistent: bool,
+    image: str,
+    resources: Resources,
+    pvc_name: str,
+    owned: bool = True,
+) -> dict:
+    """Render THE pod template — the artifact that reaches the API server.
+
+    This is the ONE function that produces a pod template, and NOTHING runs
+    after it.  :class:`PodProvisioner` wraps the result in a ``Pod``; the
+    sandbox provisioner ASSIGNS it to ``Sandbox.spec.podTemplate`` (assignment,
+    never a merge, so there is no second source);
+    :func:`unhardened_reasons` calls it with the same config.  What is judged
+    is therefore byte-for-byte what is submitted, for both provisioners.
+
+    A hardened base is built from backend state (image, resources, the
+    workspace volume, the exec container), then ``terminal.kubernetes.
+    pod_template`` is merged over it exactly once by :func:`merge_pod_template`,
+    and the RESULT is compared against that base
+    (:func:`rendered_reserved_violations`).  Checking the output rather than
+    the input is what makes the reserved core hold for input shapes nobody
+    enumerated.
+
+    Raises ``ValueError`` when the rendered template's reserved core differs
+    from the base's (or when ``pod_template`` claims a reserved field, or
+    declares a duplicate key in a list Kubernetes keys).  That is
+    belt-and-braces over :func:`validate_kubernetes_config` and it buys the
+    fail-closed path for free: :func:`unhardened_reasons` converts the raise
+    into "could not be rendered", so an unvalidated violating config keeps the
+    dangerous-command guards on rather than earning the approval skip.
+
+    *owned* is False when no ownerReference could be resolved — the one case
+    where a persistent pod also needs the activeDeadlineSeconds backstop,
+    because nothing else would ever reap it.
+    """
+    base = _hardened_base(
+        kcfg, persistent=persistent, image=image, resources=resources,
+        pvc_name=pvc_name, owned=owned,
+    )
 
     # THE one and only user layer.
     template = merge_pod_template(base, kcfg.get("pod_template"))
+
+    violations = _reserved_problems(kcfg, base, template)
+    if violations:
+        raise ValueError("; ".join(violations))
 
     # Shape defensiveness, not a second override layer: merge_pod_template
     # faithfully replaces a dict with whatever the overlay supplies, so
     # `metadata: null` used to raise a bare AttributeError out of manifest
     # construction. The managed-by label is not negotiable (it is the selector
     # for k8s/networkpolicy.yaml and the ValidatingAdmissionPolicy
-    # matchCondition), and setting it is already rejected above — a malformed
+    # matchCondition), and CHANGING it is already rejected above — a malformed
     # template loses its metadata, it does not lose the label.
     metadata = template.get("metadata")
     if not isinstance(metadata, dict):
@@ -1166,13 +1578,21 @@ def _container_pulls_in_a_secret(container: dict) -> bool:
 _CONFINED_SECCOMP_TYPES = frozenset({"RuntimeDefault", "Localhost"})
 
 
-def _confinement_reasons(sctx: Any, label: str) -> list[str]:
+def _confinement_reasons(
+    sctx: Any, label: str, *, require_seccomp: bool = False
+) -> list[str]:
     """Runtime-confinement floors a securityContext can silently relax.
 
     The base pins ``seccompProfile: RuntimeDefault``; ``pod_template`` is the
     documented free-form layer sitting on top of it, so every axis that turns
     that confinement off has to cost the approval skip. AppArmor/SELinux are
     here for the same reason ``spc_t`` is a well-known OpenShift escape.
+
+    *require_seccomp* is the pod scope, where the profile is a FLOOR rather
+    than an override: reading a value only when it is present made an explicit
+    ``seccompProfile: null`` — which the merge faithfully applies, deleting the
+    base's RuntimeDefault — invisible to the very check that exists to notice
+    it. Container scopes inherit the pod's, so absence there is normal.
     """
     if not isinstance(sctx, dict):
         return []
@@ -1186,6 +1606,11 @@ def _confinement_reasons(sctx: Any, label: str) -> list[str]:
             )
     elif seccomp is not None:
         reasons.append(f"{label}.seccompProfile is not a mapping")
+    elif require_seccomp:
+        reasons.append(
+            f"{label}.seccompProfile is not set; the hardened base pins "
+            "RuntimeDefault, so the pod submitted has no seccomp floor"
+        )
     apparmor = sctx.get("appArmorProfile")
     if isinstance(apparmor, dict) and str(apparmor.get("type") or "") == "Unconfined":
         reasons.append(f"{label}.appArmorProfile.type is Unconfined")
@@ -1194,6 +1619,40 @@ def _confinement_reasons(sctx: Any, label: str) -> list[str]:
             f"{label}.seLinuxOptions is set; this backend cannot establish "
             "what the requested SELinux context permits"
         )
+    return reasons
+
+
+#: Annotation families that change the sandbox itself rather than describe it.
+#: ``metadata.annotations`` is copied verbatim into the submitted template and
+#: is not reserved, so the judge is the only thing that sees these.
+_APPARMOR_ANNOTATION = "container.apparmor.security.beta.kubernetes.io/"
+_KATA_ANNOTATION = "io.katacontainers.config."
+
+
+def _annotation_reasons(template: Any) -> list[str]:
+    """Pod annotations that relax or reconfigure the sandbox.
+
+    The deprecated AppArmor beta annotation is a metadata KEY, not a
+    securityContext field, so the ``appArmorProfile`` check never sees it —
+    ``…/workspace: unconfined`` turned confinement off in complete silence. The
+    Kata family is the same shape and matters more here: when the runtime
+    handler allowlists them, ``io.katacontainers.config.hypervisor.*`` changes
+    the VM the workload runs in, and this backend has reviewed none of it.
+    """
+    reasons: list[str] = []
+    for key, value in _dig_dict(template, "metadata", "annotations").items():
+        name = str(key)
+        if name.startswith(_APPARMOR_ANNOTATION):
+            text = str(value)
+            if text != "runtime/default" and not text.startswith("localhost/"):
+                reasons.append(
+                    f"annotation {name}={text!r} relaxes AppArmor confinement"
+                )
+        elif name.startswith(_KATA_ANNOTATION):
+            reasons.append(
+                f"annotation {name} reconfigures the Kata sandbox VM and is not "
+                "reviewed by this backend"
+            )
     return reasons
 
 
@@ -1236,7 +1695,13 @@ def unhardened_reasons(kcfg: dict) -> list[str]:
     # future change that turns validation into a warning must not silently
     # reopen the operator-authored-pod door.
     if str(kcfg.get("provisioner") or "").strip().lower() == "sandbox":
-        reasons.extend(sandbox_spec_reasons((kcfg.get("sandbox") or {}).get("spec")))
+        sandbox = kcfg.get("sandbox")
+        if sandbox is not None and not isinstance(sandbox, dict):
+            reasons.append(
+                f"sandbox is not a mapping (got {type(sandbox).__name__}); this "
+                "backend cannot establish what would be submitted"
+            )
+        reasons.extend(sandbox_spec_reasons(_mapping(kcfg, "sandbox").get("spec")))
 
     try:
         template = render_pod_template(
@@ -1269,7 +1734,10 @@ def template_reasons(template: dict) -> list[str]:
         reasons.append("pod securityContext.runAsNonRoot is not true")
     if psc.get("runAsUser") == 0:
         reasons.append("pod securityContext.runAsUser is 0")
-    reasons.extend(_confinement_reasons(psc, "pod securityContext"))
+    reasons.extend(
+        _confinement_reasons(psc, "pod securityContext", require_seccomp=True)
+    )
+    reasons.extend(_annotation_reasons(template))
     if spec.get("shareProcessNamespace"):
         # Every container sees (and can /proc-inspect) every other container's
         # process tree, including anything a sidecar holds in memory.
@@ -1386,6 +1854,28 @@ class _BaseProvisioner(WorkspaceProvisioner):
             (owner_reference or {}).get("uid", "")
         )
         self.ready_timeout = int(kcfg.get("ready_timeout_seconds") or 120)
+        # Objects this provisioner REFUSED to adopt (or could not prove were
+        # ours). A refusal to reuse has to be a refusal to delete as well: the
+        # refusal raises out of ensure(), KubernetesEnvironment.__init__ catches
+        # it and calls _best_effort_destroy(), which synthesises a PodRef from
+        # the same conventional name — so the guard that protected the read side
+        # was handing the write side to the same foreign object.
+        self._foreign_names: set[str] = set()
+
+    def _refuse(self, name: str, message: str) -> "RuntimeError":
+        """Record *name* as not-ours and build the error to raise."""
+        self._foreign_names.add(name)
+        return RuntimeError(message)
+
+    def _may_delete(self, name: str) -> bool:
+        if name in self._foreign_names:
+            logger.warning(
+                "k8s: refusing to delete %s: this Hermes instance declined to "
+                "adopt it (it is not ours, or ownership could not be read), so "
+                "deleting it would destroy another agent's workspace.", name,
+            )
+            return False
+        return True
 
     # -- naming ---------------------------------------------------------
     def workspace_name(self, task_id: str) -> str:
@@ -1443,7 +1933,7 @@ class _BaseProvisioner(WorkspaceProvisioner):
 
     # -- PVC ------------------------------------------------------------
     def pvc_manifest(self, task_id: str, resources: Resources) -> dict:
-        vol = self.kcfg.get("volume") or {}
+        vol = _mapping(self.kcfg, "volume")
         size = str(vol.get("size") or "").strip() or f"{resources.disk_mib}Mi"
         spec: dict[str, Any] = {
             "accessModes": list(vol.get("access_modes") or ["ReadWriteOnce"]),
@@ -1466,40 +1956,105 @@ class _BaseProvisioner(WorkspaceProvisioner):
                     "app.kubernetes.io/component": "hermes-workspace",
                     "hermes.nousresearch.com/task": sanitize_name(task_id),
                 },
+                # Provenance, not identity: the claim carries no ownerReference
+                # (it must outlive the agent pod), so this stamp is what an
+                # adopting agent can check.  See _assert_pvc_is_ours.
+                "annotations": {PVC_INSTANCE_ANNOTATION: self._instance},
             },
             "spec": spec,
         }
 
-    def _assert_pvc_is_ours(self, pvc, name: str) -> None:
-        """Refuse to adopt a PVC this backend did not create.
+    @staticmethod
+    def _metadata_map(obj, field: str) -> dict:
+        """``metadata.<field>`` as a dict, from an SDK object or a plain dict."""
+        value = getattr(getattr(obj, "metadata", None), field, None)
+        if value is None and isinstance(obj, dict):
+            value = _dig_dict(obj, "metadata").get(field)
+        return value if isinstance(value, dict) else {}
+
+    def _assert_pvc_is_ours(self, pvc, name: str, task_id: str) -> None:
+        """Refuse to adopt a PVC this backend cannot tie to a Hermes workspace.
 
         Adoption is not free: the claim is mounted at ``mount_path``, which is
         the agent's cwd, and ``KubernetesEnvironment`` immediately syncs its
         credential files into ``<cwd>/.hermes`` — i.e. into this claim, at
-        rest, on a volume Hermes never deletes.  Pod adoption was hardened in
-        round 2 (``PodProvisioner._is_ours``); this path had no check at
-        all, so a claim someone else created under the conventional name was
-        adopted silently.
+        rest, on a volume Hermes never deletes.
 
-        The check is the managed-by label, NOT an ownerReference: the claim
-        deliberately carries none (it must outlive the agent pod) and is
-        deliberately task-scoped rather than instance-scoped, so sharing it
-        between Hermes instances running the same task id is the DESIGNED
-        behaviour — see ``pvc_name`` and k8s/README.md.  What we can and do
-        refuse is a claim that is not a Hermes workspace at all.
+        What can be proved here is weaker than on the pod path, and the
+        difference is deliberate rather than an oversight: the claim carries no
+        ownerReference (it must outlive the agent pod) and its name is task-
+        scoped rather than instance-scoped, because a persistent workspace must
+        resume for the same task after the agent pod is replaced.  So there is
+        no per-instance secret to check.  What IS checked is the complete
+        provenance stamp ``pvc_manifest`` writes — the managed-by label, the
+        component label, the task label and the creating instance annotation —
+        rather than the single well-known managed-by label, which any workload
+        with ``persistentvolumeclaims/create`` could set on a claim it made
+        under the conventional name.  A claim missing the stamp is refused
+        (fail closed) with instructions, and a claim stamped by a DIFFERENT
+        instance is logged, because cross-instance sharing is designed but
+        should never be silent.
+
+        Honest limitation, also stated in k8s/README.md: every field here is
+        forgeable by anything that can create a labelled PVC in the session
+        namespace.  ``persistentvolumeclaims/create`` in that namespace is a
+        trust boundary; keep it to Hermes (RBAC), and prefer an explicit
+        ``terminal.kubernetes.volume.claim_name``.
         """
-        labels = getattr(getattr(pvc, "metadata", None), "labels", None)
-        if labels is None and isinstance(pvc, dict):
-            labels = _dig_dict(pvc, "metadata").get("labels")
-        labels = labels or {}
+        labels = self._metadata_map(pvc, "labels")
+        annotations = self._metadata_map(pvc, "annotations")
         managed_by_key, managed_by_value = next(iter(MANAGED_BY_LABEL.items()))
+        advice = (
+            " The agent's credential files are synced into this claim. Set "
+            "terminal.kubernetes.volume.claim_name to a name of your own, or "
+            "let Hermes create the claim."
+        )
         if labels.get(managed_by_key) != managed_by_value:
-            raise RuntimeError(
+            raise self._refuse(name, (
                 f"persistentvolumeclaim {name} already exists and is not a "
                 f"Hermes workspace ({managed_by_key}="
-                f"{labels.get(managed_by_key)!r}); refusing to mount it. The "
-                "agent's credential files are synced into this claim. Set "
-                "terminal.kubernetes.volume.claim_name to a name of your own."
+                f"{labels.get(managed_by_key)!r}); refusing to mount it." + advice
+            ))
+        if labels.get("app.kubernetes.io/component") != "hermes-workspace":
+            raise self._refuse(name, (
+                f"persistentvolumeclaim {name} already exists and does not carry "
+                "the Hermes workspace component label; refusing to mount it."
+                + advice
+            ))
+        configured = str(_mapping(self.kcfg, "volume").get("claim_name") or "").strip()
+        if not configured:
+            # Conventional name -> it must be the claim for THIS task. A
+            # configured claim is the operator's own choice and may legitimately
+            # be shared across task ids.
+            want_task = sanitize_name(task_id)
+            if labels.get("hermes.nousresearch.com/task") != want_task:
+                raise self._refuse(name, (
+                    f"persistentvolumeclaim {name} already exists and is "
+                    f"labelled for task "
+                    f"{labels.get('hermes.nousresearch.com/task')!r}, not "
+                    f"{want_task!r}; refusing to mount it." + advice
+                ))
+        stamp = annotations.get(PVC_INSTANCE_ANNOTATION)
+        if not stamp:
+            raise self._refuse(name, (
+                f"persistentvolumeclaim {name} already exists but carries no "
+                f"{PVC_INSTANCE_ANNOTATION} stamp, so this backend cannot "
+                "establish that a Hermes agent created it; refusing to mount "
+                "it." + advice + " A claim you pre-created, or one left by a "
+                "Hermes build older than this stamp, needs the annotation added "
+                "(any value) to record that decision: kubectl -n <ns> annotate "
+                f"pvc {name} {PVC_INSTANCE_ANNOTATION}=adopted"
+            ))
+        if stamp != self._instance:
+            # Designed: two agents running the same task id share the claim.
+            # Never silent: it is another agent's workspace and its files.
+            logger.warning(
+                "k8s: adopting persistentvolumeclaim %s created by Hermes "
+                "instance %s (this instance is %s). Sharing a workspace claim "
+                "is by design for the same task id, but the agent's credential "
+                "files are synced into it — set "
+                "terminal.kubernetes.volume.claim_name to keep them apart.",
+                name, stamp, self._instance,
             )
 
     def _ensure_pvc(self, task_id: str, resources: Resources) -> None:
@@ -1510,7 +2065,7 @@ class _BaseProvisioner(WorkspaceProvisioner):
             existing = self._api.read_namespaced_persistent_volume_claim(
                 name=name, namespace=self.namespace
             )
-            self._assert_pvc_is_ours(existing, name)
+            self._assert_pvc_is_ours(existing, name, task_id)
             return
         except ApiException as exc:
             if exc.status != 404:
@@ -1531,11 +2086,11 @@ class _BaseProvisioner(WorkspaceProvisioner):
                     name=name, namespace=self.namespace
                 )
             except Exception as read_exc:
-                raise RuntimeError(
+                raise self._refuse(name, (
                     f"persistentvolumeclaim {name} already exists but could not "
                     f"be read ({read_exc}); refusing to mount it."
-                ) from read_exc
-            self._assert_pvc_is_ours(raced, name)
+                )) from read_exc
+            self._assert_pvc_is_ours(raced, name, task_id)
 
     # -- readiness ------------------------------------------------------
     def _pod_failure_detail(self, pod) -> str:
@@ -1666,6 +2221,11 @@ class PodProvisioner(_BaseProvisioner):
         A 409 on create is only safe to treat as "resume" when the pod is ours;
         otherwise we would silently exec into (and later delete) another
         agent's live workspace.
+
+        A read that FAILS is not the same as a read that says "not ours", and
+        collapsing the two produced a wrong message ("was not created by this
+        Hermes instance" for a 403 on ``get pods``). Both fail closed, but only
+        one of them is a statement about ownership.
         """
         from kubernetes.client.exceptions import ApiException
 
@@ -1673,8 +2233,15 @@ class PodProvisioner(_BaseProvisioner):
             pod = self._api.read_namespaced_pod(
                 name=pod_name, namespace=self.namespace
             )
-        except ApiException:
-            return False
+        except ApiException as exc:
+            if getattr(exc, "status", None) == 404:
+                return False
+            raise self._refuse(pod_name, (
+                f"session pod {pod_name} already exists but its ownership could "
+                f"not be read ({exc}); refusing to reuse or delete it. Grant "
+                "'get pods' in this namespace, or use a distinct "
+                "terminal.kubernetes.namespace."
+            )) from exc
         labels = getattr(pod.metadata, "labels", None) or {}
         if labels.get("app.kubernetes.io/managed-by") != "hermes-agent":
             return False
@@ -1712,15 +2279,20 @@ class PodProvisioner(_BaseProvisioner):
             # 409 = the pod already exists (persistent resume after a soft
             # stop, or a racing session in this same agent).
             if not self._is_ours(pod_name):
-                raise RuntimeError(
+                raise self._refuse(pod_name, (
                     f"session pod {pod_name} already exists and was not created "
                     "by this Hermes instance; refusing to reuse it."
-                )
+                ))
 
         pod = self.wait_pod_ready(pod_name)
         return PodRef(self.namespace, pod_name, self.exec_container(pod))
 
     def destroy(self, pod_ref: PodRef, persistent: bool) -> None:
+        # A pod we refused to adopt is a pod we must not delete: the refusal
+        # raises out of ensure(), and the environment's teardown path then asks
+        # to destroy the workspace under exactly that name.
+        if not self._may_delete(pod_ref.pod_name):
+            return
         self._delete_pod(pod_ref.namespace, pod_ref.pod_name)
         # Persistent: keep the PVC so the next session resumes the filesystem.
         # There is deliberately no automatic PVC deletion — see
@@ -2259,6 +2831,7 @@ __all__ = [
     "SESSION_SERVICE_ACCOUNT",
     "STRICT_FIELD_VALIDATION",
     "MANAGED_BY_LABEL",
+    "PVC_INSTANCE_ANNOTATION",
     "PodRef",
     "Resources",
     "WorkspaceProvisioner",
@@ -2267,6 +2840,9 @@ __all__ = [
     "render_pod_template",
     "merge_pod_template",
     "reserved_violations",
+    "rendered_reserved_violations",
+    "duplicate_keyed_entry_problems",
+    "pod_template_problems",
     "reserved_sandbox_spec_violations",
     "unreviewed_sandbox_spec_keys",
     "sandbox_spec_reasons",
