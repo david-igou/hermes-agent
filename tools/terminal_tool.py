@@ -383,13 +383,14 @@ def _kubernetes_has_host_access(config: Dict[str, Any]) -> bool:
     caps, non-root and no ServiceAccount token is genuinely isolated and can
     skip the approval layer the way Docker-without-bind-mounts does.
 
-    The verdict is derived from the RENDERED pod template, not from a
-    hand-picked subset of config keys: ``security_context`` and
-    ``pod_template_overrides`` (deep-merged last) can re-grant root, privilege
-    escalation, capabilities, a privileged ServiceAccount or a mounted token
-    without touching any of the keys a key-level heuristic would look at.
-    Anything that is not fully hardened keeps the guards, and an unreadable
-    config fails closed.
+    The verdict is derived from THE RENDERED pod template — the same single
+    artifact both provisioners submit — not from a hand-picked subset of config
+    keys: ``pod_template`` can re-grant root, privilege escalation,
+    capabilities, a privileged ServiceAccount or a mounted token without
+    touching any key a key-level heuristic would look at.  Anything that is not
+    fully hardened keeps the guards, and an unreadable config (including a
+    ``pod_template`` that claims a reserved field and therefore cannot be
+    rendered) fails closed.
     """
     kcfg = config.get("kubernetes") or {}
     try:
@@ -1843,14 +1844,19 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         namespace = _k8s.resolve_namespace(kcfg)
         owner_ref = _k8s.resolve_owner_reference(core_api, namespace, kcfg)
 
-        provisioner_name = str(kcfg.get("provisioner") or "direct").strip().lower()
+        provisioner_name = str(kcfg.get("provisioner") or "pod").strip().lower()
         if provisioner_name == "sandbox":
-            provisioner = _k8s.SandboxProvisioner(
+            # Lazy, and the only import of it outside its own module: the
+            # Sandbox provisioner is separable — this branch plus
+            # kubernetes_sandbox.py plus the three sandbox.* config keys.
+            from tools.environments.kubernetes_sandbox import SandboxProvisioner
+
+            provisioner = SandboxProvisioner(
                 kcfg, namespace, api=core_api, owner_reference=owner_ref,
                 custom_api=custom_api,
             )
         else:
-            provisioner = _k8s.DirectProvisioner(
+            provisioner = _k8s.PodProvisioner(
                 kcfg, namespace, api=core_api, owner_reference=owner_ref,
             )
 

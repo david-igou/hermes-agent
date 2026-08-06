@@ -362,15 +362,25 @@ DEFAULT_CONFIG = {
         # for secrets, and this backend has no credential surface — in-cluster
         # auth is the ServiceAccount token the kubelet projects into the pod.
         #
+        # The schema models only what the BACKEND reasons about; everything that
+        # is merely PodSpec goes in `pod_template`, ONE PodTemplateSpec merged
+        # over a hardened base.  A single artifact is rendered, submitted and
+        # security-checked — layered overrides are what let the object that was
+        # validated drift from the object that was submitted.
+        #
+        # `pod_template` and `sandbox.spec` are free-form YAML, so they are not
+        # `hermes config set` surface (a PodTemplateSpec is not a dotted-scalar
+        # field); edit config.yaml directly. See cli-config.yaml.example OPTION 7.
+        #
         # Mirror of tools/environments/kubernetes.py:DEFAULT_KUBERNETES_CONFIG.
         # A literal is required here so `hermes config set` key validation, the
         # desktop settings schema, and `hermes config show` can walk it; the two
         # are pinned together by tests/tools/test_kubernetes_config_schema.py.
         "kubernetes": {
-            # direct  = raw Pod (+ optional PVC) via the core API
+            # pod     = raw Pod (+ optional PVC) via the core API
             # sandbox = Sandbox CR (agents.x-k8s.io/v1beta1) reconciled by
             #           agent-sandbox-operator; exec still targets its pod
-            "provisioner": "direct",
+            "provisioner": "pod",
             # "" -> the projected ServiceAccount namespace file (in-cluster).
             # Deliberately not env-var resolvable.
             "namespace": "",
@@ -379,37 +389,23 @@ DEFAULT_CONFIG = {
             # ambient KUBECONFIG / ~/.kube/config.
             "kubeconfig": "",
             "context": "",
+            # Base image. Stays top-level because it is the per-task override
+            # channel for RL/benchmark harnesses; a pod_template that pins
+            # spec.containers[].image wins and disables that.
             "image": "nikolaik/python-nodejs:python3.11-nodejs20",
-            "image_pull_policy": "IfNotPresent",
-            "image_pull_secrets": [],       # Secret NAMES, not secret values
-            # Container this backend builds AND execs into. With
-            # sandbox.template_ref / sandbox.use_claim the operator builds the
-            # pod, so if it has no container with this name the first one is
-            # used instead.
+            # Container this backend builds AND execs into. A pod_template that
+            # omits it is REJECTED, never silently repaired.
             "container_name": "workspace",
-            "service_account": "hermes-session-noperms",
-            "automount_service_account_token": False,
-            # spec.runtimeClassName — set to "kata" for OpenShift sandboxed
-            # containers. "" omits the field.
-            "runtime_class_name": "",
-            "node_selector": {},
-            "tolerations": [],
-            "labels": {},
-            "annotations": {},
-            # Literal NON-SECRET env vars in the session container. config.yaml
-            # is the non-secret half of the split, so never put an API key
-            # here. The session pod is credential-free by design: you CAN
-            # reference a Secret through pod_template_overrides (envFrom /
-            # valueFrom.secretKeyRef), but k8s/validatingadmissionpolicy.yaml
-            # denies secret-backed env and secret volumes alike, and such a pod
-            # keeps the dangerous-command approval prompts on.
-            "env": {},
+            # Workspace mount, and the session's default cwd.
             "mount_path": "/workspace",
-            # Strategic-merge patch applied last onto the built pod template —
-            # the escape hatch so the schema need not model all of PodSpec.
-            # Lists of named objects (containers, volumes, volumeMounts, env)
-            # merge by `name`; other lists replace wholesale.
-            "pod_template_overrides": {},
+            # THE user layer: a PodTemplateSpec merged over the hardened base.
+            # Mappings merge; lists replace, except spec.containers /
+            # initContainers / volumes (keyed by `name`) and their volumeMounts
+            # (keyed by `mountPath`). Reserved: metadata.labels
+            # 'app.kubernetes.io/managed-by', spec.restartPolicy, the exec
+            # container's `command`, the workspace mount and the workspace
+            # volume — setting any of them is a config error.
+            "pod_template": {},
             # Deliberately NOT inherited from container_persistent (True for
             # docker/daytona): a cluster sandbox defaults to ephemeral.
             "persistent": False,
@@ -423,42 +419,22 @@ DEFAULT_CONFIG = {
                 # agents share a namespace.
                 "claim_name": "",
             },
-            # Hard lifetime ceiling for EPHEMERAL pods (leak backstop). 0 omits.
+            # spec.activeDeadlineSeconds, kept top-level because the rule for
+            # APPLYING it is backend logic YAML cannot express: ephemeral pods
+            # always, persistent pods only when no ownerReference resolved
+            # (nothing else would reap them). 0 omits.
             "active_deadline_seconds": 14400,
             "ready_timeout_seconds": 120,
             "owner_reference": "auto",      # auto | off
-            "security_context": {
-                "run_as_non_root": True,
-                # null/0 omits runAsUser so OpenShift's restricted-v2 SCC can
-                # assign a UID from the namespace range (a hardcoded 1000 is
-                # outside it and the pod is rejected). Set an integer on vanilla
-                # Kubernetes, where runAsNonRoot needs a concrete UID to run a
-                # root-default image, and set fs_group so the non-root uid can
-                # write the emptyDir/PVC.
-                "run_as_user": None,
-                "fs_group": None,
-                "seccomp_profile": "RuntimeDefault",  # "" omits
-                "allow_privilege_escalation": False,
-                "drop_capabilities": ["ALL"],
-                "read_only_root_filesystem": False,
-            },
-            # Kubernetes quantity strings ("500m", "2Gi"). Empty values fall
-            # back to the shared container_cpu / container_memory / container_disk
-            # keys above. Limits matter on OpenShift, where a ResourceQuota
-            # covering limits.* rejects a requests-only pod.
-            "resources": {
-                "requests": {"cpu": "", "memory": ""},
-                "limits": {"cpu": "", "memory": "", "ephemeral_storage": ""},
-            },
             # Read only when provisioner: sandbox.
             "sandbox": {
                 "api_group": "agents.x-k8s.io",
                 "api_version": "v1beta1",
-                "template_ref": "",         # SandboxTemplate name
-                "use_claim": False,         # SandboxClaim (needs template_ref)
-                "ttl_seconds": None,        # operator-owned TTL
-                "ready_condition": "Ready",
-                "spec_overrides": {},       # strategic merge onto Sandbox.spec
+                # Sandbox CR spec. `podTemplate` is injected from the one
+                # rendered template and is reserved here, as is
+                # `sandboxTemplateRef` (it would make the operator author a pod
+                # Hermes never renders and cannot evaluate).
+                "spec": {},
             },
         },
         # Persistent shell — keep a long-lived bash shell across execute() calls
@@ -3230,7 +3206,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 33,
+    "_config_version": 34,
 }
 
 # Optional environment variables that enhance functionality

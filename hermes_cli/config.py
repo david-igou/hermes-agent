@@ -4411,10 +4411,10 @@ def show_config():
         print(f"  Vercel auth:    {'configured' if get_env_value('VERCEL_OIDC_TOKEN') or (get_env_value('VERCEL_TOKEN') and get_env_value('VERCEL_PROJECT_ID') and get_env_value('VERCEL_TEAM_ID')) else '(not set)'}")
     elif terminal.get('backend') == 'kubernetes':
         k8s = terminal.get('kubernetes', {}) or {}
-        print(f"  Provisioner:  {k8s.get('provisioner', 'direct')}")
+        print(f"  Provisioner:  {k8s.get('provisioner', 'pod')}")
         print(f"  Namespace:    {k8s.get('namespace') or '(from in-cluster ServiceAccount)'}")
         print(f"  Image:        {k8s.get('image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
-        print(f"  RuntimeClass: {k8s.get('runtime_class_name') or '(cluster default)'}")
+        print(f"  Pod template: {'customised' if k8s.get('pod_template') else '(hardened default)'}")
         print(f"  Persistent:   {bool(k8s.get('persistent', False))}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')

@@ -14,8 +14,7 @@ tests are that policy, expressed as executable contracts:
   4. `hermes config set` can never mirror the block into .env.
 """
 
-import ast
-import inspect
+import json
 import re
 from pathlib import Path
 
@@ -39,18 +38,50 @@ def test_default_config_mirrors_the_backend_schema():
 def test_kubernetes_is_bridged_by_all_three_config_paths():
     """terminal_tool reads os.environ only; three independent code paths bridge
     terminal.* into env vars (CLI, gateway, config helper). A key missing from
-    any one of them silently does nothing for that entry point."""
+    any one of them silently does nothing for that entry point.
+
+    Asserted from what each path DOES, not from its source text: a
+    source-substring test freezes the shape of the code rather than its
+    behaviour and breaks on any refactor that keeps the bridge intact."""
     import cli
     import gateway.run as gateway_run
-    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP, apply_terminal_config_to_env
 
     assert TERMINAL_CONFIG_ENV_MAP["kubernetes"] == "TERMINAL_KUBERNETES"
 
-    cli_source = inspect.getsource(cli.load_cli_config)
-    assert '"kubernetes": "TERMINAL_KUBERNETES"' in cli_source
+    config = {"terminal": {"backend": "kubernetes",
+                           "kubernetes": {"namespace": "hermes-agents"}}}
+    bridged = apply_terminal_config_to_env(env={}, config=config, override=True)
+    assert json.loads(bridged["TERMINAL_KUBERNETES"])["namespace"] == "hermes-agents"
 
-    gateway_source = inspect.getsource(gateway_run)
-    assert '"kubernetes": "TERMINAL_KUBERNETES"' in gateway_source
+    # cli.py and gateway/run.py hold their own literal maps. Extract the
+    # MAPPING (data, not code shape) so the pin survives a refactor.
+    assert _extract_terminal_env_map(cli, "load_cli_config").get(
+        "kubernetes") == "TERMINAL_KUBERNETES"
+    assert _extract_terminal_env_map(gateway_run, None).get(
+        "kubernetes") == "TERMINAL_KUBERNETES"
+
+
+def _extract_terminal_env_map(module, func_name):
+    """Collect every {"<terminal key>": "TERMINAL_*"} literal in *module*."""
+    import ast as _ast
+    import inspect as _inspect
+    import textwrap
+
+    source = textwrap.dedent(_inspect.getsource(
+        getattr(module, func_name) if func_name else module
+    ))
+    found: dict[str, str] = {}
+    for node in _ast.walk(_ast.parse(source)):
+        if not isinstance(node, _ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if (isinstance(key, _ast.Constant) and isinstance(key.value, str)
+                    and isinstance(value, _ast.Constant)
+                    and isinstance(value.value, str)
+                    and value.value.startswith("TERMINAL_")):
+                found[key.value] = value.value
+    return found
 
 
 def test_no_per_setting_kubernetes_env_vars_exist():
@@ -114,18 +145,25 @@ def test_config_set_cannot_mirror_the_block_into_dotenv():
 
 def test_nested_kubernetes_keys_validate_as_known_config_keys():
     """`hermes config set terminal.kubernetes.namespace foo` must be accepted,
-    which requires every scalar to be enumerated in DEFAULT_CONFIG."""
+    which requires every scalar to be enumerated in DEFAULT_CONFIG.
+
+    `pod_template` and `sandbox.spec` are deliberately NOT in this list: they
+    are free-form PodTemplateSpec / CR spec, not dotted-scalar surface, and are
+    edited in config.yaml directly."""
     from hermes_cli.config import _validate_config_key
 
     for key in (
         "terminal.kubernetes.namespace",
         "terminal.kubernetes.provisioner",
         "terminal.kubernetes.image",
-        "terminal.kubernetes.runtime_class_name",
-        "terminal.kubernetes.security_context.run_as_user",
-        "terminal.kubernetes.resources.limits.memory",
+        "terminal.kubernetes.container_name",
+        "terminal.kubernetes.mount_path",
+        "terminal.kubernetes.persistent",
+        "terminal.kubernetes.active_deadline_seconds",
+        "terminal.kubernetes.ready_timeout_seconds",
+        "terminal.kubernetes.owner_reference",
         "terminal.kubernetes.volume.storage_class_name",
-        "terminal.kubernetes.sandbox.template_ref",
+        "terminal.kubernetes.sandbox.api_group",
     ):
         is_known, suggestion = _validate_config_key(key)
         assert is_known, (
@@ -133,6 +171,63 @@ def test_nested_kubernetes_keys_validate_as_known_config_keys():
             f"(suggestion: {suggestion}). Every scalar must be enumerated in "
             "DEFAULT_CONFIG['terminal']['kubernetes']."
         )
+
+
+def test_deleted_kubernetes_keys_are_not_recognised():
+    """Hard cut: no aliases, no compatibility shim. The old keys must not
+    validate, or the collapse is cosmetic."""
+    from hermes_cli.config import _validate_config_key
+
+    for key in (
+        "terminal.kubernetes.runtime_class_name",
+        "terminal.kubernetes.service_account",
+        "terminal.kubernetes.security_context.run_as_user",
+        "terminal.kubernetes.resources.limits.memory",
+        "terminal.kubernetes.sandbox.template_ref",
+        "terminal.kubernetes.pod_template_overrides",
+    ):
+        is_known, _ = _validate_config_key(key)
+        assert not is_known, f"{key} was hard-cut but still validates"
+
+
+def test_the_migration_deletes_the_hard_cut_keys_and_renames_the_provisioner():
+    """AGENTS.md requires a migration for a structural rename. This one is the
+    hard cut EXECUTED — it removes the old names from the user's file (where
+    the stricter validator would now reject them) and names what it removed;
+    the runtime never learns them."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.config_migrations import _migrate_to_34
+
+    on_disk = {"terminal": {"kubernetes": {
+        "provisioner": "direct",
+        "runtime_class_name": "kata",
+        "service_account": "custom",
+        "pod_template_overrides": {"spec": {"priorityClassName": "high"}},
+        "sandbox": {"template_ref": "t", "use_claim": True, "ttl_seconds": 900,
+                    "spec_overrides": {"networkPolicy": {"egress": "deny"},
+                                       "podTemplate": {"spec": {"hostPID": True}}}},
+    }}}
+    written = {}
+    saved = (config_mod.read_raw_config, config_mod._persist_migration)
+    try:
+        config_mod.read_raw_config = lambda: on_disk
+        config_mod._persist_migration = lambda cfg: written.update(cfg)
+        results = {"config_added": [], "warnings": []}
+        _migrate_to_34(results, quiet=True)
+    finally:
+        config_mod.read_raw_config, config_mod._persist_migration = saved
+
+    kube = written["terminal"]["kubernetes"]
+    assert kube["provisioner"] == "pod"
+    assert kube["pod_template"] == {"spec": {"priorityClassName": "high"}}
+    assert "pod_template_overrides" not in kube
+    assert "runtime_class_name" not in kube and "service_account" not in kube
+    assert set(kube["sandbox"]) <= {"api_group", "api_version", "spec"}
+    # sandbox.spec carries the CR fields but never a second pod template.
+    assert kube["sandbox"]["spec"]["networkPolicy"] == {"egress": "deny"}
+    assert "podTemplate" not in kube["sandbox"]["spec"]
+    # The user is TOLD what was dropped rather than discovering it at runtime.
+    assert any("runtime_class_name" in w for w in results["warnings"]), results
 
 
 def test_deprecated_upstream_env_vars_are_diagnosed():
@@ -154,25 +249,58 @@ def test_cli_config_example_documents_the_yaml_block():
     assert "backend: \"kubernetes\"" in text
     assert "kubernetes:" in text
     assert "provisioner:" in text
-    assert "runtime_class_name" in text
+    assert "pod_template:" in text
 
 
-def test_backend_module_imports_without_the_kubernetes_sdk():
-    """Every `kubernetes` SDK import must be function-local so the module (and
-    its manifest builders) load on a machine without the client."""
-    source = (REPO_ROOT / "tools" / "environments" / "kubernetes.py").read_text()
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Module):
-            for stmt in node.body:
-                if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-                    module = getattr(stmt, "module", None) or ""
-                    names = [a.name for a in stmt.names]
-                    assert not module.startswith("kubernetes"), (
-                        f"module-level `from {module} import ...` breaks import "
-                        "without the SDK installed"
-                    )
-                    assert not any(n.startswith("kubernetes") for n in names), (
-                        "module-level `import kubernetes` breaks import without "
-                        "the SDK installed"
-                    )
+def test_user_facing_docs_do_not_advertise_deleted_keys():
+    """Every one of these was a first-class key. Leaving them in the shipped
+    docs sends operators to a knob that no longer exists."""
+    gone = ("pod_template_overrides", "spec_overrides", "template_ref",
+            "use_claim", "runtime_class_name", "security_context")
+    for relative in ("cli-config.yaml.example",
+                     "website/docs/user-guide/configuration.md"):
+        text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        for key in gone:
+            assert key not in text, f"{relative} still documents {key}"
+
+
+def test_backend_modules_import_without_the_kubernetes_sdk():
+    """Every `kubernetes` SDK import must be function-local so the modules (and
+    their manifest builders) load on a machine without the client.
+
+    Executed, not AST-inspected: an import-shape test covers only the one file
+    path it names and cannot see whether the module actually loads."""
+    import builtins
+    import importlib
+    import sys
+
+    modules = ("tools.environments.kubernetes",
+               "tools.environments.kubernetes_sandbox")
+    saved_modules = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name in modules or name == "kubernetes"
+        or name.startswith("kubernetes.")
+    }
+    real_import = builtins.__import__
+
+    def _blocked(name, *args, **kwargs):
+        if name == "kubernetes" or name.startswith("kubernetes."):
+            raise ImportError("kubernetes client is not installed")
+        return real_import(name, *args, **kwargs)
+
+    builtins.__import__ = _blocked
+    try:
+        k8s = importlib.import_module(modules[0])
+        importlib.import_module(modules[1])
+        template = k8s.render_pod_template(
+            k8s.merge_kubernetes_config({}), persistent=False, image="i:1",
+            resources=k8s.Resources(), pvc_name="pvc",
+        )
+        assert template["spec"]["containers"][0]["image"] == "i:1"
+        assert k8s.unhardened_reasons(k8s.merge_kubernetes_config({})) == []
+    finally:
+        builtins.__import__ = real_import
+        for name in modules:
+            sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)

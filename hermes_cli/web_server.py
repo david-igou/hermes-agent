@@ -882,10 +882,10 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "terminal.kubernetes.provisioner": {
         "type": "select",
         "description": "Kubernetes workspace provisioner",
-        # direct = raw Pod via the core API; sandbox = Sandbox CR reconciled by
+        # pod = raw Pod via the core API; sandbox = Sandbox CR reconciled by
         # agent-sandbox-operator. Sync with VALID_PROVISIONERS in
         # tools/environments/kubernetes.py.
-        "options": ["direct", "sandbox"],
+        "options": ["pod", "sandbox"],
     },
     "terminal.vercel_runtime": {
         "type": "select",

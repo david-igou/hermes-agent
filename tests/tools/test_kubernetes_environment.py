@@ -2,8 +2,9 @@
 
 Ported from upstream PR #37591 and re-specified for this fork's config surface:
 every setting is a ``terminal.kubernetes.*`` config.yaml key bridged as ONE
-internal JSON env var, and the pod's ``runAsUser``/``fsGroup`` are OMITTED by
-default so OpenShift's restricted-v2 SCC can assign them.
+internal JSON env var, and the pod shape is ONE ``pod_template``
+PodTemplateSpec merged over a hardened base — one artifact rendered, submitted
+and security-checked.
 
 No cluster required: the kubernetes client is stubbed into ``sys.modules`` and
 manifest builders run with ``api=None``.
@@ -24,21 +25,20 @@ import pytest
 
 from tools.environments.kubernetes import (
     DEFAULT_KUBERNETES_CONFIG,
-    DirectProvisioner,
     KubernetesEnvironment,
+    PodProvisioner,
     PodRef,
     Resources,
-    SandboxProvisioner,
     WorkspaceProvisioner,
-    build_pod_template,
     merge_kubernetes_config,
+    render_pod_template,
     sanitize_name,
     validate_kubernetes_config,
 )
 
-# strategic_merge / unhardened_reasons are imported inside the tests that use
-# them so this module still imports against a build that lacks them (which is
-# how the regression tests below are demonstrated to fail pre-fix).
+# merge_pod_template / reserved_violations / unhardened_reasons and the sandbox
+# provisioner are imported inside the tests that use them, so this module still
+# imports against a build that lacks them.
 
 
 @pytest.fixture(autouse=True)
@@ -100,6 +100,12 @@ def _kcfg(**overrides):
     return merge_kubernetes_config(overrides)
 
 
+def _sandbox_cls():
+    from tools.environments.kubernetes_sandbox import SandboxProvisioner
+
+    return SandboxProvisioner
+
+
 OWNER_REF = {
     "apiVersion": "v1",
     "kind": "Pod",
@@ -151,54 +157,68 @@ def test_partial_config_still_yields_every_default():
     DEFAULT_CONFIG, so a user who sets one key produces a partial payload."""
     merged = merge_kubernetes_config({"namespace": "hermes-agents"})
     assert merged["namespace"] == "hermes-agents"
-    assert merged["provisioner"] == "direct"
-    assert merged["security_context"]["seccomp_profile"] == "RuntimeDefault"
+    assert merged["provisioner"] == "pod"
+    assert merged["container_name"] == "workspace"
     assert merged["volume"]["access_modes"] == ["ReadWriteOnce"]
     assert merged["sandbox"]["api_group"] == "agents.x-k8s.io"
 
 
 def test_partial_nested_config_merges_rather_than_replaces():
     merged = merge_kubernetes_config(
-        {"security_context": {"run_as_user": 1000}, "resources": {"limits": {"cpu": "2"}}}
+        {"volume": {"size": "20Gi"}, "sandbox": {"api_version": "v1"}}
     )
-    assert merged["security_context"]["run_as_user"] == 1000
-    assert merged["security_context"]["drop_capabilities"] == ["ALL"]
-    assert merged["resources"]["limits"]["cpu"] == "2"
-    assert merged["resources"]["requests"] == {"cpu": "", "memory": ""}
+    assert merged["volume"]["size"] == "20Gi"
+    assert merged["volume"]["access_modes"] == ["ReadWriteOnce"]
+    assert merged["sandbox"]["api_version"] == "v1"
+    assert merged["sandbox"]["api_group"] == "agents.x-k8s.io"
 
 
 def test_merge_does_not_mutate_defaults():
-    merged = merge_kubernetes_config({"labels": {"a": "b"}})
-    merged["labels"]["c"] = "d"
-    merged["sandbox"]["template_ref"] = "x"
-    assert DEFAULT_KUBERNETES_CONFIG["labels"] == {}
-    assert DEFAULT_KUBERNETES_CONFIG["sandbox"]["template_ref"] == ""
+    merged = merge_kubernetes_config({"pod_template": {"spec": {}}})
+    merged["pod_template"]["spec"]["hostPID"] = True
+    merged["sandbox"]["spec"]["ttlSeconds"] = 5
+    assert DEFAULT_KUBERNETES_CONFIG["pod_template"] == {}
+    assert DEFAULT_KUBERNETES_CONFIG["sandbox"]["spec"] == {}
 
 
 def test_validation_rejects_bad_provisioner_and_quantities():
     problems = validate_kubernetes_config(_kcfg(provisioner="operator"))
     assert any("provisioner" in p for p in problems)
 
-    problems = validate_kubernetes_config(
-        _kcfg(resources={"requests": {"memory": "2 gigabytes"}})
-    )
+    problems = validate_kubernetes_config(_kcfg(volume={"size": "2 gigabytes"}))
     assert any("quantity" in p for p in problems)
 
 
-def test_validation_rejects_run_as_root_with_run_as_non_root():
-    problems = validate_kubernetes_config(
-        _kcfg(security_context={"run_as_non_root": True, "run_as_user": 0})
+def test_the_old_provisioner_name_is_gone():
+    """`direct` was renamed `pod` — a hard cut, so the old value must FAIL
+    rather than quietly keep working through an alias."""
+    from tools.environments.kubernetes import VALID_PROVISIONERS
+
+    assert VALID_PROVISIONERS == ("pod", "sandbox")
+    assert any(
+        "provisioner" in p
+        for p in validate_kubernetes_config(_kcfg(provisioner="direct"))
     )
-    assert any("run_as_user=0" in p for p in problems)
-
-
-def test_validation_requires_template_ref_for_claims():
-    problems = validate_kubernetes_config(_kcfg(sandbox={"use_claim": True}))
-    assert any("template_ref" in p for p in problems)
 
 
 def test_default_config_is_valid():
     assert validate_kubernetes_config(merge_kubernetes_config({})) == []
+
+
+def test_hard_cut_keys_are_not_in_the_schema():
+    """The ~30 PodSpec-shaped keys collapsed into pod_template. No aliases, no
+    shim: the schema is the 12 top-level keys the backend reasons about."""
+    gone = {
+        "image_pull_policy", "image_pull_secrets", "service_account",
+        "automount_service_account_token", "runtime_class_name",
+        "node_selector", "tolerations", "labels", "annotations", "env",
+        "security_context", "resources", "pod_template_overrides",
+    }
+    assert not (gone & set(DEFAULT_KUBERNETES_CONFIG))
+    assert set(DEFAULT_KUBERNETES_CONFIG["sandbox"]) == {
+        "api_group", "api_version", "spec",
+    }
+    assert "pod_template" in DEFAULT_KUBERNETES_CONFIG
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +227,7 @@ def test_default_config_is_valid():
 
 
 def _provisioner(**overrides):
-    return DirectProvisioner(
+    return PodProvisioner(
         _kcfg(**overrides), "hermes", api=None, owner_reference=OWNER_REF
     )
 
@@ -216,9 +236,8 @@ def test_ephemeral_pod_uses_emptydir_and_carries_ownerref():
     pod = _provisioner().pod_manifest(
         "abc", persistent=False, image="img:1", resources=Resources()
     )
-    vols = pod["spec"]["volumes"]
-    assert vols[0]["name"] == "workspace"
-    assert vols[0]["emptyDir"] == {}
+    vols = {v["name"]: v for v in pod["spec"]["volumes"]}
+    assert vols["workspace"]["emptyDir"] == {}
     mount = pod["spec"]["containers"][0]["volumeMounts"][0]
     assert mount["mountPath"] == "/workspace"
     assert pod["metadata"]["ownerReferences"][0]["uid"] == OWNER_REF["uid"]
@@ -263,7 +282,7 @@ def test_pvc_name_can_be_pinned_so_instances_do_not_share_a_workspace():
 
 
 def test_pvc_honours_configured_storage_class_and_size():
-    p = DirectProvisioner(
+    p = PodProvisioner(
         _kcfg(volume={"size": "20Gi", "storage_class_name": "truenas-nvme",
                       "access_modes": ["ReadWriteMany"]}),
         "hermes", api=None, owner_reference=OWNER_REF,
@@ -276,13 +295,13 @@ def test_pvc_honours_configured_storage_class_and_size():
 
 def test_pod_manifest_omits_ownerref_when_owner_unknown():
     """K8s rejects an ownerReference with an empty name/uid with a 422."""
-    p = DirectProvisioner(_kcfg(), "hermes", api=None, owner_reference=None)
+    p = PodProvisioner(_kcfg(), "hermes", api=None, owner_reference=None)
     pod = p.pod_manifest("abc", persistent=False, image="img:1", resources=Resources())
     assert "ownerReferences" not in pod["metadata"]
 
 
 def test_ephemeral_pod_has_active_deadline_persistent_does_not():
-    p = DirectProvisioner(
+    p = PodProvisioner(
         _kcfg(active_deadline_seconds=999), "hermes", api=None, owner_reference=OWNER_REF
     )
     ephemeral = p.pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
@@ -291,82 +310,74 @@ def test_ephemeral_pod_has_active_deadline_persistent_does_not():
     assert "activeDeadlineSeconds" not in persistent["spec"]
 
 
-def test_pod_security_context_is_hardened():
+def test_the_hardened_base_is_hardened():
+    """What pod_template merges OVER. Every property here is one the hardening
+    judge checks for, so the shipped default earns the approval skip."""
     pod = _provisioner().pod_manifest(
         "abc", persistent=False, image="img:1", resources=Resources()
     )
     spec = pod["spec"]
+    assert spec["restartPolicy"] == "Never"
     assert spec["automountServiceAccountToken"] is False
     assert spec["serviceAccountName"] == "hermes-session-noperms"
     assert spec["hostNetwork"] is False
     assert spec["hostPID"] is False
     assert spec["hostIPC"] is False
     assert spec["enableServiceLinks"] is False
+    assert spec["securityContext"]["runAsNonRoot"] is True
+    assert spec["securityContext"]["seccompProfile"] == {"type": "RuntimeDefault"}
     sc = spec["containers"][0]["securityContext"]
     assert sc["runAsNonRoot"] is True
     assert sc["allowPrivilegeEscalation"] is False
     assert sc["capabilities"]["drop"] == ["ALL"]
-    assert spec["securityContext"]["seccompProfile"] == {"type": "RuntimeDefault"}
+    # restricted-v2 assigns runAsUser/fsGroup from the namespace range; a
+    # hardcoded value outside it is rejected at admission.
+    assert "runAsUser" not in spec["securityContext"]
+    assert "fsGroup" not in spec["securityContext"]
+    assert "runAsUser" not in sc
 
 
-def test_run_as_user_omitted_by_default_for_openshift_scc():
-    """restricted-v2 uses runAsUser: MustRunAsRange from the namespace's
-    openshift.io/sa.scc.uid-range annotation, so a hardcoded 1000 is rejected
-    outright. Omitting it lets SCC assign both runAsUser and fsGroup."""
-    pod = _provisioner().pod_manifest(
-        "abc", persistent=False, image="img:1", resources=Resources()
-    )
-    assert "runAsUser" not in pod["spec"]["securityContext"]
-    assert "fsGroup" not in pod["spec"]["securityContext"]
-    assert "runAsUser" not in pod["spec"]["containers"][0]["securityContext"]
-
-
-def test_run_as_user_present_when_explicitly_configured():
-    """Vanilla Kubernetes needs a concrete UID for runAsNonRoot to schedule a
-    root-default image, and an fsGroup so it can write the workspace volume."""
-    p = _provisioner(security_context={"run_as_user": 1000, "fs_group": 1000})
-    pod = p.pod_manifest("abc", persistent=False, image="img:1", resources=Resources())
-    assert pod["spec"]["securityContext"]["runAsUser"] == 1000
-    assert pod["spec"]["securityContext"]["fsGroup"] == 1000
-    assert pod["spec"]["containers"][0]["securityContext"]["runAsUser"] == 1000
-
-
-def test_runtime_class_omitted_when_empty_and_present_when_set():
-    default_pod = _provisioner().pod_manifest(
-        "abc", persistent=False, image="i:1", resources=Resources()
-    )
-    assert "runtimeClassName" not in default_pod["spec"]
-
-    kata_pod = _provisioner(runtime_class_name="kata").pod_manifest(
-        "abc", persistent=False, image="i:1", resources=Resources()
-    )
-    assert kata_pod["spec"]["runtimeClassName"] == "kata"
-
-
-def test_node_selector_tolerations_labels_and_env_reach_the_manifest():
+def test_pod_template_reaches_the_manifest():
+    """The escape hatch: anything that is merely PodSpec goes here, and it is
+    the ONLY user layer."""
     tolerations = [{"key": "kata", "operator": "Exists", "effect": "NoSchedule"}]
-    p = _provisioner(
-        node_selector={"node-role.kubernetes.io/worker": ""},
-        tolerations=tolerations,
-        labels={"team": "hermes"},
-        annotations={"io.katacontainers.config.hypervisor.default_memory": "4096"},
-        env={"HTTPS_PROXY": "http://proxy:3128"},
-        image_pull_secrets=["regcred"],
-        image_pull_policy="Always",
-    )
+    p = _provisioner(pod_template={
+        "metadata": {"labels": {"team": "hermes"},
+                     "annotations": {"io.katacontainers.x": "4096"}},
+        "spec": {
+            "runtimeClassName": "kata",
+            "nodeSelector": {"node-role.kubernetes.io/worker": ""},
+            "tolerations": tolerations,
+            "imagePullSecrets": [{"name": "regcred"}],
+            "priorityClassName": "high",
+            "containers": [{"name": "workspace",
+                            "imagePullPolicy": "Always",
+                            "env": [{"name": "HTTPS_PROXY", "value": "http://p:3128"}]}],
+        },
+    })
     pod = p.pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
-    assert pod["spec"]["nodeSelector"] == {"node-role.kubernetes.io/worker": ""}
-    assert pod["spec"]["tolerations"] == tolerations
-    assert pod["spec"]["imagePullSecrets"] == [{"name": "regcred"}]
+    spec = pod["spec"]
+    assert spec["runtimeClassName"] == "kata"
+    assert spec["nodeSelector"] == {"node-role.kubernetes.io/worker": ""}
+    assert spec["tolerations"] == tolerations
+    assert spec["imagePullSecrets"] == [{"name": "regcred"}]
+    assert spec["priorityClassName"] == "high"
     assert pod["metadata"]["labels"]["team"] == "hermes"
     assert pod["metadata"]["labels"]["app.kubernetes.io/managed-by"] == "hermes-agent"
     assert pod["metadata"]["annotations"]
-    container = pod["spec"]["containers"][0]
+    container = spec["containers"][0]
     assert container["imagePullPolicy"] == "Always"
-    assert {"name": "HTTPS_PROXY", "value": "http://proxy:3128"} in container["env"]
+    assert {"name": "HTTPS_PROXY", "value": "http://p:3128"} in container["env"]
+    # ...and the merge kept the base container intact.
+    assert container["image"] == "i:1"
+    assert container["command"] == ["sleep", "infinity"]
+    # Merge, not replace, at the spec level too.
+    assert spec["restartPolicy"] == "Never"
 
 
-def test_resources_fall_back_to_shared_container_keys_then_explicit_quantities():
+def test_resources_come_from_the_shared_container_keys():
+    """terminal.container_cpu / container_memory feed the BASE; a pod_template
+    container merges over it by name."""
     default_pod = _provisioner().pod_manifest(
         "abc", persistent=False, image="i:1",
         resources=Resources(cpu=0.5, memory_mib=2048),
@@ -375,29 +386,24 @@ def test_resources_fall_back_to_shared_container_keys_then_explicit_quantities()
     assert requests == {"cpu": "500m", "memory": "2048Mi"}
     assert "limits" not in default_pod["spec"]["containers"][0]["resources"]
 
-    explicit = _provisioner(
-        resources={"requests": {"cpu": "250m", "memory": "1Gi"},
-                   "limits": {"cpu": "2", "memory": "4Gi",
-                              "ephemeral_storage": "8Gi"}}
-    ).pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
+    explicit = _provisioner(pod_template={"spec": {"containers": [
+        {"name": "workspace", "resources": {
+            "requests": {"cpu": "250m", "memory": "1Gi"},
+            "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "8Gi"}}},
+    ]}}).pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
     res = explicit["spec"]["containers"][0]["resources"]
     assert res["requests"] == {"cpu": "250m", "memory": "1Gi"}
     assert res["limits"] == {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "8Gi"}
 
 
-def test_pod_template_overrides_are_applied_last():
-    p = _provisioner(pod_template_overrides={"spec": {"priorityClassName": "high"}})
-    pod = p.pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
-    assert pod["spec"]["priorityClassName"] == "high"
-    # Merge, not replace.
-    assert pod["spec"]["restartPolicy"] == "Never"
-
-
-def test_read_only_root_filesystem_gets_a_writable_tmp():
-    """init_session() writes its env snapshot under /tmp; a read-only root with
-    no writable /tmp silently breaks cwd/env tracking."""
-    p = _provisioner(security_context={"read_only_root_filesystem": True})
-    pod = p.pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
+def test_tmp_emptydir_is_unconditional():
+    """init_session() writes its env snapshot under /tmp. The old `/tmp` mount
+    was conditional on a read_only_root_filesystem config key that no longer
+    exists, so a pod_template setting readOnlyRootFilesystem: true would have
+    silently broken cwd/env tracking."""
+    pod = _provisioner().pod_manifest(
+        "abc", persistent=False, image="i:1", resources=Resources()
+    )
     mounts = {m["mountPath"] for m in pod["spec"]["containers"][0]["volumeMounts"]}
     assert "/tmp" in mounts
     assert any(v["name"] == "tmp" for v in pod["spec"]["volumes"])
@@ -415,8 +421,8 @@ def test_pod_name_is_instance_scoped():
     """_resolve_container_task_id collapses nearly everything to "default", so
     without a discriminator two agents in one namespace fight over the same pod
     name — the second 409s, "reuses" the first's workspace, and later deletes it."""
-    a = DirectProvisioner(_kcfg(), "hermes", api=None, owner_reference=OWNER_REF)
-    b = DirectProvisioner(
+    a = PodProvisioner(_kcfg(), "hermes", api=None, owner_reference=OWNER_REF)
+    b = PodProvisioner(
         _kcfg(), "hermes", api=None,
         owner_reference={**OWNER_REF, "uid": "22222222-2222-2222-2222-222222222222"},
     )
@@ -427,7 +433,7 @@ def test_pod_name_is_instance_scoped():
 
 
 # ---------------------------------------------------------------------------
-# DirectProvisioner against a mocked API
+# PodProvisioner against a mocked API
 # ---------------------------------------------------------------------------
 
 
@@ -447,7 +453,7 @@ def _running_pod(labels=None, owners=None, containers=("workspace",)):
 
 
 def _provisioner_with_api(api, **overrides):
-    return DirectProvisioner(
+    return PodProvisioner(
         _kcfg(**overrides), "hermes", api=api, owner_reference=OWNER_REF
     )
 
@@ -461,6 +467,7 @@ def test_ensure_ephemeral_creates_pod_only():
 
     api.create_namespaced_pod.assert_called_once()
     api.create_namespaced_persistent_volume_claim.assert_not_called()
+    assert api.create_namespaced_pod.call_args.kwargs["field_validation"] == "Strict"
     assert ref.pod_name == p.workspace_name("abc")
     assert ref.container == "workspace"
 
@@ -477,6 +484,12 @@ def test_ensure_persistent_creates_pvc_then_pod():
 
     api.create_namespaced_persistent_volume_claim.assert_called_once()
     api.create_namespaced_pod.assert_called_once()
+    # Without fieldValidation=Strict an unknown field is accepted with 201 and
+    # silently dropped, and the python client discards the API server's
+    # "Warning: 299 - unknown field" header, so nothing is logged.
+    for call in (api.create_namespaced_persistent_volume_claim,
+                 api.create_namespaced_pod):
+        assert call.call_args.kwargs["field_validation"] == "Strict"
 
 
 def _hermes_pvc(labels=None):
@@ -579,7 +592,7 @@ def test_destroy_deletes_pod_and_keeps_pvc():
 
 
 def _sandbox_provisioner(api=None, custom=None, **sandbox_overrides):
-    return SandboxProvisioner(
+    return _sandbox_cls()(
         _kcfg(provisioner="sandbox", sandbox=sandbox_overrides),
         "hermes", api=api, owner_reference=OWNER_REF, custom_api=custom,
     )
@@ -598,37 +611,34 @@ def test_sandbox_manifest_shape():
     assert spec["containers"][0]["image"] == "img:1"
 
 
-def test_sandbox_pod_template_matches_direct_pod_spec():
-    """Flipping provisioner must not silently change the workload shape."""
-    kcfg = _kcfg(runtime_class_name="kata", labels={"team": "hermes"})
-    direct = DirectProvisioner(kcfg, "hermes", api=None, owner_reference=OWNER_REF)
-    sandbox = SandboxProvisioner(
+def test_sandbox_pod_template_matches_the_pod_provisioners_pod_spec():
+    """The same dict feeds both provisioners — the Sandbox CRD is itself
+    spec.podTemplate.spec — so flipping provisioner cannot change the workload
+    shape."""
+    kcfg = _kcfg(pod_template={"spec": {"runtimeClassName": "kata"}})
+    pod_p = PodProvisioner(kcfg, "hermes", api=None, owner_reference=OWNER_REF)
+    sandbox = _sandbox_cls()(
         kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None
     )
-    direct_spec = direct.pod_manifest(
+    pod_spec = pod_p.pod_manifest(
         "abc", persistent=False, image="i:1", resources=Resources()
     )["spec"]
     sandbox_spec = sandbox.sandbox_manifest(
         "abc", persistent=False, image="i:1", resources=Resources()
     )["spec"]["podTemplate"]["spec"]
-    assert direct_spec == sandbox_spec
+    assert pod_spec == sandbox_spec
     assert sandbox_spec["runtimeClassName"] == "kata"
 
 
-def test_sandbox_manifest_uses_template_ref_instead_of_pod_template():
-    manifest = _sandbox_provisioner(template_ref="agent-base").sandbox_manifest(
-        "abc", persistent=False, image="img:1", resources=Resources()
-    )
-    assert manifest["spec"]["sandboxTemplateRef"] == {"name": "agent-base"}
-    assert "podTemplate" not in manifest["spec"]
-
-
-def test_sandbox_spec_overrides_and_ttl():
+def test_sandbox_spec_carries_cr_fields_and_the_injected_pod_template():
+    """sandbox.spec is the Sandbox CR spec (ttlSeconds, networkPolicy, ...);
+    podTemplate is ASSIGNED from the one rendered template, never merged."""
     manifest = _sandbox_provisioner(
-        ttl_seconds=900, spec_overrides={"networkPolicy": {"egress": "deny"}}
+        spec={"ttlSeconds": 900, "networkPolicy": {"egress": "deny"}}
     ).sandbox_manifest("abc", persistent=False, image="i:1", resources=Resources())
     assert manifest["spec"]["ttlSeconds"] == 900
     assert manifest["spec"]["networkPolicy"] == {"egress": "deny"}
+    assert manifest["spec"]["podTemplate"]["spec"]["restartPolicy"] == "Never"
 
 
 def test_sandbox_ensure_creates_cr_and_waits_for_pod():
@@ -655,6 +665,7 @@ def test_sandbox_ensure_creates_cr_and_waits_for_pod():
     call = custom.create_namespaced_custom_object.call_args.kwargs
     assert call["group"] == "agents.x-k8s.io"
     assert call["plural"] == "sandboxes"
+    assert call["field_validation"] == "Strict"
     assert ref.pod_name == "sandbox-pod-1"
     # Exec targets the reconciled pod, not the CR.
     api.read_namespaced_pod.assert_called()
@@ -705,15 +716,16 @@ def test_sandbox_destroy_deletes_the_custom_resource():
     api.delete_namespaced_pod.assert_not_called()
 
 
-def test_sandbox_claim_requires_bound_sandbox_name():
-    custom = MagicMock()
-    custom.get_namespaced_custom_object.return_value = {
-        "status": {"conditions": [{"type": "Ready", "status": "True"}]}
-    }
-    p = _sandbox_provisioner(api=MagicMock(), custom=custom,
-                             use_claim=True, template_ref="agent-base")
-    with pytest.raises(RuntimeError, match="no bound Sandbox"):
-        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+def test_sandbox_provisioner_lives_in_its_own_module():
+    """Requirement 7: the sandbox provisioner is cleanly separable — this file
+    plus the factory branch plus the three sandbox.* keys. The shared module
+    must not import it."""
+    import tools.environments.kubernetes as k8s_mod
+
+    assert not hasattr(k8s_mod, "SandboxProvisioner")
+    from tools.environments.kubernetes import WorkspaceProvisioner
+
+    assert issubclass(_sandbox_cls(), WorkspaceProvisioner)
 
 
 # ---------------------------------------------------------------------------
@@ -965,12 +977,14 @@ def _install_fake_backend(monkeypatch):
 
     import tools.environments.kubernetes as k8s_mod
 
+    import tools.environments.kubernetes_sandbox as sandbox_mod
+
     monkeypatch.setattr(k8s_mod, "KubernetesEnvironment", _FakeEnv)
     monkeypatch.setattr(
-        k8s_mod, "DirectProvisioner", lambda *a, **kw: MagicMock(name="direct")
+        k8s_mod, "PodProvisioner", lambda *a, **kw: MagicMock(name="pod")
     )
     monkeypatch.setattr(
-        k8s_mod, "SandboxProvisioner", lambda *a, **kw: MagicMock(name="sandbox")
+        sandbox_mod, "SandboxProvisioner", lambda *a, **kw: MagicMock(name="sandbox")
     )
     monkeypatch.setattr(
         k8s_mod, "load_kubernetes_apis", lambda kcfg: (MagicMock(), MagicMock())
@@ -1021,12 +1035,12 @@ def test_factory_k8s_persistent_opt_in(monkeypatch):
 
 def test_factory_selects_sandbox_provisioner(monkeypatch):
     import tools.terminal_tool as tt
-    import tools.environments.kubernetes as k8s_mod
+    import tools.environments.kubernetes_sandbox as sandbox_mod
 
     _install_fake_backend(monkeypatch)
     seen = {}
     monkeypatch.setattr(
-        k8s_mod, "SandboxProvisioner",
+        sandbox_mod, "SandboxProvisioner",
         lambda *a, **kw: seen.setdefault("sandbox", MagicMock()),
     )
     tt._create_environment(
@@ -1126,7 +1140,7 @@ def test_live_terminal_tool_kubernetes_image_and_container_config(monkeypatch):
     # deliberately no TERMINAL_KUBERNETES_POD_SA / _IMAGE / _NAMESPACE.
     monkeypatch.setenv(
         "TERMINAL_KUBERNETES",
-        json.dumps({"namespace": "hermes", "service_account": "custom-sa",
+        json.dumps({"namespace": "hermes", "container_name": "devbox",
                     "image": "quay.io/hermes/session:1"}),
     )
 
@@ -1144,10 +1158,10 @@ def test_live_terminal_tool_kubernetes_image_and_container_config(monkeypatch):
     assert captured["image"] == "quay.io/hermes/session:1"
     cc = captured.get("container_config")
     assert cc is not None, "container_config was None — kubernetes missing from the builder"
-    assert cc["kubernetes"]["service_account"] == "custom-sa"
+    assert cc["kubernetes"]["container_name"] == "devbox"
     assert cc["kubernetes"]["namespace"] == "hermes"
     # Defaults survive a partial payload.
-    assert cc["kubernetes"]["provisioner"] == "direct"
+    assert cc["kubernetes"]["provisioner"] == "pod"
 
 
 def test_kubernetes_backend_default_cwd_is_the_mount_path(monkeypatch):
@@ -1299,19 +1313,19 @@ def test_concurrent_execs_do_not_poison_the_shared_api_client(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Container-name resolution  (template_ref / use_claim / overridden containers)
+# Container-name resolution: the exec target is KNOWN, not guessed
 # ---------------------------------------------------------------------------
 
 
 def test_container_name_is_configurable_and_reaches_the_manifest():
-    template = build_pod_template(
+    template = render_pod_template(
         _kcfg(container_name="devbox"), persistent=False, image="img:1",
         resources=Resources(), pvc_name="pvc",
     )
     assert template["spec"]["containers"][0]["name"] == "devbox"
 
 
-def test_direct_ensure_targets_the_configured_container():
+def test_pod_ensure_targets_the_configured_container():
     api = MagicMock()
     api.read_namespaced_pod.return_value = _running_pod(containers=("devbox",))
     p = _provisioner_with_api(api, container_name="devbox")
@@ -1319,36 +1333,26 @@ def test_direct_ensure_targets_the_configured_container():
     assert ref.container == "devbox"
 
 
-def test_sandbox_with_template_ref_execs_into_the_operators_container():
-    """sandbox.template_ref means the operator builds the pod from a
-    SandboxTemplate, so hardcoding "workspace" made every exec fail with
-    `container workspace is not valid for pod ...` — two of the three sandbox
-    modes were dead on arrival."""
-    custom = MagicMock()
-    custom.get_namespaced_custom_object.return_value = {
-        "metadata": {"uid": "sb-uid"},
-        "status": {"conditions": [{"type": "Ready", "status": "True"}],
-                   "podRef": {"name": "sandbox-pod-1"}},
-    }
-    api = MagicMock()
-    api.read_namespaced_pod.return_value = _running_pod(containers=("agent",))
-
-    p = _sandbox_provisioner(api=api, custom=custom, template_ref="agent-base")
-    ref = p.ensure("abc", persistent=False, image="img:1", resources=Resources())
-
-    assert ref.pod_name == "sandbox-pod-1"
-    assert ref.container == "agent"
-
-
-def test_pick_container_prefers_the_configured_name_when_the_pod_has_it():
+def test_exec_container_prefers_the_configured_name_when_the_pod_has_it():
     p = _provisioner_with_api(MagicMock())
     pod = _running_pod(containers=("istio-proxy", "workspace"))
-    assert p.pick_container(pod) == "workspace"
+    assert p.exec_container(pod) == "workspace"
 
 
-def test_pick_container_falls_back_to_the_configured_name_without_a_spec():
+def test_exec_container_falls_back_to_the_configured_name_without_a_spec():
     p = _provisioner_with_api(MagicMock())
-    assert p.pick_container(SimpleNamespace()) == "workspace"
+    assert p.exec_container(SimpleNamespace()) == "workspace"
+
+
+def test_exec_container_refuses_a_pod_that_lacks_the_rendered_container():
+    """The old code silently exec'd into names[0]. With container_name reserved
+    and every pod rendered here, a missing container means the object that RAN
+    is not the object that was rendered and judged — exec-ing into whatever
+    else is there is that drift, silently."""
+    p = _provisioner_with_api(MagicMock())
+    pod = _running_pod(containers=("istio-proxy", "somebody-elses-shell"))
+    with pytest.raises(RuntimeError, match="did not render"):
+        p.exec_container(pod)
 
 
 def test_container_name_is_validated_as_an_rfc1123_name():
@@ -1515,29 +1519,54 @@ def test_default_ephemeral_pod_is_a_throwaway_sandbox():
 
 @pytest.mark.parametrize("overrides, expected", [
     ({"persistent": True}, "persistent"),
-    ({"automount_service_account_token": True}, "automountServiceAccountToken"),
-    ({"security_context": {"run_as_non_root": False}}, "runAsNonRoot"),
-    ({"security_context": {"allow_privilege_escalation": True}},
-     "privilege escalation"),
-    ({"security_context": {"drop_capabilities": ["NET_RAW"]}}, "drop ALL"),
-    ({"pod_template_overrides": {"spec": {"automountServiceAccountToken": True}}},
+    ({"pod_template": {"spec": {"automountServiceAccountToken": True}}},
      "automountServiceAccountToken"),
-    ({"pod_template_overrides": {"spec": {"serviceAccountName": "cluster-admin-sa"}}},
+    ({"pod_template": {"spec": {"serviceAccountName": "cluster-admin-sa"}}},
      "serviceAccountName"),
-    ({"pod_template_overrides": {"spec": {"hostPID": True}}}, "hostPID"),
-    ({"pod_template_overrides": {"spec": {"volumes": [
+    ({"pod_template": {"spec": {"securityContext": {"runAsNonRoot": False}}}},
+     "runAsNonRoot"),
+    ({"pod_template": {"spec": {"containers": [
+        {"name": "workspace",
+         "securityContext": {"allowPrivilegeEscalation": True}}]}}},
+     "privilege escalation"),
+    ({"pod_template": {"spec": {"containers": [
+        {"name": "workspace",
+         "securityContext": {"capabilities": {"drop": ["NET_RAW"]}}}]}}},
+     "drop ALL"),
+    ({"pod_template": {"spec": {"containers": [
+        {"name": "workspace", "securityContext": {"privileged": True}}]}}},
+     "privileged"),
+    ({"pod_template": {"spec": {"containers": [
+        {"name": "workspace", "securityContext": {"runAsUser": 0}}]}}},
+     "run as root"),
+    ({"pod_template": {"spec": {"hostPID": True}}}, "hostPID"),
+    ({"pod_template": {"spec": {"hostNetwork": True}}}, "hostNetwork"),
+    ({"pod_template": {"spec": {"volumes": [
         {"name": "host", "hostPath": {"path": "/"}}]}}}, "host"),
-    ({"pod_template_overrides": {"spec": {"volumes": [
+    ({"pod_template": {"spec": {"volumes": [
         {"name": "creds", "secret": {"secretName": "s"}}]}}}, "creds"),
 ])
 def test_dehardened_pods_keep_the_dangerous_command_guards(overrides, expected):
     """The heuristic used to read three config keys, so a de-hardened pod — root,
     privilege escalation, a mounted token, a privileged SA — silently kept the
-    approval-skip that only a throwaway sandbox earns."""
+    approval-skip that only a throwaway sandbox earns.  The judge reads the
+    RENDERED template, so it sees every one of these."""
     from tools.environments.kubernetes import unhardened_reasons
 
     reasons = unhardened_reasons(_kcfg(**overrides))
     assert any(expected in reason for reason in reasons), reasons
+    assert _has_host_access(**overrides) is True
+
+
+def test_a_reserved_violation_makes_the_pod_unhardened_not_hardened():
+    """Fail-closed: render_pod_template raises on a reserved field, and
+    unhardened_reasons turns the raise into "could not be rendered". An
+    unvalidated violating config must never earn the approval skip."""
+    from tools.environments.kubernetes import unhardened_reasons
+
+    overrides = {"pod_template": {"spec": {"restartPolicy": "Always"}}}
+    reasons = unhardened_reasons(_kcfg(**overrides))
+    assert any("could not be rendered" in reason for reason in reasons), reasons
     assert _has_host_access(**overrides) is True
 
 
@@ -1568,30 +1597,100 @@ def test_docker_host_access_dispatches_to_the_kubernetes_evaluator():
 
 
 # ---------------------------------------------------------------------------
-# Reserved managed-by label
+# Reserved core: REJECTED, not silently overwritten (issue requirement 5)
 # ---------------------------------------------------------------------------
 
 
 MANAGED_BY = "app.kubernetes.io/managed-by"
 
 
-def test_user_labels_cannot_strip_the_managed_by_label():
-    """k8s/networkpolicy.yaml, k8s/validatingadmissionpolicy.yaml and pod
-    adoption all select on this label."""
-    template = build_pod_template(
-        _kcfg(labels={MANAGED_BY: "Helm", "team": "hermes"}),
+@pytest.mark.parametrize("pod_template, expected", [
+    # R1 — the selector NetworkPolicy, the admission policy and pod adoption
+    # all match on.
+    ({"metadata": {"labels": {MANAGED_BY: "Helm"}}},
+     "pod_template.metadata.labels"),
+    # R2 — a restart swaps the container out from under an open exec session.
+    ({"spec": {"restartPolicy": "Always"}}, "pod_template.spec.restartPolicy"),
+    # ...by PRESENCE, not value: the base's own value is still a violation.
+    ({"spec": {"restartPolicy": "Never"}}, "pod_template.spec.restartPolicy"),
+    # R3 — a containers list that omits the exec target.
+    ({"spec": {"containers": [{"name": "sidecar"}]}},
+     "does not declare a container named 'workspace'"),
+    # R4 — the long-running command that outlives the session.
+    ({"spec": {"containers": [{"name": "workspace", "command": ["bash"]}]}},
+     "containers[name=workspace].command"),
+    # R5 — the workspace mount cwd resolves against.
+    ({"spec": {"containers": [{"name": "workspace", "volumeMounts": [
+        {"name": "mine", "mountPath": "/workspace"}]}]}},
+     "volumeMounts[mountPath=/workspace]"),
+    # R6 — the other half of R5.
+    ({"spec": {"volumes": [{"name": "workspace", "hostPath": {"path": "/"}}]}},
+     "spec.volumes[name=workspace]"),
+])
+def test_reserved_pod_template_fields_are_rejected(pod_template, expected):
+    """Hermes owns the fields that make exec possible. A config that sets one
+    FAILS VALIDATION with the exact dotted path — it is not silently
+    overwritten, which would make the user's YAML vanish without a word."""
+    problems = validate_kubernetes_config(_kcfg(pod_template=pod_template))
+    assert any(expected in p for p in problems), problems
+    assert any("reserved" in p or "does not declare" in p for p in problems)
+    # ...and the renderer re-checks, so an unvalidated config cannot slip past.
+    with pytest.raises(ValueError):
+        render_pod_template(
+            _kcfg(pod_template=pod_template), persistent=False, image="i:1",
+            resources=Resources(), pvc_name="pvc",
+        )
+
+
+@pytest.mark.parametrize("cr_spec, expected", [
+    # S1 — a SECOND pod-template source is exactly how the judged object comes
+    # to differ from the submitted object.
+    ({"podTemplate": {"spec": {"hostPID": True}}}, "sandbox.spec.podTemplate"),
+    # S2 — an operator-authored pod this backend never renders and cannot
+    # evaluate. Flat rejection: there is no config key to redirect to.
+    ({"sandboxTemplateRef": {"name": "privileged"}},
+     "sandbox.spec.sandboxTemplateRef"),
+])
+def test_reserved_sandbox_spec_fields_are_rejected(cr_spec, expected):
+    problems = validate_kubernetes_config(
+        _kcfg(provisioner="sandbox", sandbox={"spec": cr_spec})
+    )
+    assert any(expected in p and "reserved" in p for p in problems), problems
+
+
+def test_reserved_rejection_does_not_kill_the_feature_it_secures():
+    """Reject only the named fields. A second volume, a mount at another path,
+    a sidecar container and everything else in the PodSpec stay settable —
+    which is why those two lists are merge-KEYED by identity."""
+    kcfg = _kcfg(pod_template={"spec": {
+        "volumes": [{"name": "cache", "emptyDir": {}}],
+        "containers": [
+            {"name": "workspace",
+             "volumeMounts": [{"name": "cache", "mountPath": "/cache"}]},
+            {"name": "sidecar", "image": "envoy"},
+        ],
+    }})
+    assert validate_kubernetes_config(kcfg) == []
+    template = render_pod_template(
+        kcfg, persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
+    )
+    spec = template["spec"]
+    assert {v["name"] for v in spec["volumes"]} == {"workspace", "tmp", "cache"}
+    assert [c["name"] for c in spec["containers"]] == ["workspace", "sidecar"]
+    mounts = spec["containers"][0]["volumeMounts"]
+    assert {m["mountPath"] for m in mounts} == {"/workspace", "/tmp", "/cache"}
+    # ...and the reserved core survived the merge intact.
+    assert spec["containers"][0]["command"] == ["sleep", "infinity"]
+    assert spec["restartPolicy"] == "Never"
+
+
+def test_the_managed_by_label_is_on_the_rendered_template():
+    template = render_pod_template(
+        _kcfg(pod_template={"metadata": {"labels": {"team": "hermes"}}}),
         persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
     )
     assert template["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
     assert template["metadata"]["labels"]["team"] == "hermes"
-
-
-def test_pod_template_overrides_cannot_strip_the_managed_by_label():
-    template = build_pod_template(
-        _kcfg(pod_template_overrides={"metadata": {"labels": {MANAGED_BY: "Helm"}}}),
-        persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
-    )
-    assert template["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
 
 
 def test_sandbox_manifest_keeps_the_managed_by_label():
@@ -1599,15 +1698,25 @@ def test_sandbox_manifest_keeps_the_managed_by_label():
         "abc", persistent=False, image="i:1", resources=Resources()
     )
     assert manifest["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
-
-
-def test_validation_rejects_the_reserved_label():
-    problems = validate_kubernetes_config(_kcfg(labels={MANAGED_BY: "Helm"}))
-    assert any("reserved" in problem for problem in problems)
-    problems = validate_kubernetes_config(
-        _kcfg(pod_template_overrides={"metadata": {"labels": {MANAGED_BY: "x"}}})
+    assert manifest["spec"]["podTemplate"]["metadata"]["labels"][MANAGED_BY] == (
+        "hermes-agent"
     )
-    assert any("reserved" in problem for problem in problems)
+
+
+def test_a_malformed_pod_template_loses_its_metadata_not_the_label():
+    """merge_pod_template faithfully replaces a dict with a scalar/None, and the
+    round-2 re-stamp then raised a bare AttributeError out of manifest
+    construction while the offline validator said the config was fine."""
+    for overlay in ({"metadata": None}, {"metadata": {"labels": None}},
+                    {"metadata": {"labels": 7}}):
+        kcfg = _kcfg(pod_template=overlay)
+        template = render_pod_template(
+            kcfg, persistent=False, image="i:1", resources=Resources(),
+            pvc_name="hermes-ws",
+        )
+        assert template["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
+        problems = validate_kubernetes_config(kcfg)
+        assert any("must be a mapping" in p for p in problems), (overlay, problems)
 
 
 # ---------------------------------------------------------------------------
@@ -1679,16 +1788,16 @@ def test_sandbox_refuses_a_pod_owned_by_a_different_sandbox():
 
 
 # ---------------------------------------------------------------------------
-# pod_template_overrides really is a strategic merge
+# The pod_template merge rule
 # ---------------------------------------------------------------------------
 
 
-def test_pod_template_overrides_merge_containers_by_name():
-    """Documented in four places as a strategic-merge patch. A plain deep merge
-    replaced spec.containers wholesale, dropping image/command/volumeMounts/
-    securityContext — the pod then never becomes Ready."""
-    template = build_pod_template(
-        _kcfg(pod_template_overrides={"spec": {"containers": [
+def test_pod_template_merges_containers_by_name():
+    """A plain deep merge replaced spec.containers wholesale, dropping
+    image/command/volumeMounts/securityContext — the pod then never becomes
+    Ready."""
+    template = render_pod_template(
+        _kcfg(pod_template={"spec": {"containers": [
             {"name": "workspace", "env": [{"name": "A", "value": "1"}]}
         ]}}),
         persistent=False, image="img:1", resources=Resources(), pvc_name="pvc",
@@ -1701,15 +1810,48 @@ def test_pod_template_overrides_merge_containers_by_name():
     assert {"name": "A", "value": "1"} in container["env"]
 
 
-def test_strategic_merge_appends_unmatched_named_entries_and_replaces_plain_lists():
-    from tools.environments.kubernetes import strategic_merge
+def test_volume_mounts_merge_on_mountpath_not_name():
+    """The old heuristic keyed EVERY name-bearing list on `name`, which is not
+    what the API server does for volumeMounts (patchMergeKey: mountPath). A
+    new-name/existing-mountPath mount APPENDED, producing a duplicate-mountPath
+    pod the kubelet rejects."""
+    from tools.environments.kubernetes import merge_pod_template
 
-    merged = strategic_merge(
-        {"volumes": [{"name": "workspace", "emptyDir": {}}], "args": ["a", "b"]},
-        {"volumes": [{"name": "extra", "emptyDir": {}}], "args": ["c"]},
+    merged = merge_pod_template(
+        {"spec": {"containers": [{"name": "workspace", "volumeMounts": [
+            {"name": "workspace", "mountPath": "/workspace"}]}]}},
+        {"spec": {"containers": [{"name": "workspace", "volumeMounts": [
+            {"name": "other", "mountPath": "/workspace"}]}]}},
     )
-    assert [v["name"] for v in merged["volumes"]] == ["workspace", "extra"]
-    assert merged["args"] == ["c"]
+    mounts = merged["spec"]["containers"][0]["volumeMounts"]
+    assert len(mounts) == 1, mounts
+    assert mounts[0]["name"] == "other"
+
+
+def test_merge_appends_unmatched_keyed_entries_and_replaces_plain_lists():
+    from tools.environments.kubernetes import merge_pod_template
+
+    merged = merge_pod_template(
+        {"spec": {"volumes": [{"name": "workspace", "emptyDir": {}}],
+                  "tolerations": [{"key": "a"}]}},
+        {"spec": {"volumes": [{"name": "extra", "emptyDir": {}}],
+                  "tolerations": [{"key": "b"}]}},
+    )
+    assert [v["name"] for v in merged["spec"]["volumes"]] == ["workspace", "extra"]
+    # No upstream merge key -> replace wholesale, loudly.
+    assert merged["spec"]["tolerations"] == [{"key": "b"}]
+
+
+def test_merge_keys_only_apply_at_their_anchored_paths():
+    """The table is path-anchored, so a `containers` list somewhere else in the
+    template is a plain list and replaces."""
+    from tools.environments.kubernetes import merge_pod_template
+
+    merged = merge_pod_template(
+        {"metadata": {"containers": [{"name": "a"}]}},
+        {"metadata": {"containers": [{"name": "b"}]}},
+    )
+    assert merged["metadata"]["containers"] == [{"name": "b"}]
 
 
 # ---------------------------------------------------------------------------
@@ -1717,21 +1859,34 @@ def test_strategic_merge_appends_unmatched_named_entries_and_replaces_plain_list
 # ---------------------------------------------------------------------------
 
 
-def test_run_as_user_and_fs_group_zero_are_not_silently_dropped():
-    template = build_pod_template(
-        _kcfg(security_context={"run_as_non_root": False, "run_as_user": 0,
-                                "fs_group": 0}),
+def test_pod_template_security_context_values_reach_the_manifest():
+    """Vanilla Kubernetes needs a concrete UID for runAsNonRoot to schedule a
+    root-default image, plus an fsGroup so it can write the workspace volume.
+    Both now live in pod_template — including the falsy-but-legitimate 0, which
+    a truthiness check used to drop silently."""
+    template = render_pod_template(
+        _kcfg(pod_template={"spec": {"securityContext": {
+            "runAsNonRoot": False, "runAsUser": 0, "fsGroup": 0}}}),
         persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
     )
     assert template["spec"]["securityContext"]["runAsUser"] == 0
     assert template["spec"]["securityContext"]["fsGroup"] == 0
 
+    sane = render_pod_template(
+        _kcfg(pod_template={"spec": {"securityContext": {
+            "runAsUser": 1000, "fsGroup": 1000}}}),
+        persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
+    )
+    assert sane["spec"]["securityContext"]["runAsUser"] == 1000
+    # The base's hardening survived the merge.
+    assert sane["spec"]["securityContext"]["runAsNonRoot"] is True
+
 
 def test_persistent_pod_without_an_owner_reference_gets_the_deadline_backstop():
     """A persistent pod with no ownerReference has no reaper at all; its PVC
     (the durable half) outlives the pod anyway."""
-    owned = DirectProvisioner(_kcfg(), "hermes", api=None, owner_reference=OWNER_REF)
-    orphan = DirectProvisioner(_kcfg(), "hermes", api=None, owner_reference=None)
+    owned = PodProvisioner(_kcfg(), "hermes", api=None, owner_reference=OWNER_REF)
+    orphan = PodProvisioner(_kcfg(), "hermes", api=None, owner_reference=None)
     assert "activeDeadlineSeconds" not in owned.pod_manifest(
         "abc", persistent=True, image="i:1", resources=Resources())["spec"]
     assert orphan.pod_manifest(
@@ -1790,13 +1945,17 @@ def test_kubernetes_blob_is_only_bridged_for_the_kubernetes_backend():
 
 
 # ---------------------------------------------------------------------------
-# Round-3 regressions
+# Override-bypass regressions
 #
-# Every test below fails against a02cbd58 (`git archive a02cbd58`) and passes
-# at HEAD.  The theme is one root cause: sandbox.spec_overrides was a SECOND
-# pod-template override layer that only the sandbox manifest builder applied,
-# so every control that inspected or stamped the builder's output was
-# bypassable by moving the same YAML into it.
+# Rounds 2 and 3 shipped, and a reviewer disproved, the claim that the pod the
+# hardening judge evaluated was the pod that got submitted. The root cause was
+# always the same: a SECOND pod-template override layer that only one code path
+# applied, so every control inspecting the first layer's output was bypassable
+# by moving the same YAML into the second.
+#
+# This design removes the bug class structurally: there is ONE render function,
+# ONE user layer, and the second-source keys are rejected outright. The tests
+# below are those regressions re-expressed against that design.
 # ---------------------------------------------------------------------------
 
 K8S_DIR = __import__("pathlib").Path(__file__).resolve().parents[2] / "k8s"
@@ -1806,7 +1965,7 @@ def _sandbox_kcfg(**sandbox):
     return _kcfg(provisioner="sandbox", sandbox=sandbox)
 
 
-_DEHARDENING_OVERRIDE = {
+_DEHARDENING_TEMPLATE = {
     "spec": {
         "hostPID": True,
         "hostNetwork": True,
@@ -1822,22 +1981,21 @@ _DEHARDENING_OVERRIDE = {
 }
 
 
-def test_sandbox_spec_overrides_cannot_hide_a_dehardened_pod():
-    """THE root cause. `sandbox.spec_overrides.podTemplate` is applied by
-    sandbox_manifest() AFTER build_pod_template(), so a pod with hostPID,
-    hostNetwork, a hostPath '/' volume, a privileged root container and a
-    mounted token still counted as a trusted throwaway sandbox and kept the
-    dangerous-command approval SKIP."""
+def test_a_dehardened_pod_template_cannot_hide_from_the_judge():
+    """THE root cause, in its surviving form. A pod with hostPID, hostNetwork,
+    a hostPath '/' volume, a privileged root container and a mounted token must
+    never count as a trusted throwaway sandbox — in EITHER provisioner mode,
+    because both consume the same rendered template."""
     from tools.environments.kubernetes import unhardened_reasons
-
-    kcfg = _sandbox_kcfg(spec_overrides={"podTemplate": _DEHARDENING_OVERRIDE})
-    reasons = unhardened_reasons(kcfg)
-    for expected in ("hostPID", "hostNetwork", "automountServiceAccountToken",
-                     "serviceAccountName", "privileged", "host"):
-        assert any(expected in reason for reason in reasons), (expected, reasons)
-
     from tools.terminal_tool import _kubernetes_has_host_access
-    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+
+    for kcfg in (_kcfg(pod_template=_DEHARDENING_TEMPLATE),
+                 _sandbox_kcfg(spec={}) | {"pod_template": _DEHARDENING_TEMPLATE}):
+        reasons = unhardened_reasons(kcfg)
+        for expected in ("hostPID", "hostNetwork", "automountServiceAccountToken",
+                         "serviceAccountName", "privileged", "host"):
+            assert any(expected in reason for reason in reasons), (expected, reasons)
+        assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
 
     # And the whole chain: the guards must actually stay on.
     from tools.approval import check_all_command_guards
@@ -1848,88 +2006,90 @@ def test_sandbox_spec_overrides_cannot_hide_a_dehardened_pod():
 
 def test_the_judged_pod_template_is_the_submitted_pod_template():
     """One renderer, one judge: what unhardened_reasons() evaluates must be
-    byte-identical to what the selected provisioner POSTs — for both of them."""
-    kcfg = _sandbox_kcfg(spec_overrides={"podTemplate": _DEHARDENING_OVERRIDE})
-    judged = build_pod_template(
+    byte-identical to what the selected provisioner POSTs — for BOTH of them."""
+    kcfg = _kcfg(pod_template=_DEHARDENING_TEMPLATE)
+    judged = render_pod_template(
         kcfg, persistent=False, image="i:1", resources=Resources(),
         pvc_name="hermes-ws",
     )
-    submitted = SandboxProvisioner(
-        kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
+
+    sandbox_kcfg = dict(kcfg, provisioner="sandbox")
+    submitted_sandbox = _sandbox_cls()(
+        sandbox_kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
     ).sandbox_manifest("abc", persistent=False, image="i:1",
                        resources=Resources())["spec"]["podTemplate"]
-    assert submitted == judged
+    assert submitted_sandbox == judged
+
+    submitted_pod = PodProvisioner(
+        kcfg, "hermes", api=None, owner_reference=OWNER_REF,
+    ).pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
+    # The Pod adds only object identity on top of the judged template.
+    assert submitted_pod["spec"] == judged["spec"]
+    assert submitted_pod["metadata"]["labels"] == judged["metadata"]["labels"]
+
     # The bypass, concretely: the submitted pod really is de-hardened.
-    assert submitted["spec"]["hostPID"] is True
+    assert submitted_sandbox["spec"]["hostPID"] is True
 
 
-def test_sandbox_spec_overrides_is_a_declared_pod_template_layer():
-    """Structural guard: the layer list is the single source of truth that both
-    the renderer and the judge walk, so a future layer cannot be added to one
-    without the other."""
-    from tools.environments.kubernetes import _pod_template_override_layers
+def test_there_is_exactly_one_pod_template_source():
+    """Structural guard for issue requirement 2. The sandbox provisioner must
+    ASSIGN the rendered template, never merge a second one over it — so
+    monkeypatching the single renderer changes the submitted object completely."""
+    import tools.environments.kubernetes_sandbox as sandbox_mod
 
-    names = [name for name, _ in _pod_template_override_layers(
-        _sandbox_kcfg(spec_overrides={"podTemplate": {"spec": {}}}))]
-    assert "sandbox.spec_overrides.podTemplate" in names
-    # Not a layer for the direct provisioner — it never reads sandbox.*.
-    direct_names = [name for name, _ in _pod_template_override_layers(
-        _kcfg(sandbox={"spec_overrides": {"podTemplate": {"spec": {}}}}))]
-    assert "sandbox.spec_overrides.podTemplate" not in direct_names
+    sentinel = {"metadata": {"labels": {}}, "spec": {"marker": "the-only-source"}}
+    original = sandbox_mod.render_pod_template
+    try:
+        sandbox_mod.render_pod_template = lambda *a, **kw: sentinel
+        manifest = _sandbox_provisioner(
+            spec={"ttlSeconds": 5}
+        ).sandbox_manifest("abc", persistent=False, image="i:1",
+                           resources=Resources())
+    finally:
+        sandbox_mod.render_pod_template = original
+    assert manifest["spec"]["podTemplate"] == sentinel
+    assert manifest["spec"]["ttlSeconds"] == 5
 
 
-@pytest.mark.parametrize("sandbox", [
-    {"template_ref": "privileged-template"},
-    {"template_ref": "warm", "use_claim": True},
-])
-def test_operator_supplied_pod_shapes_are_never_trusted(sandbox):
-    """With template_ref/use_claim the pod is built by agent-sandbox-operator
-    from a SandboxTemplate Hermes never reads. 'Cannot be evaluated' must not
-    read as 'hardened' — it used to return no reasons at all, which skipped the
-    guards for a pod shape nothing had inspected."""
+def test_a_second_pod_template_source_is_a_config_error_not_a_merge():
+    """`sandbox.spec.podTemplate` was the second layer. It is now rejected —
+    the only way to keep 'the object you validated' and 'the object you submit'
+    the same object."""
+    kcfg = _sandbox_kcfg(spec={"podTemplate": _DEHARDENING_TEMPLATE})
+    problems = validate_kubernetes_config(kcfg)
+    assert any("sandbox.spec.podTemplate" in p and "reserved" in p
+               for p in problems), problems
+    # ...and it never reaches the manifest even unvalidated.
+    manifest = _sandbox_cls()(
+        kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
+    ).sandbox_manifest("abc", persistent=False, image="i:1", resources=Resources())
+    assert manifest["spec"]["podTemplate"]["spec"]["hostPID"] is False
+
+
+def test_an_operator_authored_pod_shape_has_no_door_left():
+    """template_ref / use_claim / spec_overrides.sandboxTemplateRef were three
+    doors to a pod built from a SandboxTemplate Hermes never reads — a pod
+    whose hardening cannot be established, which must never read as hardened.
+    All three are gone; the surviving door is a flat rejection."""
+    assert "template_ref" not in DEFAULT_KUBERNETES_CONFIG["sandbox"]
+    assert "use_claim" not in DEFAULT_KUBERNETES_CONFIG["sandbox"]
+
+    kcfg = _sandbox_kcfg(spec={"sandboxTemplateRef": {"name": "privileged"}})
+    problems = validate_kubernetes_config(kcfg)
+    assert any("sandboxTemplateRef" in p and "reserved" in p for p in problems)
+
+    # Defence in depth: the judge must not depend on validation having run.
     from tools.environments.kubernetes import unhardened_reasons
     from tools.terminal_tool import _kubernetes_has_host_access
 
-    kcfg = _sandbox_kcfg(**sandbox)
-    reasons = unhardened_reasons(kcfg)
-    assert any("SandboxTemplate" in reason for reason in reasons), reasons
-    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
-
-
-def test_managed_by_label_survives_sandbox_spec_overrides():
-    """That label is the SOLE selector for both NetworkPolicies and for the
-    ValidatingAdmissionPolicy matchCondition. spec_overrides could rewrite it
-    with validate_kubernetes_config() reporting no problem at all."""
-    kcfg = _sandbox_kcfg(spec_overrides={
-        "podTemplate": {"metadata": {"labels": {
-            "app.kubernetes.io/managed-by": "not-hermes"}}}
-    })
-    manifest = SandboxProvisioner(
+    manifest = _sandbox_cls()(
         kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
-    ).sandbox_manifest("abc", persistent=False, image="i:1",
-                       resources=Resources())
-    labels = manifest["spec"]["podTemplate"]["metadata"]["labels"]
-    assert labels["app.kubernetes.io/managed-by"] == "hermes-agent"
-
-    problems = validate_kubernetes_config(kcfg)
-    assert any("spec_overrides" in p and "reserved" in p for p in problems), problems
-
-
-def test_label_restamp_survives_a_null_metadata_override():
-    """strategic_merge faithfully replaces a dict with a scalar/None, and the
-    round-2 re-stamp then raised a bare AttributeError out of manifest
-    construction while the offline validator said the config was fine."""
-    for overlay in ({"metadata": None}, {"metadata": {"labels": None}},
-                    {"metadata": {"labels": 7}}):
-        kcfg = _kcfg(pod_template_overrides=overlay)
-        template = build_pod_template(
-            kcfg, persistent=False, image="i:1", resources=Resources(),
-            pvc_name="hermes-ws",
-        )
-        assert template["metadata"]["labels"][
-            "app.kubernetes.io/managed-by"] == "hermes-agent"
-        problems = validate_kubernetes_config(kcfg)
-        assert any("must be a mapping" in p for p in problems), (overlay, problems)
+    ).sandbox_manifest("abc", persistent=False, image="i:1", resources=Resources())
+    # The CR still carries the ref (we do not silently strip user data), but the
+    # podTemplate is ours, so what runs is what was judged.
+    assert manifest["spec"]["podTemplate"]["spec"]["restartPolicy"] == "Never"
+    assert unhardened_reasons(kcfg) == []
+    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is False
 
 
 def test_secret_bearing_env_is_not_a_throwaway_sandbox():
@@ -1947,18 +2107,20 @@ def test_secret_bearing_env_is_not_a_throwaway_sandbox():
                 {"name": "AWS_SECRET_ACCESS_KEY",
                  "valueFrom": {"secretKeyRef": {"name": "aws", "key": "sk"}}}]}]}},
     ):
-        reasons = unhardened_reasons(_kcfg(pod_template_overrides=overlay))
+        reasons = unhardened_reasons(_kcfg(pod_template=overlay))
         assert any("Secret" in reason for reason in reasons), (overlay, reasons)
 
 
 def test_validatingadmissionpolicy_does_not_claim_the_label_is_unconfigurable():
     """A false security claim in shipped docs is worse than the bug: the round-2
-    header asserted the matchCondition 'cannot be configured away', which
-    sandbox.spec_overrides disproved."""
+    header asserted the matchCondition "cannot be configured away", which a
+    second override layer disproved. The retraction stays."""
     text = (K8S_DIR / "validatingadmissionpolicy.yaml").read_text(encoding="utf-8")
     assert "cannot be configured away" not in text
     assert "retracted" in text
-    assert "template_ref" in text
+    # The surviving honest limitation: a compromised agent talking to the API
+    # server directly is not bound by any of this.
+    assert "compromised agent" in text
 
 
 def test_validatingadmissionpolicy_covers_secret_backed_env():
@@ -1967,14 +2129,28 @@ def test_validatingadmissionpolicy_covers_secret_backed_env():
     assert "secretKeyRef" in text
 
 
-def test_networkpolicy_states_the_template_ref_gap():
-    """With sandbox.template_ref the operator's pod carries the selector label
-    only if the TEMPLATE sets it — so neither policy applies. The README
-    documented the NetworkPolicy as unconditional."""
+def test_shipped_policies_do_not_document_deleted_config_keys():
+    """The policies are COUPLED to config.yaml and say so. Naming keys that no
+    longer exist sends an operator to a knob they cannot find."""
+    for name in ("networkpolicy.yaml", "validatingadmissionpolicy.yaml",
+                 "rbac.yaml", "README.md"):
+        text = (K8S_DIR / name).read_text(encoding="utf-8")
+        for gone in ("template_ref", "use_claim", "spec_overrides",
+                     "pod_template_overrides", "security_context",
+                     "runtime_class_name"):
+            assert gone not in text, f"{name} still documents {gone}"
+
+
+def test_networkpolicy_and_readme_state_what_the_label_selector_covers():
     text = (K8S_DIR / "networkpolicy.yaml").read_text(encoding="utf-8")
-    assert "template_ref" in text
+    # It selects on the managed-by label, and says why config cannot strip it.
+    assert "app.kubernetes.io/managed-by" in text
+    assert "rejected config" in text and "no second override layer" in text
     readme = (K8S_DIR / "README.md").read_text(encoding="utf-8")
     assert "credential files at rest" in readme
+    # The retraction survives in prose: the backend does not claim to bound a
+    # compromised agent's direct API calls.
+    assert "compromised agent" in readme
 
 
 def test_pvc_adoption_refuses_a_foreign_claim():
@@ -2066,23 +2242,6 @@ def test_sandbox_refuses_a_pod_resolved_only_by_name_convention():
         p.ensure("abc", persistent=False, image="i:1", resources=Resources())
 
 
-def test_strategic_merge_docstring_admits_the_volume_mount_divergence():
-    """The docstring claimed the same `patchMergeKey: name` Kubernetes uses for
-    those fields — untrue for volumeMounts (mountPath) and ports
-    (containerPort), and pod_template_overrides is documented to users as a
-    strategic-merge patch."""
-    from tools.environments.kubernetes import strategic_merge
-
-    doc = strategic_merge.__doc__ or ""
-    assert "mountPath" in doc and "DIVERGES" in doc
-    # ...and the divergence itself, so the doc stays pinned to the behaviour.
-    merged = strategic_merge(
-        {"volumeMounts": [{"name": "workspace", "mountPath": "/workspace"}]},
-        {"volumeMounts": [{"name": "other", "mountPath": "/workspace"}]},
-    )
-    assert len(merged["volumeMounts"]) == 2
-
-
 def test_kubernetes_blob_survives_a_backend_selected_by_env_var():
     """terminal.backend ALWAYS defaults to 'local' in the merged config, so the
     round-2 gate's TERMINAL_ENV fallback was dead code: selecting the kubernetes
@@ -2110,78 +2269,121 @@ def test_doctor_probes_the_exec_verb_the_client_actually_issues():
     """connect_get_namespaced_pod_exec is a websocket-upgrading GET, authorized
     as verb `get`. Probing `create` failed a truly minimal Role (pushing
     operators to widen it) and passed the kubectl-shaped create-only Role that
-    then 403s on the first command."""
-    import inspect
+    then 403s on the first command.
 
-    from hermes_cli import doctor
-
-    source = inspect.getsource(doctor)
-    assert '("", "pods/exec", "get")' in source
-    assert '("", "pods/exec", "create")' not in source
+    Asserted behaviourally, by recording the SelfSubjectAccessReviews doctor
+    actually issues — not by reading doctor's source."""
+    reviews = _doctor_rbac_reviews(_kcfg(namespace="hermes"))
+    assert ("", "pods/exec", "get") in reviews
+    assert ("", "pods/exec", "create") not in reviews
+    assert ("", "pods", "create") in reviews
     readme = (K8S_DIR / "README.md").read_text(encoding="utf-8")
     assert "get    pods/exec" in readme
 
 
-def test_doctor_probes_the_claim_group_the_backend_posts_to():
-    """SandboxProvisioner.CLAIM_GROUP is a constant that ignores
-    sandbox.api_group, so deriving the group from api_group made doctor report
-    a pass/fail about a resource the backend never calls."""
-    import inspect
+def test_doctor_probes_the_sandbox_group_the_backend_posts_to():
+    reviews = _doctor_rbac_reviews(
+        _kcfg(namespace="hermes", provisioner="sandbox",
+              sandbox={"api_group": "custom.example.com"})
+    )
+    assert ("custom.example.com", "sandboxes", "create") in reviews
+    # The sandbox Role deliberately grants no pods create/delete.
+    assert ("", "pods", "delete") not in reviews
+    assert ("", "pods", "get") in reviews
 
+
+def _doctor_rbac_reviews(kcfg):
+    """Drive _check_kubernetes_backend and record every SSAR it submits."""
+    import importlib.util
+
+    import kubernetes.client as kclient
     from hermes_cli import doctor
 
-    source = inspect.getsource(doctor)
-    assert "SandboxProvisioner.CLAIM_GROUP" in source
-    assert '"extensions." + str(sandbox_group)' not in source
+    seen: list[tuple] = []
+
+    class _Attrs:
+        def __init__(self, namespace=None, group=None, resource=None, verb=None):
+            self.group, self.resource, self.verb = group, resource, verb
+
+    class _Spec:
+        def __init__(self, resource_attributes=None):
+            self.resource_attributes = resource_attributes
+
+    class _Review:
+        def __init__(self, spec=None):
+            self.spec = spec
+
+    class _AuthApi:
+        def __init__(self, api_client=None):
+            pass
+
+        def create_self_subject_access_review(self, review):
+            attrs = review.spec.resource_attributes
+            seen.append((attrs.group, attrs.resource, attrs.verb))
+            return SimpleNamespace(status=SimpleNamespace(allowed=True))
+
+    core = MagicMock()
+    original = {
+        "V1ResourceAttributes": getattr(kclient, "V1ResourceAttributes", None),
+        "V1SelfSubjectAccessReviewSpec": getattr(
+            kclient, "V1SelfSubjectAccessReviewSpec", None),
+        "V1SelfSubjectAccessReview": getattr(
+            kclient, "V1SelfSubjectAccessReview", None),
+        "AuthorizationV1Api": getattr(kclient, "AuthorizationV1Api", None),
+    }
+    kclient.V1ResourceAttributes = _Attrs
+    kclient.V1SelfSubjectAccessReviewSpec = _Spec
+    kclient.V1SelfSubjectAccessReview = _Review
+    kclient.AuthorizationV1Api = _AuthApi
+
+    import tools.environments.kubernetes as k8s_mod
+    import tools.terminal_tool as tt
+
+    saved = (importlib.util.find_spec, k8s_mod.load_kubernetes_apis,
+             tt._get_env_config, doctor._dry_run_pod_template)
+    try:
+        importlib.util.find_spec = lambda name, *a, **k: (
+            object() if name == "kubernetes" else saved[0](name, *a, **k)
+        )
+        k8s_mod.load_kubernetes_apis = lambda cfg: (core, MagicMock())
+        tt._get_env_config = lambda: {"kubernetes": kcfg}
+        doctor._dry_run_pod_template = lambda *a, **kw: None
+        doctor._check_kubernetes_backend([])
+    finally:
+        (importlib.util.find_spec, k8s_mod.load_kubernetes_apis,
+         tt._get_env_config, doctor._dry_run_pod_template) = saved
+        for name, value in original.items():
+            if value is None:
+                delattr(kclient, name)
+            else:
+                setattr(kclient, name, value)
+    return seen
 
 
-def test_sandbox_template_ref_smuggled_through_spec_overrides_is_not_trusted():
-    """`sandboxTemplateRef` reaches the operator through spec_overrides just as
-    surely as through sandbox.template_ref, and the resulting pod is built from
-    a SandboxTemplate this backend never reads.
+def test_doctor_dry_runs_the_rendered_pod_with_strict_field_validation():
+    """Without Strict, an unknown field in pod_template is accepted with 201 and
+    silently dropped — the python client throws away the API server's
+    "Warning: 299 - unknown field" header, so Warn is indistinguishable from
+    success. doctor submits the real rendered pod as a dry-run create so the
+    server names the offending path here, not at the first session."""
+    from hermes_cli import doctor
 
-    Round 3 closed the spec_overrides.podTemplate door but judged only the
-    config keys template_ref/use_claim, so this third door returned NO reasons
-    at all — a pod nothing had inspected kept the dangerous-command approval
-    skip.
-    """
-    from tools.environments.kubernetes import unhardened_reasons
-    from tools.terminal_tool import _kubernetes_has_host_access
+    core = MagicMock()
+    doctor._dry_run_pod_template(_kcfg(), "hermes", core, False, [])
 
-    kcfg = _sandbox_kcfg(spec_overrides={
-        "sandboxTemplateRef": {"name": "privileged-template"},
-    })
-    reasons = unhardened_reasons(kcfg)
-    assert any("SandboxTemplate" in reason for reason in reasons), reasons
-    assert any("spec_overrides.sandboxTemplateRef" in r for r in reasons), reasons
-    assert _kubernetes_has_host_access({"kubernetes": kcfg}) is True
+    kwargs = core.create_namespaced_pod.call_args.kwargs
+    assert kwargs["dry_run"] == "All"
+    assert kwargs["field_validation"] == "Strict"
+    assert kwargs["body"]["kind"] == "Pod"
+    assert kwargs["body"]["spec"]["containers"][0]["command"] == ["sleep", "infinity"]
 
 
-def test_sandbox_template_ref_in_spec_overrides_is_a_config_error():
-    """Defence in depth: the judge treats it as unjudgeable, but the config is
-    simply wrong — sandboxTemplateRef has a declared home (sandbox.template_ref)
-    and smuggling it through the overlay emits a Sandbox carrying BOTH a
-    podTemplate we rendered and a template reference we never read."""
-    from tools.environments.kubernetes import validate_kubernetes_config
+def test_doctor_reports_an_unrenderable_pod_template_as_a_failure():
+    from hermes_cli import doctor
 
-    problems = validate_kubernetes_config(_sandbox_kcfg(spec_overrides={
-        "sandboxTemplateRef": {"name": "privileged-template"},
-    }))
-    assert any("sandboxTemplateRef is not allowed" in p for p in problems), problems
-    # the declared key stays valid
-    assert not [
-        p for p in validate_kubernetes_config(_sandbox_kcfg(template_ref="t"))
-        if "sandboxTemplateRef" in p
-    ]
-
-
-def test_k8s_readme_does_not_claim_spec_overrides_is_unreachable():
-    """Rounds 2 and 3 each shipped an absolute security claim a reviewer then
-    disproved. Pin the retraction: the README may describe what the check
-    covers, but must not assert the pod shape cannot be reached."""
-    import pathlib
-
-    readme = pathlib.Path(__file__).resolve().parents[2] / "k8s" / "README.md"
-    text = readme.read_text()
-    assert "It cannot be used to reach a pod shape the security checks did not see." not in text
-    assert "sandboxTemplateRef` key is **rejected**" in text
+    issues: list[str] = []
+    doctor._dry_run_pod_template(
+        _kcfg(pod_template={"spec": {"restartPolicy": "Always"}}),
+        "hermes", MagicMock(), False, issues,
+    )
+    assert any("pod_template" in issue for issue in issues), issues

@@ -1617,12 +1617,12 @@ def setup_terminal_backend(config: dict):
         provisioner_idx = prompt_choice(
             "Workspace provisioner:",
             [
-                "direct - raw Pod + optional PVC via the Kubernetes API (default)",
+                "pod - raw Pod + optional PVC via the Kubernetes API (default)",
                 "sandbox - Sandbox CR reconciled by agent-sandbox-operator",
             ],
-            0 if k8s_cfg.get("provisioner", "direct") == "direct" else 1,
+            0 if k8s_cfg.get("provisioner", "pod") == "pod" else 1,
         )
-        k8s_cfg["provisioner"] = "direct" if provisioner_idx == 0 else "sandbox"
+        k8s_cfg["provisioner"] = "pod" if provisioner_idx == 0 else "sandbox"
 
         namespace = prompt(
             "    Namespace (blank = use the in-cluster ServiceAccount namespace)",
@@ -1637,13 +1637,13 @@ def setup_terminal_backend(config: dict):
         if image:
             k8s_cfg["image"] = image.strip()
 
-        runtime_class = prompt(
-            "    RuntimeClass (blank = cluster default; 'kata' for OpenShift "
-            "sandboxed containers)",
-            default=k8s_cfg.get("runtime_class_name", ""),
+        print_info(
+            "  Everything else about the pod (runtimeClassName for kata, "
+            "nodeSelector, tolerations, resources, extra volumes, "
+            "securityContext) goes in terminal.kubernetes.pod_template — one "
+            "PodTemplateSpec merged over a hardened base. Edit config.yaml "
+            "directly; see cli-config.yaml.example (OPTION 7)."
         )
-        k8s_cfg["runtime_class_name"] = (runtime_class or "").strip()
-
         print_info(
             "  Apply k8s/rbac.yaml so the agent ServiceAccount can create and "
             "exec into session pods, then run `hermes doctor` to verify RBAC."

@@ -644,6 +644,123 @@ def _migrate_to_33(results: Dict[str, Any], quiet: bool) -> None:
             )
 
 
+def _migrate_to_34(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 33 → 34: collapse terminal.kubernetes to the pod_template schema ──
+    # The backend used to model ~30 PodSpec fields as first-class config keys.
+    # They are gone: everything that is merely PodSpec is now ONE
+    # `pod_template` PodTemplateSpec merged over a hardened base, so exactly
+    # one artifact is rendered, submitted and security-checked.
+    #
+    # This is a HARD CUT, executed cleanly — not a compatibility shim. The
+    # runtime has zero knowledge of the old names; this step only removes them
+    # from the user's on-disk file (where the stricter validator would now
+    # reject them) and rewrites the renamed provisioner value. Anyone who was
+    # setting a removed key gets it NAMED in a warning so they can re-express
+    # it under pod_template, rather than discovering the loss at runtime.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    terminal = config.get("terminal")
+    if not isinstance(terminal, dict):
+        return
+    kube = terminal.get("kubernetes")
+    if not isinstance(kube, dict):
+        return
+
+    changed = False
+
+    # `direct` was renamed `pod` (it creates a raw Pod).
+    if str(kube.get("provisioner") or "").strip().lower() == "direct":
+        kube["provisioner"] = "pod"
+        changed = True
+        results["config_added"].append("terminal.kubernetes.provisioner=pod")
+
+    # pod_template_overrides was the same slot, and is now the ONLY user layer.
+    if "pod_template_overrides" in kube:
+        overrides = kube.pop("pod_template_overrides")
+        changed = True
+        if overrides and not kube.get("pod_template"):
+            kube["pod_template"] = overrides
+            results["config_added"].append(
+                "terminal.kubernetes.pod_template (renamed from "
+                "pod_template_overrides)"
+            )
+
+    removed = [
+        key for key in (
+            "image_pull_policy", "image_pull_secrets", "service_account",
+            "automount_service_account_token", "runtime_class_name",
+            "node_selector", "tolerations", "labels", "annotations", "env",
+            "security_context", "resources",
+        )
+        if key in kube
+    ]
+    for key in removed:
+        kube.pop(key)
+        changed = True
+
+    sandbox = kube.get("sandbox")
+    if isinstance(sandbox, dict):
+        if "spec_overrides" in sandbox:
+            spec_overrides = sandbox.pop("spec_overrides")
+            changed = True
+            # podTemplate/sandboxTemplateRef are reserved in sandbox.spec, so
+            # carrying them over would only trip the validator. Drop them and
+            # say so; everything else is genuine Sandbox CR spec.
+            carried = {
+                k: v for k, v in (spec_overrides or {}).items()
+                if k not in ("podTemplate", "sandboxTemplateRef")
+            }
+            if carried and not sandbox.get("spec"):
+                sandbox["spec"] = carried
+                results["config_added"].append(
+                    "terminal.kubernetes.sandbox.spec (renamed from "
+                    "sandbox.spec_overrides)"
+                )
+            if len(carried) != len(spec_overrides or {}):
+                removed.append("sandbox.spec_overrides.podTemplate/"
+                               "sandboxTemplateRef")
+        for key in ("template_ref", "use_claim", "ready_condition"):
+            if key in sandbox:
+                sandbox.pop(key)
+                changed = True
+                removed.append(f"sandbox.{key}")
+        if "ttl_seconds" in sandbox:
+            ttl = sandbox.pop("ttl_seconds")
+            changed = True
+            if ttl and not (sandbox.get("spec") or {}).get("ttlSeconds"):
+                sandbox.setdefault("spec", {})["ttlSeconds"] = int(ttl)
+                results["config_added"].append(
+                    "terminal.kubernetes.sandbox.spec.ttlSeconds "
+                    "(moved from sandbox.ttl_seconds)"
+                )
+            else:
+                removed.append("sandbox.ttl_seconds")
+
+    if not changed:
+        return
+
+    terminal["kubernetes"] = kube
+    config["terminal"] = terminal
+    _persist_migration(config)
+
+    if removed:
+        results["warnings"].append(
+            "terminal.kubernetes: removed "
+            + ", ".join(sorted(set(removed)))
+            + " — these are no longer config keys. Re-express pod shape under "
+            "terminal.kubernetes.pod_template (one PodTemplateSpec merged over "
+            "a hardened base); see cli-config.yaml.example OPTION 7."
+        )
+    if not quiet:
+        print(
+            "  ✓ Collapsed terminal.kubernetes to the pod_template schema "
+            "(provisioner: direct → pod)"
+        )
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: version captured before the ladder started. Order matters: later steps may
@@ -665,6 +782,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (31, _migrate_to_31),
     (32, _migrate_to_32),
     (33, _migrate_to_33),
+    (34, _migrate_to_34),
 )
 
 

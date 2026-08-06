@@ -27,21 +27,21 @@
 # `pods/create` safe.
 #
 # COUPLED TO config.yaml — keep these in sync or every session pod is DENIED:
-#   * `variables.sa == 'hermes-session-noperms'` pins
-#     terminal.kubernetes.service_account
-#   * `automountServiceAccountToken == false` pins
-#     terminal.kubernetes.automount_service_account_token
-#   * `runAsNonRoot: true` pins
-#     terminal.kubernetes.security_context.run_as_non_root
+#   * `variables.sa == 'hermes-session-noperms'` pins the hardened base's
+#     serviceAccountName (SESSION_SERVICE_ACCOUNT in
+#     tools/environments/kubernetes.py). A `pod_template` that names a
+#     different SA is DENIED here, and separately loses the approval skip.
+#   * `automountServiceAccountToken == false` and `runAsNonRoot: true` pin the
+#     hardened base; a `pod_template` may relax either, and this policy then
+#     denies the pod (and the hardening judge flags it).
 #
-# On the matchCondition label, precisely: Hermes stamps
-# `app.kubernetes.io/managed-by` as the LAST step of pod-template rendering,
-# after every override layer, and its config validation rejects the key in
-# `labels`, in `pod_template_overrides.metadata.labels` and in
-# `sandbox.spec_overrides.podTemplate.metadata.labels`. So configuration cannot
-# strip it from a pod template Hermes RENDERS. It is NOT strip-proof in general:
-# with `sandbox.template_ref` / `sandbox.use_claim` the pod comes from a
-# SandboxTemplate Hermes never writes, and a compromised agent talking to the
+# On the matchCondition label, precisely: `app.kubernetes.io/managed-by` is put
+# on THE rendered pod template — the single artifact both provisioners submit —
+# and setting the key in `terminal.kubernetes.pod_template.metadata.labels` is a
+# rejected config error. There is no second override layer, and
+# `sandbox.spec.podTemplate` / `sandbox.spec.sandboxTemplateRef` are rejected
+# too, so configuration cannot strip the label from a pod template Hermes
+# renders. It is NOT strip-proof in general: a compromised agent talking to the
 # API server directly is not bound by any of this (see the Honest limitation
 # above). An earlier revision of this file claimed the matchCondition "cannot be
 # configured away" — that claim was false and is retracted.
@@ -49,11 +49,11 @@
 # NOT COVERED: `provisioner: sandbox`. This policy matches pods CREATE, and in
 # sandbox mode the pod is created by agent-sandbox-operator from the Sandbox CR
 # under the operator's identity, so the match conditions may not hold.
-# Constrain the Sandbox CR instead (or stay on provisioner: direct) if you rely
+# Constrain the Sandbox CR instead (or stay on provisioner: pod) if you rely
 # on this policy.
 #
 # CONSEQUENCE OF THE SECRET RULES BELOW: they deny secret-backed ENV as well as
-# secret volumes, so a `pod_template_overrides` block that injects provider API
+# secret volumes, so a `pod_template` block that injects provider API
 # keys into the session container (envFrom.secretRef / valueFrom.secretKeyRef)
 # is DENIED wherever this policy is bound. That is deliberate — the session pod
 # is credential-free by design — but it means "reference the Secret by name"
@@ -125,7 +125,7 @@ spec:
     - expression: "!has(object.spec.hostIPC) || object.spec.hostIPC == false"
       message: "hostIPC is not allowed for session pods"
     # initContainers are included: one added through
-    # terminal.kubernetes.pod_template_overrides otherwise bypassed every
+    # terminal.kubernetes.pod_template otherwise bypassed every
     # container-level floor below while still satisfying the policy.
     - expression: >-
         (object.spec.containers +

@@ -11,7 +11,7 @@
 # Two Role variants ship below. Apply exactly ONE, matching
 # terminal.kubernetes.provisioner:
 #
-#   provisioner: direct   -> hermes-session-exec        (pods + PVCs + exec)
+#   provisioner: pod      -> hermes-session-exec        (pods + PVCs + exec)
 #   provisioner: sandbox  -> hermes-session-sandbox     (sandboxes + exec, NO
 #                            bare pods/create — a meaningful reduction, since
 #                            "create pods in a namespace" is close to
@@ -32,7 +32,7 @@ metadata:
 automountServiceAccountToken: false
 
 ---
-# ── provisioner: direct ──────────────────────────────────────────────────────
+# ── provisioner: pod ─────────────────────────────────────────────────────────
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -96,12 +96,11 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["create", "get", "delete"]
-  # Only needed when terminal.kubernetes.sandbox.use_claim is true.
-  - apiGroups: ["extensions.agents.x-k8s.io"]
-    resources: ["sandboxclaims"]
-    verbs: ["create", "get", "delete"]
-  # NOTE: sandboxtemplates / sandboxwarmpools are deliberately absent — the
-  # backend never reads them; the operator resolves the template reference.
+  # NOTE: sandboxclaims / sandboxtemplates / sandboxwarmpools are deliberately
+  # absent. This backend renders and submits its own podTemplate, so it never
+  # references a SandboxTemplate — a pod it does not render is a pod whose
+  # hardening it cannot establish (sandbox.spec.sandboxTemplateRef is a
+  # rejected config key for exactly that reason).
   # Resolve the reconciled pod (name, readiness, container list) and exec.
   # `list` IS used here (and only here): when the operator's status carries no
   # podRef, _resolve_pod_name falls back to a label selector.
@@ -135,13 +134,14 @@ roleRef:
 
 ---
 # ── OpenShift only: SCC access for session pods ──────────────────────────────
-# With the shipped defaults (security_context.run_as_user: null) session pods
-# satisfy `restricted-v2`, which every authenticated SA already has via
+# The hardened base leaves runAsUser unset, so session pods satisfy
+# `restricted-v2`, which every authenticated SA already has via
 # system:authenticated — so you do NOT need this on OpenShift 4.21.
 #
-# You DO need it if you pin terminal.kubernetes.security_context.run_as_user to
-# a UID outside the namespace's openshift.io/sa.scc.uid-range, or if you set
-# terminal.kubernetes.runtime_class_name to a runtime whose SCC differs. In
+# You DO need it if your terminal.kubernetes.pod_template pins
+# spec.securityContext.runAsUser to a UID outside the namespace's
+# openshift.io/sa.scc.uid-range, or sets spec.runtimeClassName to a runtime
+# whose SCC differs. In
 # that case create a custom SCC and bind `use` on it to the SESSION SA:
 #
 # apiVersion: rbac.authorization.k8s.io/v1

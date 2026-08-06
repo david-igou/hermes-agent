@@ -303,21 +303,13 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
             ("", "pods", "get"),
             exec_check,
         ]
-        if sandbox_cfg.get("use_claim"):
-            # The backend posts SandboxClaims to SandboxProvisioner.CLAIM_GROUP,
-            # a constant that ignores sandbox.api_group — deriving the group
-            # from api_group here probed a group the backend never calls.
-            from tools.environments.kubernetes import SandboxProvisioner
-
-            checks.append((SandboxProvisioner.CLAIM_GROUP, "sandboxclaims",
-                           "create"))
     else:
         checks = [
             ("", "pods", "create"),
             ("", "pods", "delete"),
             exec_check,
         ]
-    if kcfg.get("persistent") and not (sandbox_mode and sandbox_cfg.get("template_ref")):
+    if kcfg.get("persistent"):
         checks.append(("", "persistentvolumeclaims", "create"))
 
     try:
@@ -389,6 +381,88 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
     except Exception as exc:
         check_warn("kubernetes RBAC check skipped", f"({exc})")
 
+    _dry_run_pod_template(kcfg, namespace, core_api, sandbox_mode, issues)
+
+
+def _dry_run_pod_template(kcfg, namespace, core_api, sandbox_mode, issues) -> None:
+    """Ask the API server to validate the user's pod_template, creating nothing.
+
+    ``terminal.kubernetes.pod_template`` is free-form YAML posted verbatim, and
+    the python client DISCARDS the API server's ``Warning: 299 - unknown field``
+    header — so without ``fieldValidation=Strict`` a typo'd
+    ``securityContext.runAsNonroot`` returns 201 and is silently dropped, with
+    nothing logged.  A ``dry_run="All"`` create with Strict makes the server
+    name the exact offending path here, in ``hermes doctor``, instead of at the
+    first session.
+
+    Never fails doctor on a transient API error: only a 400 (the server
+    rejecting the submitted object) is a check_fail.
+    """
+    from tools.environments.kubernetes import (
+        PodProvisioner,
+        Resources,
+        STRICT_FIELD_VALIDATION,
+    )
+
+    try:
+        if sandbox_mode:
+            from tools.environments.kubernetes_sandbox import SandboxProvisioner
+
+            provisioner = SandboxProvisioner(kcfg, namespace, api=core_api)
+            body = provisioner.sandbox_manifest(
+                "doctor", persistent=False,
+                image=str(kcfg.get("image") or ""), resources=Resources(),
+            )
+        else:
+            provisioner = PodProvisioner(kcfg, namespace, api=core_api)
+            body = provisioner.pod_manifest(
+                "doctor", persistent=False,
+                image=str(kcfg.get("image") or ""), resources=Resources(),
+            )
+    except Exception as exc:
+        _fail_and_issue(
+            "kubernetes pod template unrenderable", f"({exc})",
+            "Fix terminal.kubernetes.pod_template in config.yaml", issues,
+        )
+        return
+
+    # Imported OUTSIDE the try: naming ApiException in an except clause whose
+    # import lives inside the same try turns a missing SDK into a NameError.
+    from kubernetes import client as k8s_client
+    from kubernetes.client.exceptions import ApiException
+
+    try:
+        if sandbox_mode:
+            sb = kcfg.get("sandbox") or {}
+            k8s_client.CustomObjectsApi(core_api.api_client).create_namespaced_custom_object(
+                group=str(sb.get("api_group") or "agents.x-k8s.io"),
+                version=str(sb.get("api_version") or "v1beta1"),
+                namespace=namespace, plural="sandboxes", body=body,
+                dry_run="All", **STRICT_FIELD_VALIDATION,
+            )
+        else:
+            core_api.create_namespaced_pod(
+                namespace=namespace, body=body,
+                dry_run="All", **STRICT_FIELD_VALIDATION,
+            )
+    except ApiException as exc:
+        if exc.status == 400:
+            _fail_and_issue(
+                "kubernetes pod template rejected by the API server",
+                f"({getattr(exc, 'body', None) or exc.reason})",
+                "Fix the field the API server names in "
+                "terminal.kubernetes.pod_template",
+                issues,
+            )
+        else:
+            check_warn("kubernetes pod template dry-run skipped",
+                       f"({exc.status} {exc.reason})")
+    except Exception as exc:
+        check_warn("kubernetes pod template dry-run skipped", f"({exc})")
+    else:
+        check_ok("kubernetes pod template",
+                 "(accepted by the API server with fieldValidation=Strict)")
+
 
 def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None:
     """Emit a check_fail and append the corresponding fix instruction."""
@@ -430,10 +504,10 @@ _DEPRECATED_ENV_VARS: tuple[tuple[str, str], ...] = (
     # diagnosis instead of silence — none of them are read by this fork.
     ("TERMINAL_KUBERNETES_NAMESPACE", "terminal.kubernetes.namespace in config.yaml — ignored"),
     ("TERMINAL_KUBERNETES_IMAGE", "terminal.kubernetes.image in config.yaml — ignored"),
-    ("TERMINAL_KUBERNETES_POD_SA", "terminal.kubernetes.service_account in config.yaml — ignored"),
+    ("TERMINAL_KUBERNETES_POD_SA", "terminal.kubernetes.pod_template.spec.serviceAccountName in config.yaml — ignored"),
     ("TERMINAL_KUBERNETES_PERSISTENT", "terminal.kubernetes.persistent in config.yaml — ignored"),
     ("TERMINAL_KUBERNETES_ACTIVE_DEADLINE_SECONDS", "terminal.kubernetes.active_deadline_seconds in config.yaml — ignored"),
-    ("TERMINAL_KUBERNETES_PULL_SECRETS", "terminal.kubernetes.image_pull_secrets in config.yaml — ignored"),
+    ("TERMINAL_KUBERNETES_PULL_SECRETS", "terminal.kubernetes.pod_template.spec.imagePullSecrets in config.yaml — ignored"),
 )
 
 

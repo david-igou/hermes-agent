@@ -31,7 +31,7 @@ See `cli-config.yaml.example` (OPTION 7) for the full annotated block, or run `h
 ```bash
 # 1. Edit rbac.yaml: replace <AGENT_NAMESPACE> and <AGENT_SA>.
 #    Apply the Role matching terminal.kubernetes.provisioner:
-#      direct  -> hermes-session-exec
+#      pod     -> hermes-session-exec
 #      sandbox -> hermes-session-sandbox
 kubectl apply -f rbac.yaml
 
@@ -51,7 +51,7 @@ Manual equivalent:
 
 ```bash
 SA=system:serviceaccount:<AGENT_NAMESPACE>:<AGENT_SA>
-# provisioner: direct
+# provisioner: pod
 kubectl auth can-i create pods        --as=$SA -n <AGENT_NAMESPACE>   # yes
 kubectl auth can-i get    pods/exec   --as=$SA -n <AGENT_NAMESPACE>   # yes  <- the one that matters
 # provisioner: sandbox — `create pods` must be NO; the operator owns the pod
@@ -88,27 +88,43 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
 
 ## OpenShift 4.21 notes
 
-* **Do not pin `security_context.run_as_user`.** `restricted-v2` uses `runAsUser: MustRunAsRange` with the range from the namespace's `openshift.io/sa.scc.uid-range` annotation, so a hard-coded `1000` is rejected outright (`must be in the ranges: [1000700000, 1000709999]`). The shipped default leaves `run_as_user`/`fs_group` unset so SCC assigns both. Set them only on vanilla Kubernetes, where `runAsNonRoot` needs a concrete UID to schedule a root-default image.
-* **Set resource limits.** A namespace `ResourceQuota` covering `limits.cpu`/`limits.memory` rejects a requests-only pod. Use `terminal.kubernetes.resources.limits`.
-* **Sandboxed containers (kata).** Set `terminal.kubernetes.runtime_class_name: kata` and raise `ready_timeout_seconds` — kata cold starts routinely exceed the 120s default.
+* **Do not pin `runAsUser`.** `restricted-v2` uses `runAsUser: MustRunAsRange` with the range from the namespace's `openshift.io/sa.scc.uid-range` annotation, so a hard-coded `1000` is rejected outright (`must be in the ranges: [1000700000, 1000709999]`). The hardened base leaves `runAsUser`/`fsGroup` unset so SCC assigns both. Set `pod_template.spec.securityContext.runAsUser` only on vanilla Kubernetes, where `runAsNonRoot` needs a concrete UID to schedule a root-default image.
+* **Set resource limits.** A namespace `ResourceQuota` covering `limits.cpu`/`limits.memory` rejects a requests-only pod. Set them on the `workspace` container in `terminal.kubernetes.pod_template` (it merges onto the base by `name`).
+* **Sandboxed containers (kata).** Set `terminal.kubernetes.pod_template.spec.runtimeClassName: kata` and raise `ready_timeout_seconds` — kata cold starts routinely exceed the 120s default.
 * **SCC RBAC is usually unnecessary.** With the shipped defaults the session SA satisfies `restricted-v2`, which every authenticated SA already has. The commented block at the bottom of `rbac.yaml` covers the case where you pin a UID or need a custom SCC.
 
 ## Provisioners
 
-`terminal.kubernetes.provisioner` selects how the workspace is created. Both produce a pod that Hermes exec's into, and both build the same pod template from the same `terminal.kubernetes.*` keys, so switching is a one-line change.
+`terminal.kubernetes.provisioner` selects which Kubernetes API creates the workspace. Both exec into a pod, and both consume the **identical** rendered pod template — the `Sandbox` CRD is itself `spec.podTemplate.spec` — so switching is a one-line change that cannot alter the workload shape.
 
-* **`direct`** (default) — a raw `Pod` (plus a `PersistentVolumeClaim` when `persistent: true`) via the core API.
-* **`sandbox`** — a `Sandbox` custom resource (`agents.x-k8s.io/v1beta1`) reconciled by [agent-sandbox-operator](https://github.com/kubernetes-sigs/agent-sandbox) v0.9.0+. Optionally a `SandboxClaim` (`extensions.agents.x-k8s.io/v1beta1`) against a `SandboxTemplate`, so a `SandboxWarmPool` can hand back a pre-warmed pod: set `sandbox.use_claim: true` and `sandbox.template_ref`.
+* **`pod`** (default) — a raw `Pod` (plus a `PersistentVolumeClaim` when `persistent: true`) via the core API.
+* **`sandbox`** — a `Sandbox` custom resource (`agents.x-k8s.io/v1beta1`) reconciled by [agent-sandbox-operator](https://github.com/kubernetes-sigs/agent-sandbox) v0.9.0+.
 
   Security upside: the agent SA needs `sandboxes` create/delete but **not** bare `pods` create/delete.
 
-  When `sandbox.template_ref` is set, the operator's template supplies the pod shape and the shared pod-shape keys (`image`, `security_context`, `resources`, …) are not sent.
+  `terminal.kubernetes.sandbox.spec` is the `Sandbox` **spec** (`ttlSeconds`, `networkPolicy`, …). Two keys in it are **rejected** by config validation:
 
-  **Two consequences of that, stated plainly.** Hermes neither writes nor reads the SandboxTemplate, so (a) it cannot vouch for the pod's hardening — `template_ref`/`use_claim` therefore always keep the dangerous-command approval prompts on, and `hermes doctor` says so; and (b) the pod carries `app.kubernetes.io/managed-by: hermes-agent` only if your template sets it, and without that label **neither NetworkPolicy in `networkpolicy.yaml` applies**. Put the label in the template's pod metadata.
+  * `podTemplate` — the provisioner assigns the one rendered template here. A second source is precisely how the object that was security-checked comes to differ from the object that was submitted.
+  * `sandboxTemplateRef` — a `SandboxTemplate` makes the operator author a pod this backend never renders, so its hardening cannot be established and the managed-by label the NetworkPolicy selects on would be present only if the template happened to set it. There is deliberately no config key for it.
 
-  `sandbox.spec_overrides` is a strategic-merge patch on the `Sandbox` **spec**. Its `podTemplate` key is a declared pod-template override layer: rendered by the same builder, judged by the same hardening evaluator, with the managed-by label re-stamped after it. Its `sandboxTemplateRef` key is **rejected** by config validation — use `sandbox.template_ref`, which the hardening evaluator understands — and if one reaches the evaluator anyway it is treated as unjudgeable, i.e. not a throwaway sandbox.
+  Scope of that claim, precisely: it covers the pod shape **this backend renders**, which under this schema is every pod it creates. It does not cover anything a compromised agent does by calling the Kubernetes API directly with its own credentials. That is bounded by RBAC, the ValidatingAdmissionPolicy and NetworkPolicy — not by this backend.
 
-  Scope of that claim, precisely: it covers the pod shape **this backend renders**. It does not and cannot cover a pod built from a `SandboxTemplate` (see above), nor anything a compromised agent does by calling the Kubernetes API directly with its own credentials. Those are bounded by RBAC, the ValidatingAdmissionPolicy and NetworkPolicy — not by this backend.
+## Pod shape
+
+`terminal.kubernetes.pod_template` is the ONE user layer: a `PodTemplateSpec` merged over a hardened base by a documented Hermes merge rule (mappings merge; lists replace, except `spec.containers` / `spec.initContainers` / `spec.volumes` keyed by `name` and their `volumeMounts` keyed by `mountPath` — the keys the API server itself uses). `render_pod_template()` produces exactly one artifact, nothing runs after it, and `unhardened_reasons()` judges that same call.
+
+Hermes owns the fields that make exec possible and **rejects** a template that sets them, with the exact dotted path — it does not silently overwrite them:
+
+| Reserved | Why |
+| --- | --- |
+| `metadata.labels['app.kubernetes.io/managed-by']` | the selector `networkpolicy.yaml`, `validatingadmissionpolicy.yaml` and session-pod adoption all match on |
+| `spec.restartPolicy` | pinned `Never`; a restart swaps the container out from under an open exec session |
+| a `spec.containers` list omitting `container_name` | Hermes execs into that container |
+| that container's `command` | pinned `["sleep","infinity"]` so the pod outlives the session |
+| that container's `volumeMounts[mountPath=<mount_path>]` | the workspace mount `terminal.cwd` resolves against |
+| `spec.volumes[name=workspace]` | built from `persistent` and `volume.*` |
+
+Everything else in the `PodSpec` is yours. Every create this backend issues passes `fieldValidation=Strict`, so an unknown or duplicated field is a `400` naming the path rather than a silent drop (the python client discards the API server's `Warning: 299 - unknown field` header, which makes the default `Warn` behaviour indistinguishable from success). `hermes doctor` submits your rendered pod as a `dry_run=All` create for the same reason.
 
 ## Workspace persistence
 
@@ -135,7 +151,7 @@ Persistent sessions also keep the dangerous-command approval prompts on (see `to
 
 Stated plainly, because the upstream sample overclaimed here:
 
-* The ValidatingAdmissionPolicy hooks on a label the pod creator chooses. Hermes *configuration* cannot strip it (the label is stamped after the last override layer and the key is reserved on every layer), but a fully compromised agent talking to the API server directly could omit it, and a `sandbox.template_ref` pod carries it only if the template does. The containment boundary is the RBAC grant (and SCC on OpenShift), not the policy.
+* The ValidatingAdmissionPolicy hooks on a label the pod creator chooses. Hermes *configuration* cannot strip it — the label is on THE rendered template, setting the key in `pod_template.metadata.labels` is a rejected config error, and there is no second override layer nor any operator-authored-pod mode left — but a fully compromised agent talking to the API server directly could omit it. The containment boundary is the RBAC grant (and SCC on OpenShift), not the policy.
 * The policy also denies secret-backed env (`envFrom.secretRef`, `valueFrom.secretKeyRef`), not only secret volumes — so injecting provider API keys into the session pod is denied wherever it is bound. Deliberate; see the file header if you need to relax it.
 * `create pods` in a namespace remains a powerful verb. The policy narrows *shape*; it does not make the grant harmless. Run Hermes in a dedicated namespace with nothing else in it.
 * Session pods share the cluster network unless `networkpolicy.yaml` is applied.
