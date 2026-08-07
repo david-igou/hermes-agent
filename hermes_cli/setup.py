@@ -1641,7 +1641,8 @@ def setup_terminal_backend(config: dict):
             "  Everything else about the pod (runtimeClassName for kata, "
             "nodeSelector, tolerations, resources, extra volumes, "
             "securityContext) goes in terminal.kubernetes.pod_template — one "
-            "PodTemplateSpec merged over a hardened base. Edit config.yaml "
+            "PodTemplateSpec merged over a default base (RFC 7386 semantics). "
+            "Edit config.yaml "
             "directly; see cli-config.yaml.example (OPTION 7)."
         )
         print_info(

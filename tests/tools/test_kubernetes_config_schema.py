@@ -290,6 +290,68 @@ def test_the_migration_deletes_the_hard_cut_keys_and_renames_the_provisioner():
     assert validate_kubernetes_config(merge_kubernetes_config(kube)) == []
 
 
+def test_the_approval_skip_migration_writes_the_key_explicitly():
+    """v34 -> v35: the dangerous-command approval skip stopped being inferred
+    from the rendered pod and became `terminal.kubernetes.trusted_sandbox`.
+
+    The migration writes it EXPLICITLY as false rather than leaving it to the
+    default, so a config that used to earn the skip loses it visibly — with a
+    warning naming the key — instead of silently."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.config_migrations import _migrate_to_35
+
+    on_disk = {"terminal": {"kubernetes": {"namespace": "hermes-agents"}}}
+    written = {}
+    saved = (config_mod.read_raw_config, config_mod._persist_migration)
+    try:
+        config_mod.read_raw_config = lambda: on_disk
+        config_mod._persist_migration = lambda cfg: written.update(cfg)
+        results = {"config_added": [], "warnings": []}
+        _migrate_to_35(results, quiet=True)
+    finally:
+        config_mod.read_raw_config, config_mod._persist_migration = saved
+
+    assert written["terminal"]["kubernetes"]["trusted_sandbox"] is False
+    assert any("trusted_sandbox" in w for w in results["warnings"]), results
+
+    from tools.environments.kubernetes import (
+        merge_kubernetes_config,
+        validate_kubernetes_config,
+    )
+
+    assert validate_kubernetes_config(
+        merge_kubernetes_config(written["terminal"]["kubernetes"])
+    ) == []
+
+
+def test_the_approval_skip_migration_never_overwrites_an_explicit_choice():
+    """An operator who already opted in keeps the skip."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.config_migrations import _migrate_to_35
+
+    on_disk = {"terminal": {"kubernetes": {"trusted_sandbox": True}}}
+    written = {}
+    saved = (config_mod.read_raw_config, config_mod._persist_migration)
+    try:
+        config_mod.read_raw_config = lambda: on_disk
+        config_mod._persist_migration = lambda cfg: written.update(cfg)
+        _migrate_to_35({"config_added": [], "warnings": []}, quiet=True)
+    finally:
+        config_mod.read_raw_config, config_mod._persist_migration = saved
+
+    assert written == {}, "migration rewrote an explicit trusted_sandbox"
+
+
+def test_trusted_sandbox_is_config_set_surface():
+    """It is a scalar the operator has to be able to flip from the CLI."""
+    from hermes_cli.config import _validate_config_key
+
+    is_known, suggestion = _validate_config_key(
+        "terminal.kubernetes.trusted_sandbox"
+    )
+    assert is_known, suggestion
+
+
 def test_deprecated_upstream_env_vars_are_diagnosed():
     """Anyone who copied PR #37591's .env.example block should get a diagnosis
     from `hermes doctor`, not silence."""
@@ -358,7 +420,7 @@ def test_backend_modules_import_without_the_kubernetes_sdk():
             resources=k8s.Resources(), pvc_name="pvc",
         )
         assert template["spec"]["containers"][0]["image"] == "i:1"
-        assert k8s.unhardened_reasons(k8s.merge_kubernetes_config({})) == []
+        assert k8s.validate_kubernetes_config(k8s.merge_kubernetes_config({})) == []
     finally:
         builtins.__import__ = real_import
         for name in modules:

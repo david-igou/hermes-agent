@@ -448,19 +448,21 @@ terminal:
       spec:
         runtimeClassName: kata     # OpenShift sandboxed containers
         containers:
-          - name: workspace        # merged onto the hardened base by `name`
+          - name: workspace        # merged onto the default base by `name`
             resources:
               requests: {cpu: "500m", memory: "2Gi"}
               limits:   {cpu: "2",    memory: "4Gi"}
 ```
 
-The schema models only what the backend has to reason about — object placement, cluster auth, the exec target, workspace lifetime. Everything else is plain `PodSpec` and lives in **`pod_template`**, a single `PodTemplateSpec` merged over a hardened base. One artifact is rendered, submitted, and security-checked, so the object that was validated cannot drift from the object that was submitted. `cli-config.yaml.example` (OPTION 7) documents the full key set.
+The schema models only what the backend has to reason about — object placement, cluster auth, the exec target, workspace lifetime. Everything else is plain `PodSpec` and lives in **`pod_template`**, a single `PodTemplateSpec` merged over a **default** base. `cli-config.yaml.example` (OPTION 7) documents the full key set.
 
-**Merge rule for `pod_template`:** mappings merge recursively; lists replace wholesale, except `spec.containers`, `spec.initContainers` and `spec.volumes` (merged element-wise on `name`) and their `volumeMounts` (merged on `mountPath`) — the keys the API server itself uses. An element whose key is absent from the base is appended. This is a documented Hermes merge rule, not a strategic-merge patch.
+**Merge rule for `pod_template`:** JSON merge patch, [RFC 7386](https://www.rfc-editor.org/rfc/rfc7386) — mappings merge recursively, a `null` removes the key it names, and lists replace wholesale (`volumes`, `volumeMounts`, `env`, `tolerations`, `imagePullSecrets`, `ports`, all of them). The one exception is `spec.containers` and `spec.initContainers`, which merge element-wise on `name` so you can set `resources` on the workspace container without restating its image, command and mounts. A container the base does not declare is appended.
 
-**Reserved fields:** Hermes owns the fields that make exec possible, and a config that sets one is **rejected with the exact dotted path** rather than silently overwritten: the managed-by label (`pod_template.metadata.labels['app.kubernetes.io/managed-by']`), `pod_template.metadata.ownerReferences`, `spec.restartPolicy`, a `spec.containers` list that omits `container_name`, that container's `command` **and `args`** (the kubelet builds the process as `command + args`, so either one can make the session container exit), its workspace `volumeMounts` entry at `mount_path`, the `workspace` volume, and — in sandbox mode — `sandbox.spec.podTemplate` and `sandbox.spec.sandboxTemplateRef`. Everything else in the `PodSpec` stays yours.
+**Nothing is reserved.** The base is a set of defaults that make the out-of-box config produce a working pod, not a constraint: a `pod_template` may override any field in it, including the exec container's `command`, `args`, `restartPolicy`, `volumeMounts` and `securityContext`. If the result cannot serve exec, that fails visibly at the first command. The one value Hermes stamps after the merge is the `app.kubernetes.io/managed-by: hermes-agent` label, which is how it finds and adopts its own session pods and what the shipped NetworkPolicy selects on.
 
-**Unknown keys are rejected too:** anything under `terminal.kubernetes.*` that is not in the schema fails validation by name, including every key the collapse deleted — each of those gets a message pointing at the `pod_template` path that carries its shape now. Accepting them would make the cut a silent no-op: a deleted hardening key would simply stop applying, with nothing logged. `pod_template` and `sandbox.spec` are free-form and stay open by construction.
+**Validation is the cluster's job.** Hermes checks the `provisioner` enum and the handful of types needed to build a request at all; what a session pod may be is decided by SCC, Pod Security Admission, `ValidatingAdmissionPolicy`, NetworkPolicy and RBAC, which the cluster administrator owns.
+
+**Approval prompts:** Hermes' dangerous-command guards stay on for this backend unless you set `terminal.kubernetes.trusted_sandbox: true`. That is a declaration by the operator, not something Hermes infers by inspecting the pod.
 
 **Strict field validation:** every create this backend issues passes `fieldValidation=Strict`. Without it, an unknown field such as `securityContext.runAsNonroot` is accepted with HTTP 201 and silently dropped, and the Python client discards the API server's `Warning: 299 - unknown field` header, so nothing is logged. `hermes doctor` additionally submits your rendered pod as a `dry_run=All` create, so a typo is named by the API server there rather than at the first session.
 
@@ -476,7 +478,7 @@ There is no lazy install for this backend: the terminal tool stays disabled unti
 
 **Authentication:** in-cluster ServiceAccount first, then `terminal.kubernetes.kubeconfig`, then the ambient `KUBECONFIG` / `~/.kube/config` for out-of-cluster development.
 
-**Approval guards:** the dangerous-command prompts are skipped only while the *rendered* pod is a throwaway sandbox — ephemeral, non-root, drop-ALL, no privilege escalation, no ServiceAccount token, an emptyDir workspace and the no-perms ServiceAccount. Setting `persistent: true` or relaxing any of that through `pod_template` puts the guards back on, and so does a `pod_template` that cannot be rendered at all; `hermes doctor` reports which applies.
+**Approval guards:** the dangerous-command prompts stay on unless you set `terminal.kubernetes.trusted_sandbox: true`. That is a declaration by the operator, not something Hermes derives by inspecting the pod — whether a session pod is contained is decided by SCC, Pod Security Admission, your `ValidatingAdmissionPolicy` and your NetworkPolicy, none of which Hermes can see. `hermes doctor` reports which way it is set.
 
 **Credential files:** the session pod is an execution boundary, not a secrets boundary — registered credential files and skills are synced into it on session start (as with the Modal/Daytona backends). The sync streams over the exec stdin channel, never through exec argv, because exec request URLs land in the API-server audit log.
 

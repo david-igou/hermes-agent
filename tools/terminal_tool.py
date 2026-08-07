@@ -377,42 +377,27 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _kubernetes_has_host_access(config: Dict[str, Any]) -> bool:
-    """Return True when a Kubernetes session pod is NOT a throwaway sandbox.
+    """Return True when Hermes must keep its dangerous-command guards on.
 
-    An ephemeral pod with an emptyDir workspace, no host namespaces, drop-ALL
-    caps, non-root and no ServiceAccount token is genuinely isolated and can
-    skip the approval layer the way Docker-without-bind-mounts does.
+    DECLARED, never inferred. ``terminal.kubernetes.trusted_sandbox`` is the
+    operator's statement that this backend's session pods are disposable enough
+    to skip the approval prompts; the negation of that key is the whole answer,
+    and nothing about the rendered pod is inspected.
 
-    The verdict is derived from THE RENDERED pod template — the same single
-    artifact both provisioners submit — not from a hand-picked subset of config
-    keys: ``pod_template`` can re-grant root, privilege escalation,
-    capabilities, a privileged ServiceAccount or a mounted token without
-    touching any key a key-level heuristic would look at.  Anything that is not
-    fully hardened keeps the guards, and an unreadable config (including a
-    ``pod_template`` that claims a reserved field and therefore cannot be
-    rendered) fails closed.
+    Hermes used to read the pod back and grade it — securityContext, volume
+    types, host namespaces, the ServiceAccount, secret-backed env. That was an
+    in-process approximation of admission control, and whether a pod is
+    contained is decided by SCC, Pod Security Admission,
+    ValidatingAdmissionPolicy, NetworkPolicy and RBAC, which the cluster
+    administrator owns and Hermes cannot see. An approximation that disagrees
+    with them is worse than no answer, so the operator states the answer.
+
+    Defaults to False, i.e. the guards stay ON until someone opts out.
     """
-    kcfg = config.get("kubernetes") or {}
-    try:
-        from tools.environments.kubernetes import (
-            merge_kubernetes_config,
-            unhardened_reasons,
-        )
-
-        reasons = unhardened_reasons(merge_kubernetes_config(kcfg))
-    except Exception as exc:  # fail closed — keep the guards
-        logger.warning(
-            "kubernetes: could not evaluate session-pod hardening (%s); "
-            "keeping the dangerous-command guards enabled", exc,
-        )
+    kcfg = config.get("kubernetes")
+    if not isinstance(kcfg, dict):
         return True
-    if reasons:
-        logger.debug(
-            "kubernetes: session pod is not a throwaway sandbox (%s); "
-            "dangerous-command guards stay enabled", "; ".join(reasons),
-        )
-        return True
-    return False
+    return not bool(kcfg.get("trusted_sandbox"))
 
 
 def _check_all_guards(command: str, env_type: str,

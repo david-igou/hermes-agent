@@ -343,33 +343,25 @@ terminal:
 # -----------------------------------------------------------------------------
 # The schema models only what the BACKEND has to reason about. Everything that
 # is merely PodSpec lives in ONE `pod_template` PodTemplateSpec merged over a
-# hardened base, so exactly one artifact is rendered, submitted and
-# security-checked. Layered overrides are what let the object you validated
-# drift from the object you submit.
+# DEFAULT base — defaults that make the out-of-box config produce a working
+# pod, NOT constraints. Nothing is reserved: a pod_template may override any
+# field, including the exec container's command, args, restartPolicy,
+# volumeMounts and securityContext.
 #
-# Merge rule for pod_template: mappings merge recursively; lists REPLACE
-# wholesale, except spec.containers / spec.initContainers / spec.volumes
-# (merged element-wise on `name`) and their volumeMounts (merged on
-# `mountPath`) — the keys the API server itself uses. An element whose key is
-# absent from the base is appended.
+# Merge rule for pod_template: JSON merge patch, RFC 7386 — mappings merge
+# recursively, a `null` REMOVES the key it names, and lists REPLACE wholesale
+# (volumes, volumeMounts, env, tolerations, imagePullSecrets, ports, all of
+# them). The ONE exception is spec.containers / spec.initContainers, which
+# merge element-wise on `name` so you can set `resources` on the workspace
+# container without restating its image, command and mounts. A container the
+# base does not declare is appended.
 #
-# Reserved — setting any of these is a CONFIG ERROR, not a silent overwrite:
-#   pod_template.metadata.labels['app.kubernetes.io/managed-by']
-#       the selector k8s/networkpolicy.yaml, k8s/validatingadmissionpolicy.yaml
-#       and session-pod adoption all match on
-#   pod_template.spec.restartPolicy
-#       pinned to Never; a restart swaps the container out from under an open
-#       exec session
-#   pod_template.spec.containers  ...must declare `container_name`
-#   pod_template.spec.containers[name=<container_name>].command
-#       pinned to ["sleep","infinity"] so the pod outlives the session
-#   pod_template.spec.containers[name=<container_name>].volumeMounts[mountPath=<mount_path>]
-#       the workspace mount terminal.cwd resolves against
-#   pod_template.spec.volumes[name=workspace]
-#       built from `persistent` and `volume.*`
-#   sandbox.spec.podTemplate  /  sandbox.spec.sandboxTemplateRef
-#       a second pod-template source, or an operator-authored pod this backend
-#       never renders and therefore cannot evaluate
+# Validating and constraining the POD is the cluster's job, not Hermes'. Every
+# create this backend issues passes fieldValidation=Strict, so a malformed or
+# unknown field is a 400 naming the exact JSON path; what a session pod is
+# ALLOWED to be is decided by SCC, Pod Security Admission, your
+# ValidatingAdmissionPolicy, NetworkPolicy and RBAC. A pod that cannot serve
+# exec fails at the first command — visibly, which is the point.
 #
 # terminal:
 #   backend: "kubernetes"
@@ -385,25 +377,33 @@ terminal:
 #     context: ""
 #
 #     image: "nikolaik/python-nodejs:python3.11-nodejs20"
-#     container_name: "workspace"  # the container built AND exec'd into; a
-#                                  # pod_template that omits it is REJECTED
+#     container_name: "workspace"  # the container Hermes execs into, and the
+#                                  # one the default base builds. Rename it
+#                                  # here if a pod_template renames it.
 #     mount_path: "/workspace"     # workspace mount, and the session's cwd
 #
-#     pod_template: {}             # PodTemplateSpec merged over the hardened
+#     pod_template: {}             # PodTemplateSpec merged over the default
 #                                  # base (see the merge rule above). This is
 #                                  # where runtimeClassName, nodeSelector,
 #                                  # tolerations, resources, imagePullPolicy,
 #                                  # imagePullSecrets, env, labels, annotations
-#                                  # and securityContext now live.
+#                                  # and securityContext live.
 #                                  # NOTE: referencing a Secret from the session
 #                                  # container (envFrom.secretRef /
 #                                  # env[].valueFrom.secretKeyRef) is DENIED by
-#                                  # the shipped k8s/validatingadmissionpolicy.yaml
-#                                  # and also marks the pod as not-a-throwaway-
-#                                  # sandbox (dangerous-command prompts stay on).
+#                                  # the shipped k8s/validatingadmissionpolicy.yaml.
 #                                  # The session container is meant to hold no
 #                                  # credentials; if you must, relax the policy
 #                                  # deliberately — see that file's header.
+#
+#     trusted_sandbox: false       # DECLARE that these session pods are
+#                                  # disposable enough to skip Hermes'
+#                                  # dangerous-command approval prompts. Hermes
+#                                  # does not infer this from the pod: what
+#                                  # contains a pod is SCC / Pod Security
+#                                  # Admission / admission policy / NetworkPolicy,
+#                                  # which Hermes cannot see. Leave false unless
+#                                  # you have locked the namespace down.
 #
 #     persistent: false            # opt-in retained PVC per task; NOT inherited
 #                                  # from container_persistent
@@ -424,17 +424,11 @@ terminal:
 #     sandbox:                     # only read when provisioner: sandbox
 #       api_group: "agents.x-k8s.io"
 #       api_version: "v1beta1"
-#       spec: {}                   # Sandbox CR spec, submitted VERBATIM.
-#                                  # podTemplate is injected from pod_template
-#                                  # above and is reserved; so is
-#                                  # sandboxTemplateRef (an operator-authored
-#                                  # pod this backend never renders). Hermes has
-#                                  # reviewed ttlSeconds only — any OTHER key
-#                                  # here is submitted but cannot be evaluated,
-#                                  # so it marks the pod as not-a-throwaway-
-#                                  # sandbox and the dangerous-command prompts
-#                                  # stay on. That is deliberate: unknown is not
-#                                  # hardened.
+#       spec: {}                   # Sandbox CR spec, submitted VERBATIM for the
+#                                  # CRD's own schema to validate under
+#                                  # fieldValidation=Strict. podTemplate is
+#                                  # injected from pod_template above, so a
+#                                  # podTemplate written here is overwritten.
 #
 # Minimal OpenShift 4.21 + kata example — note that runtimeClassName and
 # resources are plain PodSpec, so they go in pod_template:
@@ -447,7 +441,7 @@ terminal:
 #       spec:
 #         runtimeClassName: "kata"
 #         containers:
-#           - name: "workspace"    # merged by `name` onto the hardened base
+#           - name: "workspace"    # merged by `name` onto the default base
 #             resources:
 #               requests: {cpu: "500m", memory: "2Gi"}
 #               limits:   {cpu: "2",    memory: "4Gi"}

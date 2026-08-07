@@ -134,7 +134,7 @@ roleRef:
 
 ---
 # ── OpenShift only: SCC access for session pods ──────────────────────────────
-# The hardened base leaves runAsUser unset, so session pods satisfy
+# The default base leaves runAsUser unset, so session pods satisfy
 # `restricted-v2`, which every authenticated SA already has via
 # system:authenticated — so you do NOT need this on OpenShift 4.21.
 #

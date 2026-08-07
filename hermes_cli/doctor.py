@@ -312,23 +312,20 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
     if kcfg.get("persistent"):
         checks.append(("", "persistentvolumeclaims", "create"))
 
-    try:
-        from tools.environments.kubernetes import unhardened_reasons
-
-        reasons = unhardened_reasons(kcfg)
-    except Exception as exc:  # pragma: no cover - defensive
-        reasons = [f"could not evaluate ({exc})"]
-    if reasons:
+    # Declared, not inferred: Hermes does not grade the pod it renders. What a
+    # session pod may be is decided by SCC / Pod Security Admission /
+    # ValidatingAdmissionPolicy / NetworkPolicy, which the cluster admin owns.
+    if kcfg.get("trusted_sandbox"):
         check_warn(
-            "kubernetes session pod is not a throwaway sandbox",
-            f"({'; '.join(reasons[:3])})",
-        )
-        check_info(
-            "dangerous-command approval guards stay ENABLED for this backend"
+            "kubernetes trusted_sandbox: true",
+            "(dangerous-command approval guards are DISABLED for this backend "
+            "— the cluster's admission policy is the only control)",
         )
     else:
-        check_ok("kubernetes session pod hardening",
-                 "(ephemeral, non-root, drop-ALL, no token)")
+        check_info(
+            "dangerous-command approval guards stay ENABLED for this backend "
+            "(set terminal.kubernetes.trusted_sandbox: true to opt out)"
+        )
 
     try:
         from kubernetes import client as k8s_client

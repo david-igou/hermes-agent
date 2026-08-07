@@ -88,7 +88,7 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
 
 ## OpenShift 4.21 notes
 
-* **Do not pin `runAsUser`.** `restricted-v2` uses `runAsUser: MustRunAsRange` with the range from the namespace's `openshift.io/sa.scc.uid-range` annotation, so a hard-coded `1000` is rejected outright (`must be in the ranges: [1000700000, 1000709999]`). The hardened base leaves `runAsUser`/`fsGroup` unset so SCC assigns both. Set `pod_template.spec.securityContext.runAsUser` only on vanilla Kubernetes, where `runAsNonRoot` needs a concrete UID to schedule a root-default image.
+* **Do not pin `runAsUser`.** `restricted-v2` uses `runAsUser: MustRunAsRange` with the range from the namespace's `openshift.io/sa.scc.uid-range` annotation, so a hard-coded `1000` is rejected outright (`must be in the ranges: [1000700000, 1000709999]`). The default base leaves `runAsUser`/`fsGroup` unset so SCC assigns both. Set `pod_template.spec.securityContext.runAsUser` only on vanilla Kubernetes, where `runAsNonRoot` needs a concrete UID to schedule a root-default image.
 * **Set resource limits.** A namespace `ResourceQuota` covering `limits.cpu`/`limits.memory` rejects a requests-only pod. Set them on the `workspace` container in `terminal.kubernetes.pod_template` (it merges onto the base by `name`).
 * **Sandboxed containers (kata).** Set `terminal.kubernetes.pod_template.spec.runtimeClassName: kata` and raise `ready_timeout_seconds` — kata cold starts routinely exceed the 120s default.
 * **SCC RBAC is usually unnecessary.** With the shipped defaults the session SA satisfies `restricted-v2`, which every authenticated SA already has. The commented block at the bottom of `rbac.yaml` covers the case where you pin a UID or need a custom SCC.
@@ -102,38 +102,40 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
 
   Security upside: the agent SA needs `sandboxes` create/delete but **not** bare `pods` create/delete.
 
-  `terminal.kubernetes.sandbox.spec` is the `Sandbox` **spec**, and on this path it — not just the pod template — is the artifact submitted to the API server. Two keys in it are **rejected** by config validation, and by `sandbox_manifest()` itself so an unvalidated config cannot post them either:
+  `terminal.kubernetes.sandbox.spec` is the `Sandbox` **spec**, and on this path it — not just the pod template — is the artifact submitted to the API server. It is submitted **verbatim**, for the CRD's own schema to validate under `fieldValidation=Strict`. The one key that is not yours is `podTemplate`: the provisioner assigns the rendered template there, so anything you write under it is overwritten.
 
-  * `podTemplate` — the provisioner assigns the one rendered template here. A second source is precisely how the object that was security-checked comes to differ from the object that was submitted.
-  * `sandboxTemplateRef` — a `SandboxTemplate` makes the operator author a pod this backend never renders, so its hardening cannot be established and the managed-by label the NetworkPolicy selects on would be present only if the template happened to set it. There is deliberately no config key for it.
-
-  Every **other** key you put in `sandbox.spec` is submitted verbatim. Hermes has reviewed `ttlSeconds` only (it can only shorten the workspace's life), so anything else counts as *unreviewed* and `unhardened_reasons()` reports it: the pod stops qualifying as a throwaway sandbox and the dangerous-command approval prompts stay on. That is the deliberate trade — a CRD is extensible by design and its coordinates (`sandbox.api_group` / `api_version`) are themselves user config, so a two-name denylist cannot be complete. Unknown is not hardened, and it costs the approval skip rather than passing invisibly.
-
-  On this path the ValidatingAdmissionPolicy in this directory does **not** apply: it matches `pods` CREATE, and the pod is created by agent-sandbox-operator from the CR under the operator's own identity. The same is true of OpenShift SCC admission, which is evaluated against the identity that submits the pod — the operator's ServiceAccount, which is typically not `restricted-v2`. So on `provisioner: sandbox` the in-process judge is the only control on `hostPath` / `hostNetwork` / `hostPID` / `privileged` / drop-ALL / secret-backed env, and the judge does not reject any of them — it withdraws the approval skip. Constrain the `Sandbox` CR with your own admission policy, or stay on `provisioner: pod`, if you rely on cluster-side enforcement.
-
-  Scope of that claim, precisely: it covers the pod shape **this backend renders**, which under this schema is every pod it creates. It does not cover anything a compromised agent does by calling the Kubernetes API directly with its own credentials. That is bounded by RBAC, the ValidatingAdmissionPolicy and NetworkPolicy — not by this backend.
+  On this path the ValidatingAdmissionPolicy in this directory does **not** apply: it matches `pods` CREATE, and the pod is created by agent-sandbox-operator from the CR under the operator's own identity. The same is true of OpenShift SCC admission, which is evaluated against the identity that submits the pod — the operator's ServiceAccount, which is typically not `restricted-v2`. **So on `provisioner: sandbox` there is no cluster-side control on the session pod's shape unless you write one.** Constrain the `Sandbox` CR with your own admission policy, or stay on `provisioner: pod`.
 
 ## Pod shape
 
-`terminal.kubernetes.pod_template` is the ONE user layer: a `PodTemplateSpec` merged over a hardened base by a documented Hermes merge rule (mappings merge; lists replace, except `spec.containers` / `spec.initContainers` / `spec.volumes` keyed by `name` and their `volumeMounts` keyed by `mountPath` — the keys the API server itself uses). `render_pod_template()` produces exactly one artifact, nothing runs after it, and `unhardened_reasons()` judges that same call.
+`terminal.kubernetes.pod_template` is the ONE user layer: a `PodTemplateSpec` merged over a **default** base. The base is defaults — the image, the exec container and its `sleep infinity` command, `restartPolicy: Never`, the workspace and `/tmp` volumes, a conservative `securityContext` — chosen so the out-of-box config produces a pod that starts and can be exec'd into. **It is not a constraint. Nothing is reserved**: a `pod_template` may override any field in it, including the exec container's `command`, `args`, `restartPolicy`, `volumeMounts` and `securityContext`. If the result cannot serve exec, that surfaces as an error from the API server or from the first command — visibly, which is the point.
 
-Hermes owns the fields that make exec possible and **rejects** a template that sets them, with the exact dotted path — it does not silently overwrite them:
+### Merge rule
 
-| Reserved | Why |
-| --- | --- |
-| `metadata.labels['app.kubernetes.io/managed-by']` | the selector `networkpolicy.yaml`, `validatingadmissionpolicy.yaml` and session-pod adoption all match on |
-| `metadata.ownerReferences` | Hermes owns pod adoption and GC; `_is_ours()` reads it to decide whether an existing object may be reused. Use `owner_reference: off` to opt out |
-| `spec.restartPolicy` | pinned `Never`; a restart swaps the container out from under an open exec session |
-| a `spec.containers` list omitting `container_name` | Hermes execs into that container |
-| that container's `command` **and `args`** | pinned `["sleep","infinity"]` so the pod outlives the session. Both halves: the kubelet builds the process as `command + args`, so `args` alone turns it into `sleep infinity --whatever`, which exits at once and (under the pinned `restartPolicy: Never`) leaves a Failed pod |
-| that container's `volumeMounts[mountPath=<mount_path>]` | the workspace mount `terminal.cwd` resolves against |
-| `spec.volumes[name=workspace]` | built from `persistent` and `volume.*` |
+**JSON merge patch ([RFC 7386](https://www.rfc-editor.org/rfc/rfc7386)), plus one exception.** Mappings merge recursively; a `null` **removes** the key it names (so any base default can be dropped); every list **replaces** the base's wholesale — `volumes`, `volumeMounts`, `env`, `tolerations`, `imagePullSecrets`, `ports`, all of them. The exception: `spec.containers` and `spec.initContainers` merge **element-wise on `name`**, because without it the most common override there — setting `resources` on the workspace container — would force you to restate its image, command and mounts. A container the base does not declare is appended.
 
-Where that rejection is decided is the point, not just what is on the list. The check that makes the guarantee compares the **rendered** template against the hardened base Hermes built (`rendered_reserved_violations()`), so a violation means "the pod that would be posted is not the pod Hermes owns" — whatever input shape produced it. The friendlier check that names your config key (`reserved_violations()`) reads your `pod_template`, but it is a diagnostic, not the enforcement: reading the input is how four review rounds each found one more way in. The last one was two `spec.containers` entries named `workspace` — the input check read the first, the merge applied the second, and because the merge folds them into one entry the API server never saw a duplicate to reject.
+```yaml
+pod_template:
+  spec:
+    nodeSelector: {disktype: ssd}      # map: merges into the base's spec
+    tolerations: [{key: gpu, operator: Exists}]   # list: replaces (base has none)
+    volumes:                           # list: REPLACES — the base's `workspace`
+      - name: scratch                  # and `tmp` volumes are GONE. Restate them
+        emptyDir: {}                   # if you still want them.
+    containers:                        # exception: merged by `name`
+      - name: workspace                # image/command/volumeMounts are kept
+        resources:
+          limits: {cpu: "2", memory: 4Gi}
+```
 
-Duplicate keys are also rejected outright in every list Kubernetes keys (`containers`, `initContainers`, `ephemeralContainers`, `volumes`, `imagePullSecrets`, and each container's `volumeMounts`, `volumeDevices`, `env`, `ports`). Kubernetes forbids them anyway; the merge is what hid them.
+The one thing Hermes stamps **after** the merge is `metadata.labels['app.kubernetes.io/managed-by': hermes-agent]`. That is not a security control — it is how Hermes finds and adopts its own session pods, and what `networkpolicy.yaml` and `validatingadmissionpolicy.yaml` select on. Set the key if you like; the stamp wins.
 
-Everything else in the `PodSpec` is yours. Keys that are **not** in the `terminal.kubernetes.*` schema at all — including every key the pod_template collapse deleted — are rejected by name, so a stale `config.yaml` fails loudly instead of having its settings quietly stop applying. Every create this backend issues passes `fieldValidation=Strict`, so an unknown or duplicated field is a `400` naming the path rather than a silent drop (the python client discards the API server's `Warning: 299 - unknown field` header, which makes the default `Warn` behaviour indistinguishable from success). `hermes doctor` submits your rendered pod as a `dry_run=All` create for the same reason.
+### Validation is the cluster's job
+
+Hermes validates almost nothing about the pod, on purpose. `validate_kubernetes_config()` checks the `provisioner` enum and the two or three types needed to build a request at all (`pod_template` must be a mapping, `sandbox.spec` must be a mapping). Everything else is delegated:
+
+* **Well-formedness** — every create this backend issues passes `fieldValidation=Strict`, so an unknown, misspelled or duplicated field is a `400` naming the exact JSON path. (The python client discards the API server's `Warning: 299 - unknown field` header, which makes the default `Warn` behaviour indistinguishable from success, so Strict is not optional here.) `hermes doctor` submits your rendered pod as a `dry_run=All` create for the same reason: you see the server's verdict at config time.
+* **What the pod may be** — SCC, Pod Security Admission, the `ValidatingAdmissionPolicy` in this directory, NetworkPolicy and RBAC. These are the cluster administrator's tools, they are authoritative, and an in-process approximation of them would be redundant where it agreed and wrong where it did not.
 
 ## Workspace persistence
 
@@ -156,13 +158,15 @@ The claim name is **task-scoped, not instance-scoped**: two Hermes instances in 
 > * that stamp is **provenance, not identity**, and every field in it is forgeable by anything that can create a labelled PVC in the session namespace — the claim carries no `ownerReference` by design (it must outlive the agent pod) and its name is predictable. Treat `persistentvolumeclaims/create` in the session namespace as a trust boundary: keep it to Hermes via RBAC, or set `terminal.kubernetes.volume.claim_name` to a claim of your own;
 > * the reaper above deletes those credentials along with the workspace. Run it.
 
-Persistent sessions also keep the dangerous-command approval prompts on (see `tools/approval.py`): `rm -rf /workspace` against a retained PVC destroys durable state, so it is not treated as a throwaway sandbox.
+## The approval-prompt skip is declared, not inferred
+
+Hermes' dangerous-command approval prompts stay **on** for this backend unless you set `terminal.kubernetes.trusted_sandbox: true`. That key is a statement by the operator, not a verdict Hermes reaches by reading the pod back: whether a session pod is contained is decided by SCC, Pod Security Admission, your admission policy and your NetworkPolicy, none of which Hermes can see. Set it only once the namespace is locked down — and remember that `persistent: true` puts a durable PVC behind `/workspace`, where `rm -rf` destroys real state.
 
 ## What this does NOT protect against
 
 Stated plainly, because the upstream sample overclaimed here:
 
-* The ValidatingAdmissionPolicy hooks on a label the pod creator chooses. Hermes *configuration* cannot strip it — the label is on THE rendered template, setting the key in `pod_template.metadata.labels` is a rejected config error, and there is no second override layer nor any operator-authored-pod mode left — but a fully compromised agent talking to the API server directly could omit it. The containment boundary is the RBAC grant (and SCC on OpenShift), not the policy.
+* The ValidatingAdmissionPolicy hooks on a label the pod creator chooses. Hermes *configuration* cannot strip it — the label is stamped onto the rendered template after the merge, so a `pod_template` that sets or deletes the key does not win — but a fully compromised agent talking to the API server directly could omit it. The containment boundary is the RBAC grant (and SCC on OpenShift), not the policy.
 * The policy also denies secret-backed env (`envFrom.secretRef`, `valueFrom.secretKeyRef`), not only secret volumes — so injecting provider API keys into the session pod is denied wherever it is bound. Deliberate; see the file header if you need to relax it.
 * `create pods` in a namespace remains a powerful verb. The policy narrows *shape*; it does not make the grant harmless. Run Hermes in a dedicated namespace with nothing else in it.
 * Session pods share the cluster network unless `networkpolicy.yaml` is applied.

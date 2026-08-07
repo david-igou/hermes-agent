@@ -752,12 +752,55 @@ def _migrate_to_34(results: Dict[str, Any], quiet: bool) -> None:
             + ", ".join(sorted(set(removed)))
             + " — these are no longer config keys. Re-express pod shape under "
             "terminal.kubernetes.pod_template (one PodTemplateSpec merged over "
-            "a hardened base); see cli-config.yaml.example OPTION 7."
+            "a default base); see cli-config.yaml.example OPTION 7."
         )
     if not quiet:
         print(
             "  ✓ Collapsed terminal.kubernetes to the pod_template schema "
             "(provisioner: direct → pod)"
+        )
+
+
+def _migrate_to_35(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 34 → 35: the approval skip becomes DECLARED, not inferred ──
+    # terminal.kubernetes gained `trusted_sandbox`. Until now Hermes decided
+    # whether to skip its dangerous-command approval prompts by inspecting the
+    # rendered pod (non-root, drop-ALL, emptyDir, no token, ...). That was an
+    # in-process approximation of admission control; SCC, Pod Security
+    # Admission, ValidatingAdmissionPolicy, NetworkPolicy and RBAC decide
+    # containment authoritatively, and Hermes cannot see any of them.
+    #
+    # So the key is written EXPLICITLY (false) rather than left to the default:
+    # a config that used to earn the skip silently loses it, and the operator
+    # has to see the key to get it back. Silently keeping the prompts on would
+    # be safe but unexplained; silently keeping the skip would be neither.
+    _c = _cfg()
+    config = _c.read_raw_config()
+    terminal = config.get("terminal")
+    if not isinstance(terminal, dict):
+        return
+    kube = terminal.get("kubernetes")
+    if not isinstance(kube, dict) or "trusted_sandbox" in kube:
+        return
+
+    kube["trusted_sandbox"] = False
+    terminal["kubernetes"] = kube
+    config["terminal"] = terminal
+    _c._persist_migration(config)
+
+    results["config_added"].append("terminal.kubernetes.trusted_sandbox=false")
+    results["warnings"].append(
+        "terminal.kubernetes: the dangerous-command approval skip is now "
+        "DECLARED by terminal.kubernetes.trusted_sandbox, not inferred from the "
+        "rendered pod. It has been written as false, so the approval prompts "
+        "stay on. Set it to true once your cluster's SCC / Pod Security "
+        "Admission / ValidatingAdmissionPolicy / NetworkPolicy contain session "
+        "pods to your satisfaction — see k8s/README.md."
+    )
+    if not quiet:
+        print(
+            "  ✓ Added terminal.kubernetes.trusted_sandbox: false "
+            "(the approval skip is now declared, not inferred)"
         )
 
 
@@ -783,6 +826,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (32, _migrate_to_32),
     (33, _migrate_to_33),
     (34, _migrate_to_34),
+    (35, _migrate_to_35),
 )
 
 

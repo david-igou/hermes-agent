@@ -27,20 +27,18 @@
 # `pods/create` safe.
 #
 # COUPLED TO config.yaml — keep these in sync or every session pod is DENIED:
-#   * `variables.sa == 'hermes-session-noperms'` pins the hardened base's
+#   * `variables.sa == 'hermes-session-noperms'` pins the DEFAULT base's
 #     serviceAccountName (SESSION_SERVICE_ACCOUNT in
 #     tools/environments/kubernetes.py). A `pod_template` that names a
-#     different SA is DENIED here, and separately loses the approval skip.
-#   * `automountServiceAccountToken == false` and `runAsNonRoot: true` pin the
-#     hardened base; a `pod_template` may relax either, and this policy then
-#     denies the pod (and the hardening judge flags it).
+#     different SA is DENIED here — this policy is the control, not Hermes.
+#   * `automountServiceAccountToken == false` and `runAsNonRoot: true` are also
+#     only DEFAULTS in Hermes; a `pod_template` may relax either, and this
+#     policy is what then denies the pod.
 #
-# On the matchCondition label, precisely: `app.kubernetes.io/managed-by` is put
-# on THE rendered pod template — the single artifact both provisioners submit —
-# and setting the key in `terminal.kubernetes.pod_template.metadata.labels` is a
-# rejected config error. There is no second override layer, and
-# `sandbox.spec.podTemplate` / `sandbox.spec.sandboxTemplateRef` are rejected
-# too, so configuration cannot strip the label from a pod template Hermes
+# On the matchCondition label, precisely: `app.kubernetes.io/managed-by` is
+# stamped onto THE rendered pod template AFTER the user's pod_template is
+# merged, so a config that sets or deletes the key does not win and
+# configuration cannot strip the label from a pod template Hermes
 # renders. It is NOT strip-proof in general: a compromised agent talking to the
 # API server directly is not bound by any of this (see the Honest limitation
 # above). An earlier revision of this file claimed the matchCondition "cannot be

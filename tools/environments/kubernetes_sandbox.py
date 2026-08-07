@@ -3,8 +3,8 @@
 The second implementation of :class:`~tools.environments.kubernetes.
 WorkspaceProvisioner`, and the reason that ABC exists: it provisions session
 workspaces as ``agents.x-k8s.io/v1beta1`` ``Sandbox`` custom resources and lets
-agent-sandbox-operator reconcile the pod, while the exec loop, the file sync
-and the hardening judge are all shared with ``provisioner: pod`` unchanged.
+agent-sandbox-operator reconcile the pod, while the exec loop and the file sync
+are shared with ``provisioner: pod`` unchanged.
 
 Deliberately a separate module.  Everything Sandbox-specific is here plus the
 three ``terminal.kubernetes.sandbox.*`` keys, the ``provisioner == "sandbox"``
@@ -12,11 +12,12 @@ branch of the environment factory and the sandbox arm of ``hermes doctor`` — s
 a pod-only build is this file plus those three call sites, with nothing to
 unpick in the shared code.
 
-The pod template is NOT authored here.  ``render_pod_template`` produces exactly
-one artifact and :meth:`SandboxProvisioner.sandbox_manifest` ASSIGNS it to
-``spec.podTemplate``; ``terminal.kubernetes.sandbox.spec.podTemplate`` is a
-rejected key, because a second source would let the object the hardening judge
-evaluated differ from the object that is submitted.
+The pod template is NOT authored here.  ``render_pod_template`` produces it and
+:meth:`SandboxProvisioner.sandbox_manifest` ASSIGNS it to ``spec.podTemplate``,
+so a ``sandbox.spec.podTemplate`` written in config is overwritten by the
+rendered one.  Everything else in ``terminal.kubernetes.sandbox.spec`` is
+submitted verbatim and validated by the CRD's own schema under
+``field_validation="Strict"``.
 """
 
 import logging
@@ -31,7 +32,6 @@ from tools.environments.kubernetes import (
     _BaseProvisioner,
     _dig_dict,
     render_pod_template,
-    reserved_sandbox_spec_violations,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,11 +68,15 @@ class SandboxProvisioner(_BaseProvisioner):
         sb = sb if isinstance(sb, dict) else {}
         self.group = str(sb.get("api_group") or "agents.x-k8s.io")
         self.version = str(sb.get("api_version") or "v1beta1")
-        # terminal.kubernetes.sandbox.spec — the Sandbox CR spec, minus the
-        # podTemplate this provisioner injects (a reserved key). A non-mapping
-        # is kept as-is so sandbox_manifest() can REJECT it by name rather than
-        # dying with a TypeError on item assignment.
-        self.cr_spec = sb.get("spec") if sb.get("spec") is not None else {}
+        # terminal.kubernetes.sandbox.spec — the Sandbox CR spec. The
+        # podTemplate this provisioner injects overwrites any written here;
+        # everything else is submitted verbatim for the CRD schema to validate.
+        # A non-mapping is REPORTED by validate_kubernetes_config() (the factory
+        # refuses to build this provisioner); the {} fallback only keeps
+        # sandbox_manifest() from dying with a TypeError on item assignment if
+        # it is ever called without validation having run.
+        spec_cfg = sb.get("spec")
+        self.cr_spec = spec_cfg if isinstance(spec_cfg, dict) else {}
         # CR names this provisioner created (or proved were ours), so destroy()
         # deletes the right object even when the reconciled pod has a different
         # name — and deletes NOTHING when there is no such name.
@@ -82,24 +86,15 @@ class SandboxProvisioner(_BaseProvisioner):
     def sandbox_manifest(
         self, task_id: str, persistent: bool, image: str, resources: Resources
     ) -> dict:
-        """Build the Sandbox CR carrying the ONE rendered pod template.
+        """Build the Sandbox CR carrying the rendered pod template.
 
         ``spec.podTemplate`` is ASSIGNED, never merged: the Sandbox CRD is
         itself ``spec.podTemplate.spec``, so the same dict feeds both
-        provisioners and there is no second layer for a security control to
-        miss.
-
-        Raises ``ValueError`` when ``sandbox.spec`` claims a reserved key.
-        That is belt-and-braces over ``validate_kubernetes_config`` and it is
-        exactly what ``render_pod_template`` does for ``pod_template``: an
-        UNVALIDATED config must not be able to post a ``sandboxTemplateRef``
-        (an operator-authored pod Hermes never renders) or a second
-        ``podTemplate`` alongside the one Hermes rendered and judged.
+        provisioners. A ``podTemplate`` written in ``sandbox.spec`` is therefore
+        overwritten rather than rejected; a ``sandboxTemplateRef`` written there
+        is submitted, and what the operator then does with it is the operator's
+        and the cluster's business, not this backend's.
         """
-        violations = reserved_sandbox_spec_violations(self.cr_spec)
-        if violations:
-            raise ValueError("; ".join(violations))
-
         spec: dict[str, Any] = deepcopy(self.cr_spec)
         spec["podTemplate"] = render_pod_template(
             self.kcfg,

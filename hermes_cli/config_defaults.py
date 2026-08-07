@@ -364,9 +364,9 @@ DEFAULT_CONFIG = {
         #
         # The schema models only what the BACKEND reasons about; everything that
         # is merely PodSpec goes in `pod_template`, ONE PodTemplateSpec merged
-        # over a hardened base.  A single artifact is rendered, submitted and
-        # security-checked — layered overrides are what let the object that was
-        # validated drift from the object that was submitted.
+        # over a DEFAULT base with RFC 7386 (JSON merge patch) semantics.
+        # Nothing is reserved — validating and constraining the pod is the
+        # cluster's job (fieldValidation=Strict, SCC / PSA / admission policy).
         #
         # `pod_template` and `sandbox.spec` are free-form YAML, so they are not
         # `hermes config set` surface (a PodTemplateSpec is not a dotted-scalar
@@ -393,19 +393,22 @@ DEFAULT_CONFIG = {
             # channel for RL/benchmark harnesses; a pod_template that pins
             # spec.containers[].image wins and disables that.
             "image": "nikolaik/python-nodejs:python3.11-nodejs20",
-            # Container this backend builds AND execs into. A pod_template that
-            # omits it is REJECTED, never silently repaired.
+            # Container this backend execs into, and the one the default base
+            # builds. Rename it here if a pod_template renames it.
             "container_name": "workspace",
             # Workspace mount, and the session's default cwd.
             "mount_path": "/workspace",
-            # THE user layer: a PodTemplateSpec merged over the hardened base.
-            # Mappings merge; lists replace, except spec.containers /
-            # initContainers / volumes (keyed by `name`) and their volumeMounts
-            # (keyed by `mountPath`). Reserved: metadata.labels
-            # 'app.kubernetes.io/managed-by', spec.restartPolicy, the exec
-            # container's `command`, the workspace mount and the workspace
-            # volume — setting any of them is a config error.
+            # THE user layer: a PodTemplateSpec merged over the default base
+            # with RFC 7386 semantics — mappings merge, null removes, lists
+            # REPLACE wholesale — except spec.containers / spec.initContainers,
+            # which merge element-wise on `name`. Nothing is reserved.
             "pod_template": {},
+            # Declares that this backend's session pods are disposable enough
+            # to skip Hermes' dangerous-command approval prompts. Declared by
+            # the operator, never inferred from the pod: what contains a pod is
+            # SCC / Pod Security Admission / admission policy / NetworkPolicy,
+            # which Hermes cannot see. Default false = prompts stay ON.
+            "trusted_sandbox": False,
             # Deliberately NOT inherited from container_persistent (True for
             # docker/daytona): a cluster sandbox defaults to ephemeral.
             "persistent": False,
@@ -430,10 +433,9 @@ DEFAULT_CONFIG = {
             "sandbox": {
                 "api_group": "agents.x-k8s.io",
                 "api_version": "v1beta1",
-                # Sandbox CR spec. `podTemplate` is injected from the one
-                # rendered template and is reserved here, as is
-                # `sandboxTemplateRef` (it would make the operator author a pod
-                # Hermes never renders and cannot evaluate).
+                # Sandbox CR spec, submitted verbatim for the CRD's own
+                # schema to validate. `podTemplate` is overwritten by the
+                # rendered template this backend injects.
                 "spec": {},
             },
         },
@@ -3206,7 +3208,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 34,
+    "_config_version": 35,
 }
 
 # Optional environment variables that enhance functionality

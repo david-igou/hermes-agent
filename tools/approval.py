@@ -3241,11 +3241,11 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     must go through the normal approval flow.
     """
     if env_type in ("docker", "kubernetes"):
-        # Kubernetes follows the Docker precedent rather than being blanket
-        # trusted: an ephemeral session pod with an emptyDir workspace is a
-        # throwaway sandbox, but a pod backed by a persistent PVC (or holding a
-        # mounted ServiceAccount token) can destroy durable state, so it keeps
-        # the guards. See terminal_tool._kubernetes_has_host_access.
+        # Kubernetes is not blanket trusted: the guards stay on unless the
+        # operator DECLARES terminal.kubernetes.trusted_sandbox. Hermes does
+        # not grade the session pod itself — SCC, Pod Security Admission,
+        # ValidatingAdmissionPolicy and NetworkPolicy decide containment and
+        # Hermes cannot see them. See terminal_tool._kubernetes_has_host_access.
         return not has_host_access
     return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
 
