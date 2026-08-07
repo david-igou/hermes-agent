@@ -804,6 +804,106 @@ def _migrate_to_35(results: Dict[str, Any], quiet: bool) -> None:
         )
 
 
+def _migrate_to_36(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 35 → 36: stateless pods; claim-based sandbox provisioner ──
+    # Three decisions land at once, all removals:
+    #
+    # * Session pods are STATELESS. `persistent` and the whole `volume` block
+    #   are gone; the workspace is an emptyDir that dies with the pod.
+    # * `image` was the last sugar key writing into the pod. The image lives
+    #   in pod_template like every other pod field (spec.containers merged by
+    #   name), so a configured image is MOVED there, not dropped.
+    # * `provisioner: sandbox` now consumes agent-sandbox the way the project
+    #   intends: a SandboxClaim checked out of an admin-owned SandboxWarmPool.
+    #   Hermes no longer authors the Sandbox CR, so `sandbox.api_group`,
+    #   `sandbox.api_version` and `sandbox.spec` are gone, replaced by ONE key
+    #   `sandbox.warm_pool` that the operator must fill in.
+    _c = _cfg()
+    config = _c.read_raw_config()
+    terminal = config.get("terminal")
+    if not isinstance(terminal, dict):
+        return
+    kube = terminal.get("kubernetes")
+    if not isinstance(kube, dict):
+        return
+
+    changed = False
+    removed: list[str] = []
+
+    image = str(kube.pop("image", "") or "").strip()
+    if image:
+        changed = True
+        # Preserve intent: write the image into pod_template's exec container
+        # unless the template already pins one.
+        template = kube.get("pod_template")
+        template = template if isinstance(template, dict) else {}
+        spec = template.get("spec") if isinstance(template.get("spec"), dict) else {}
+        containers = spec.get("containers")
+        containers = containers if isinstance(containers, list) else []
+        exec_name = str(kube.get("container_name") or "workspace").strip() or "workspace"
+        target = next(
+            (c for c in containers
+             if isinstance(c, dict) and c.get("name") == exec_name),
+            None,
+        )
+        if target is None:
+            containers.append({"name": exec_name, "image": image})
+            results["config_added"].append(
+                "terminal.kubernetes.pod_template.spec.containers"
+                f"[name={exec_name}].image (moved from image)"
+            )
+        elif not target.get("image"):
+            target["image"] = image
+            results["config_added"].append(
+                "terminal.kubernetes.pod_template.spec.containers"
+                f"[name={exec_name}].image (moved from image)"
+            )
+        else:
+            removed.append("image (pod_template already pins one)")
+        spec["containers"] = containers
+        template["spec"] = spec
+        kube["pod_template"] = template
+    elif "image" in kube:
+        kube.pop("image", None)
+        changed = True
+
+    for key in ("persistent", "volume"):
+        if key in kube:
+            kube.pop(key)
+            changed = True
+            removed.append(key)
+
+    sandbox = kube.get("sandbox")
+    if isinstance(sandbox, dict):
+        for key in ("api_group", "api_version", "spec"):
+            if key in sandbox:
+                sandbox.pop(key)
+                changed = True
+                removed.append(f"sandbox.{key}")
+
+    if not changed:
+        return
+
+    terminal["kubernetes"] = kube
+    config["terminal"] = terminal
+    _c._persist_migration(config)
+
+    if removed:
+        results["warnings"].append(
+            "terminal.kubernetes: removed " + ", ".join(sorted(set(removed)))
+            + " — session pods are now stateless (the workspace is an "
+            "emptyDir), and provisioner: sandbox now checks a SandboxClaim "
+            "out of an admin-owned SandboxWarmPool instead of submitting a "
+            "Sandbox CR. If you use provisioner: sandbox, set "
+            "terminal.kubernetes.sandbox.warm_pool — see k8s/README.md."
+        )
+    if not quiet:
+        print(
+            "  ✓ terminal.kubernetes: stateless session pods; sandbox "
+            "provisioner is now SandboxClaim/warm-pool based"
+        )
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: version captured before the ladder started. Order matters: later steps may
@@ -827,6 +927,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (33, _migrate_to_33),
     (34, _migrate_to_34),
     (35, _migrate_to_35),
+    (36, _migrate_to_36),
 )
 
 

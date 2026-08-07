@@ -226,7 +226,7 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
     RBAC is where in-cluster deployments actually fail, so this goes past a
     "is the SDK installed" check and asks the API server whether the agent's
     ServiceAccount may create pods, exec into them, and (in sandbox mode)
-    create Sandboxes.
+    create SandboxClaims against the configured SandboxWarmPool.
     """
     if importlib.util.find_spec("kubernetes") is None:
         _fail_and_issue(
@@ -240,11 +240,11 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
 
     try:
         from tools.environments.kubernetes import (
+            VALID_PROVISIONERS,
             in_cluster,
             load_kubernetes_apis,
             merge_kubernetes_config,
             resolve_namespace,
-            validate_kubernetes_config,
         )
         from tools.terminal_tool import _get_env_config
 
@@ -256,12 +256,18 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
         )
         return
 
-    problems = validate_kubernetes_config(kcfg)
-    for problem in problems:
-        _fail_and_issue("kubernetes config invalid", f"({problem})", problem, issues)
-    if problems:
+    # The one Hermes-side decision (which API to call); everything else is
+    # validated by the API server, which the dry-run below exercises.
+    provisioner = str(kcfg.get("provisioner") or "").strip().lower()
+    if provisioner not in VALID_PROVISIONERS:
+        _fail_and_issue(
+            "kubernetes provisioner unknown", f"({provisioner!r})",
+            "Set terminal.kubernetes.provisioner to one of "
+            + ", ".join(VALID_PROVISIONERS),
+            issues,
+        )
         return
-    check_ok("kubernetes config", f"(provisioner: {kcfg.get('provisioner')})")
+    check_ok("kubernetes config", f"(provisioner: {provisioner})")
 
     check_info(
         "kubernetes auth: in-cluster ServiceAccount"
@@ -283,11 +289,10 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
     check_ok("kubernetes namespace", f"({namespace})")
 
     # Per-provisioner, because the shipped Roles differ: the sandbox Role
-    # deliberately grants NO pods create/delete (the operator owns the pod
-    # lifecycle), so demanding them there fails a correctly configured
+    # deliberately grants NO pods create/delete (the claim controller owns the
+    # pod lifecycle), so demanding them there fails a correctly configured
     # least-privilege deployment.
-    sandbox_mode = str(kcfg.get("provisioner") or "").strip().lower() == "sandbox"
-    sandbox_cfg = kcfg.get("sandbox") or {}
+    sandbox_mode = provisioner == "sandbox"
     # `get`, not `create`: the only exec call this backend makes is
     # api.connect_get_namespaced_pod_exec, which the python client issues as a
     # websocket-upgrading GET, so kube-apiserver authorizes it as verb `get`.
@@ -296,10 +301,15 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
     # then 403s on the first command.
     exec_check = ("", "pods/exec", "get")
     if sandbox_mode:
-        sandbox_group = sandbox_cfg.get("api_group", "agents.x-k8s.io")
+        from tools.environments.kubernetes_sandbox import (
+            EXTENSIONS_API_GROUP,
+            SANDBOX_API_GROUP,
+        )
+
         checks = [
-            (sandbox_group, "sandboxes", "create"),
-            (sandbox_group, "sandboxes", "delete"),
+            (EXTENSIONS_API_GROUP, "sandboxclaims", "create"),
+            (EXTENSIONS_API_GROUP, "sandboxclaims", "delete"),
+            (SANDBOX_API_GROUP, "sandboxes", "get"),
             ("", "pods", "get"),
             exec_check,
         ]
@@ -309,8 +319,6 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
             ("", "pods", "delete"),
             exec_check,
         ]
-    if kcfg.get("persistent"):
-        checks.append(("", "persistentvolumeclaims", "create"))
 
     # Declared, not inferred: Hermes does not grade the pod it renders. What a
     # session pod may be is decided by SCC / Pod Security Admission /
@@ -358,8 +366,8 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
 
         if sandbox_mode:
             # Least-privilege signal, not a requirement: with the sandbox
-            # provisioner the operator owns pod lifecycle, so the agent's SA
-            # should NOT be able to create pods itself.
+            # provisioner the claim controller owns pod lifecycle, so the
+            # agent's SA should NOT be able to create pods itself.
             review = k8s_client.V1SelfSubjectAccessReview(
                 spec=k8s_client.V1SelfSubjectAccessReviewSpec(
                     resource_attributes=k8s_client.V1ResourceAttributes(
@@ -385,10 +393,124 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
     except Exception as exc:
         check_warn("kubernetes RBAC check skipped", f"({exc})")
 
-    _dry_run_pod_template(kcfg, namespace, core_api, sandbox_mode, issues)
+    if sandbox_mode:
+        _check_warm_pool(kcfg, namespace, core_api, issues)
+        _dry_run_sandbox_claim(kcfg, namespace, core_api, issues)
+    else:
+        _dry_run_pod_template(kcfg, namespace, core_api, issues)
 
 
-def _dry_run_pod_template(kcfg, namespace, core_api, sandbox_mode, issues) -> None:
+def _check_warm_pool(kcfg, namespace, core_api, issues) -> None:
+    """Verify the configured SandboxWarmPool exists (the admin's object)."""
+    from kubernetes import client as k8s_client
+    from kubernetes.client.exceptions import ApiException
+    from tools.environments.kubernetes_sandbox import (
+        EXTENSIONS_API_GROUP,
+        SANDBOX_API_VERSION,
+    )
+
+    warm_pool = str((kcfg.get("sandbox") or {}).get("warm_pool") or "").strip()
+    if not warm_pool:
+        _fail_and_issue(
+            "kubernetes warm pool not configured", "(sandbox.warm_pool is empty)",
+            "Set terminal.kubernetes.sandbox.warm_pool to a SandboxWarmPool in "
+            "the session namespace (created by your cluster admin — see "
+            "k8s/README.md), or use provisioner: pod",
+            issues,
+        )
+        return
+    try:
+        pool = k8s_client.CustomObjectsApi(
+            core_api.api_client
+        ).get_namespaced_custom_object(
+            group=EXTENSIONS_API_GROUP, version=SANDBOX_API_VERSION,
+            namespace=namespace, plural="sandboxwarmpools", name=warm_pool,
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            _fail_and_issue(
+                "kubernetes warm pool missing", f"({warm_pool} in {namespace})",
+                f"Create SandboxWarmPool {warm_pool} (and its SandboxTemplate) "
+                "in the session namespace, or point sandbox.warm_pool at an "
+                "existing pool — see k8s/README.md",
+                issues,
+            )
+        elif exc.status == 403:
+            # Not required at runtime (Hermes only creates claims), so a
+            # denied read is a blind spot, not a failure.
+            check_warn(
+                "kubernetes warm pool unreadable",
+                f"(RBAC denies get sandboxwarmpools; cannot verify {warm_pool})",
+            )
+        else:
+            check_warn("kubernetes warm pool check skipped",
+                       f"({exc.status} {exc.reason})")
+        return
+    except Exception as exc:
+        check_warn("kubernetes warm pool check skipped", f"({exc})")
+        return
+    replicas = (pool.get("spec") or {}).get("replicas")
+    check_ok("kubernetes warm pool",
+             f"({warm_pool}, replicas: {replicas if replicas is not None else '?'})")
+
+
+def _dry_run_sandbox_claim(kcfg, namespace, core_api, issues) -> None:
+    """Ask the API server to validate the SandboxClaim, creating nothing."""
+    from kubernetes import client as k8s_client
+    from kubernetes.client.exceptions import ApiException
+    from tools.environments.kubernetes import STRICT_FIELD_VALIDATION
+    from tools.environments.kubernetes_sandbox import (
+        EXTENSIONS_API_GROUP,
+        SANDBOX_API_VERSION,
+        SandboxClaimProvisioner,
+    )
+
+    try:
+        provisioner = SandboxClaimProvisioner(kcfg, namespace, api=core_api)
+        body = provisioner.claim_manifest("doctor")
+    except Exception as exc:
+        _fail_and_issue(
+            "kubernetes sandbox claim unrenderable", f"({exc})",
+            "Fix the terminal.kubernetes.sandbox block in config.yaml", issues,
+        )
+        return
+    try:
+        k8s_client.CustomObjectsApi(
+            core_api.api_client
+        ).create_namespaced_custom_object(
+            group=EXTENSIONS_API_GROUP, version=SANDBOX_API_VERSION,
+            namespace=namespace, plural="sandboxclaims", body=body,
+            dry_run="All", **STRICT_FIELD_VALIDATION,
+        )
+    except ApiException as exc:
+        if exc.status == 400:
+            _fail_and_issue(
+                "kubernetes sandbox claim rejected by the API server",
+                f"({getattr(exc, 'body', None) or exc.reason})",
+                "Fix the field the API server names in the "
+                "terminal.kubernetes.sandbox block",
+                issues,
+            )
+        elif exc.status == 404:
+            _fail_and_issue(
+                "kubernetes sandbox claim CRD missing",
+                f"(sandboxclaims.{EXTENSIONS_API_GROUP} not served)",
+                "Install agent-sandbox WITH its extensions "
+                "(sandbox-with-extensions.yaml, or the Red Hat build), or use "
+                "provisioner: pod",
+                issues,
+            )
+        else:
+            check_warn("kubernetes sandbox claim dry-run skipped",
+                       f"({exc.status} {exc.reason})")
+    except Exception as exc:
+        check_warn("kubernetes sandbox claim dry-run skipped", f"({exc})")
+    else:
+        check_ok("kubernetes sandbox claim",
+                 "(accepted by the API server with fieldValidation=Strict)")
+
+
+def _dry_run_pod_template(kcfg, namespace, core_api, issues) -> None:
     """Ask the API server to validate the user's pod_template, creating nothing.
 
     ``terminal.kubernetes.pod_template`` is free-form YAML posted verbatim, and
@@ -404,25 +526,12 @@ def _dry_run_pod_template(kcfg, namespace, core_api, sandbox_mode, issues) -> No
     """
     from tools.environments.kubernetes import (
         PodProvisioner,
-        Resources,
         STRICT_FIELD_VALIDATION,
     )
 
     try:
-        if sandbox_mode:
-            from tools.environments.kubernetes_sandbox import SandboxProvisioner
-
-            provisioner = SandboxProvisioner(kcfg, namespace, api=core_api)
-            body = provisioner.sandbox_manifest(
-                "doctor", persistent=False,
-                image=str(kcfg.get("image") or ""), resources=Resources(),
-            )
-        else:
-            provisioner = PodProvisioner(kcfg, namespace, api=core_api)
-            body = provisioner.pod_manifest(
-                "doctor", persistent=False,
-                image=str(kcfg.get("image") or ""), resources=Resources(),
-            )
+        provisioner = PodProvisioner(kcfg, namespace, api=core_api)
+        body = provisioner.pod_manifest("doctor")
     except Exception as exc:
         _fail_and_issue(
             "kubernetes pod template unrenderable", f"({exc})",
@@ -432,23 +541,13 @@ def _dry_run_pod_template(kcfg, namespace, core_api, sandbox_mode, issues) -> No
 
     # Imported OUTSIDE the try: naming ApiException in an except clause whose
     # import lives inside the same try turns a missing SDK into a NameError.
-    from kubernetes import client as k8s_client
     from kubernetes.client.exceptions import ApiException
 
     try:
-        if sandbox_mode:
-            sb = kcfg.get("sandbox") or {}
-            k8s_client.CustomObjectsApi(core_api.api_client).create_namespaced_custom_object(
-                group=str(sb.get("api_group") or "agents.x-k8s.io"),
-                version=str(sb.get("api_version") or "v1beta1"),
-                namespace=namespace, plural="sandboxes", body=body,
-                dry_run="All", **STRICT_FIELD_VALIDATION,
-            )
-        else:
-            core_api.create_namespaced_pod(
-                namespace=namespace, body=body,
-                dry_run="All", **STRICT_FIELD_VALIDATION,
-            )
+        core_api.create_namespaced_pod(
+            namespace=namespace, body=body,
+            dry_run="All", **STRICT_FIELD_VALIDATION,
+        )
     except ApiException as exc:
         if exc.status == 400:
             _fail_and_issue(
@@ -507,9 +606,9 @@ _DEPRECATED_ENV_VARS: tuple[tuple[str, str], ...] = (
     # closed for exactly that reason. Anyone who copied that block gets a
     # diagnosis instead of silence — none of them are read by this fork.
     ("TERMINAL_KUBERNETES_NAMESPACE", "terminal.kubernetes.namespace in config.yaml — ignored"),
-    ("TERMINAL_KUBERNETES_IMAGE", "terminal.kubernetes.image in config.yaml — ignored"),
+    ("TERMINAL_KUBERNETES_IMAGE", "terminal.kubernetes.pod_template spec.containers[].image in config.yaml — ignored"),
     ("TERMINAL_KUBERNETES_POD_SA", "terminal.kubernetes.pod_template.spec.serviceAccountName in config.yaml — ignored"),
-    ("TERMINAL_KUBERNETES_PERSISTENT", "terminal.kubernetes.persistent in config.yaml — ignored"),
+    ("TERMINAL_KUBERNETES_PERSISTENT", "removed — session pods are stateless; ignored"),
     ("TERMINAL_KUBERNETES_ACTIVE_DEADLINE_SECONDS", "terminal.kubernetes.active_deadline_seconds in config.yaml — ignored"),
     ("TERMINAL_KUBERNETES_PULL_SECRETS", "terminal.kubernetes.pod_template.spec.imagePullSecrets in config.yaml — ignored"),
 )

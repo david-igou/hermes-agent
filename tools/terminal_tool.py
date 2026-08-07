@@ -1332,7 +1332,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
-        "daytona_image", "kubernetes_image", "env_type",
+        "daytona_image", "env_type",
     })
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
@@ -1546,12 +1546,20 @@ def _get_env_config() -> Dict[str, Any]:
     # go through merge_kubernetes_config().  Parse only when the kubernetes
     # backend is selected so a stale value can't break local/docker sessions.
     if kubernetes_backend:
-        from tools.environments.kubernetes import merge_kubernetes_config
+        from tools.environments.kubernetes import (
+            effective_image,
+            merge_kubernetes_config,
+        )
         kubernetes_config = merge_kubernetes_config(
             _parse_env_var(_KUBERNETES_CONFIG_ENV, "{}", json.loads, "valid JSON")
         )
+        # DERIVED for display surfaces (status, prompt), never an input:
+        # there is no terminal.kubernetes.image key. Empty for provisioner:
+        # sandbox, where the cluster's SandboxTemplate decides.
+        kubernetes_image = effective_image(kubernetes_config)
     else:
         kubernetes_config = {}
+        kubernetes_image = ""
 
     # Default cwd: local uses the host's current directory, ssh uses the
     # remote home, Vercel uses its documented workspace root, Kubernetes uses
@@ -1605,7 +1613,7 @@ def _get_env_config() -> Dict[str, Any]:
         # Whole terminal.kubernetes.* block (defaults merged). Empty dict when
         # another backend is selected.
         "kubernetes": kubernetes_config,
-        "kubernetes_image": str(kubernetes_config.get("image") or "") or default_image,
+        "kubernetes_image": kubernetes_image,
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
@@ -1818,25 +1826,30 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         from tools.environments import kubernetes as _k8s
 
         kcfg = _k8s.merge_kubernetes_config(cc.get("kubernetes"))
-        problems = _k8s.validate_kubernetes_config(kcfg)
-        if problems:
+
+        # The ONE Hermes-side config decision: which Kubernetes API to call.
+        # Everything else is validated by the API server itself
+        # (fieldValidation=Strict), not re-derived in-process.
+        provisioner_name = str(kcfg.get("provisioner") or "pod").strip().lower()
+        if provisioner_name not in _k8s.VALID_PROVISIONERS:
             raise ValueError(
-                "Invalid terminal.kubernetes configuration:\n  - "
-                + "\n  - ".join(problems)
+                "terminal.kubernetes.provisioner must be one of "
+                f"{', '.join(_k8s.VALID_PROVISIONERS)} (got {provisioner_name!r})"
             )
 
         core_api, custom_api = _k8s.load_kubernetes_apis(kcfg)
         namespace = _k8s.resolve_namespace(kcfg)
         owner_ref = _k8s.resolve_owner_reference(core_api, namespace, kcfg)
 
-        provisioner_name = str(kcfg.get("provisioner") or "pod").strip().lower()
         if provisioner_name == "sandbox":
             # Lazy, and the only import of it outside its own module: the
-            # Sandbox provisioner is separable — this branch plus
-            # kubernetes_sandbox.py plus the three sandbox.* config keys.
-            from tools.environments.kubernetes_sandbox import SandboxProvisioner
+            # claim provisioner is separable — this branch plus
+            # kubernetes_sandbox.py plus the sandbox.warm_pool config key.
+            from tools.environments.kubernetes_sandbox import (
+                SandboxClaimProvisioner,
+            )
 
-            provisioner = SandboxProvisioner(
+            provisioner = SandboxClaimProvisioner(
                 kcfg, namespace, api=core_api, owner_reference=owner_ref,
                 custom_api=custom_api,
             )
@@ -1845,21 +1858,11 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                 kcfg, namespace, api=core_api, owner_reference=owner_ref,
             )
 
-        # Kubernetes sessions default to EPHEMERAL (the point is an isolation
-        # sandbox); persistence is opt-in via terminal.kubernetes.persistent,
-        # NOT the shared container_persistent default (True for docker/daytona).
-        k8s_persistent = bool(kcfg.get("persistent", False))
-
         return _k8s.KubernetesEnvironment(
             provisioner=provisioner,
             task_id=task_id,
-            persistent=k8s_persistent,
-            image=image,
             cwd=cwd,
             timeout=timeout,
-            resources=_k8s.Resources(
-                cpu=cpu, memory_mib=int(memory), disk_mib=int(disk)
-            ),
             api=core_api,
         )
 
@@ -2433,7 +2436,9 @@ def terminal_tool(
         elif env_type == "daytona":
             image = overrides.get("daytona_image") or config["daytona_image"]
         elif env_type == "kubernetes":
-            image = overrides.get("kubernetes_image") or config["kubernetes_image"]
+            # Display-only: the image is authored in pod_template (or the
+            # cluster's SandboxTemplate), not selected per task.
+            image = config["kubernetes_image"]
         else:
             image = ""
 
@@ -3411,17 +3416,9 @@ def check_terminal_requirements() -> bool:
                     "not installed: pip install 'hermes-agent[kubernetes]'"
                 )
                 return False
-            from tools.environments.kubernetes import (
-                merge_kubernetes_config,
-                validate_kubernetes_config,
-            )
-            problems = validate_kubernetes_config(
-                merge_kubernetes_config(config.get("kubernetes"))
-            )
-            if problems:
-                for problem in problems:
-                    logger.error("kubernetes backend: %s", problem)
-                return False
+            # No config validation here: the API server validates every
+            # request (fieldValidation=Strict), and an unknown provisioner
+            # raises with a clear message in the environment factory.
             return True
 
         else:

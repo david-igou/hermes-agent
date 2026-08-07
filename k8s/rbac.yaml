@@ -1,8 +1,8 @@
 # RBAC for the Kubernetes terminal backend (terminal.backend: kubernetes).
 #
-# Grants the agent's ServiceAccount the minimum verbs needed to create, exec
-# into, and delete session pods (and the PVCs that back persistent workspaces)
-# IN ITS OWN NAMESPACE only.
+# Grants the agent's ServiceAccount the minimum verbs needed to provision,
+# exec into, and delete session pods IN ITS OWN NAMESPACE only. Session pods
+# are stateless — there is no PVC surface.
 #
 # Replace the placeholders before applying:
 #   <AGENT_NAMESPACE>   namespace where the Hermes pod runs (e.g. "hermes-agents")
@@ -11,19 +11,23 @@
 # Two Role variants ship below. Apply exactly ONE, matching
 # terminal.kubernetes.provisioner:
 #
-#   provisioner: pod      -> hermes-session-exec        (pods + PVCs + exec)
-#   provisioner: sandbox  -> hermes-session-sandbox     (sandboxes + exec, NO
-#                            bare pods/create — a meaningful reduction, since
-#                            "create pods in a namespace" is close to
-#                            namespace-admin without admission constraints)
+#   provisioner: pod      -> hermes-session-exec     (pods + exec)
+#   provisioner: sandbox  -> hermes-session-sandbox  (sandboxclaims + exec, NO
+#                            bare pods/create and NO pod-authoring surface at
+#                            all: the pod shape lives in the admin's
+#                            SandboxTemplate, behind the cluster's admission
+#                            stack — a meaningful reduction, since "create
+#                            pods in a namespace" is close to namespace-admin
+#                            without admission constraints)
 #
 # Pair either with k8s/networkpolicy.yaml (session pods otherwise reach every
 # Service in the cluster) and, on non-OpenShift clusters, with
-# k8s/validatingadmissionpolicy.yaml.
+# k8s/validatingadmissionpolicy.yaml (provisioner: pod only — claims carry no
+# pod spec to police).
 ---
 # The session pods themselves run as this no-perms SA so they hold no cluster
-# credentials. The backend also sets automountServiceAccountToken: false on the
-# pod itself (terminal.kubernetes.automount_service_account_token).
+# credentials. The backend's default base also sets
+# automountServiceAccountToken: false on the pod itself.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -43,20 +47,13 @@ rules:
   # ownerReference that garbage-collects session pods when the agent dies, and
   # reads pod status for readiness diagnostics (ImagePullBackOff,
   # CreateContainerConfigError, SCC denial) and the container list.
-  # No `list`: the direct provisioner only ever addresses pods BY NAME, and
+  # No `list`: the pod provisioner only ever addresses pods BY NAME, and
   # `list pods` would let a compromised agent enumerate every pod in the
   # namespace (the Hermes pod itself, any co-tenant) — which get-by-name does
   # not.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "get", "delete"]
-  # PVCs backing persistent workspaces. NO delete: the backend deliberately
-  # never deletes a PVC (a persistent workspace must outlive the agent pod),
-  # so granting delete would only widen the blast radius. No `list` either —
-  # the claim is read by name.
-  - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
-    verbs: ["create", "get"]
   # Streaming exec into the session pod. `get` is the verb that is actually
   # exercised: the python client upgrades via connect_get_namespaced_pod_exec,
   # a websocket GET, which kube-apiserver authorizes as `get`. `create` is kept
@@ -82,40 +79,42 @@ roleRef:
   name: hermes-session-exec
 
 ---
-# ── provisioner: sandbox (agent-sandbox-operator v0.9.0+) ────────────────────
-# Note the absence of pods create/delete: the operator owns pod lifecycle, so
-# the agent only needs to create the CR and exec into the resulting pod.
+# ── provisioner: sandbox (agent-sandbox + extensions) ────────────────────────
+# Hermes creates a SandboxClaim against an admin-owned SandboxWarmPool and
+# execs into the pod the claim is bound to. Note what is ABSENT:
+#
+#   * pods create/delete — the claim controller owns pod lifecycle;
+#   * sandboxes create   — Hermes never authors a Sandbox (or a pod spec);
+#   * sandboxtemplates / sandboxwarmpools write access — those are the
+#     ADMIN's objects. They are the enforcement point on this path: whoever
+#     can write the template defines what session pods are. Keep them out of
+#     the agent's reach.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: hermes-session-sandbox
   namespace: <AGENT_NAMESPACE>
 rules:
-  # No `watch` and no `list`: readiness is polled with
-  # get_namespaced_custom_object, and the CR is always addressed by name.
+  # The claim lifecycle. No `watch`/`list`: readiness is polled with
+  # get_namespaced_custom_object, always by name.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["create", "get", "delete"]
+  # Read-only: resolve the bound Sandbox (claim.status.sandbox.name) to its
+  # uid and pod name. Never created, never deleted — deleting the claim
+  # cascades.
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
-    verbs: ["create", "get", "delete"]
-  # NOTE: sandboxclaims / sandboxtemplates / sandboxwarmpools are deliberately
-  # absent. This backend renders and submits its own podTemplate, so it never
-  # references a SandboxTemplate — a pod it does not render is a pod whose
-  # hardening it cannot establish (sandbox.spec.sandboxTemplateRef is a
-  # rejected config key for exactly that reason).
-  # Resolve the reconciled pod (name, readiness, container list) and exec.
-  # `list` IS used here (and only here): when the operator's status carries no
-  # podRef, _resolve_pod_name falls back to a label selector.
+    verbs: ["get"]
+  # Resolve the bound pod by name (readiness, container list, the
+  # ownerReference proof that it belongs to our Sandbox).
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
-  # See the direct Role above: `get` is the verb the client actually exercises.
+    verbs: ["get"]
+  # See the pod Role above: `get` is the verb the client actually exercises.
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["get", "create"]
-  # Only when terminal.kubernetes.persistent is true AND no SandboxTemplate
-  # supplies the volume. Read by name; no `list`.
-  - apiGroups: [""]
-    resources: ["persistentvolumeclaims"]
-    verbs: ["create", "get"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -138,7 +137,8 @@ roleRef:
 # `restricted-v2`, which every authenticated SA already has via
 # system:authenticated — so you do NOT need this on OpenShift 4.21.
 #
-# You DO need it if your terminal.kubernetes.pod_template pins
+# You DO need it if your terminal.kubernetes.pod_template (or, for
+# provisioner: sandbox, your SandboxTemplate) pins
 # spec.securityContext.runAsUser to a UID outside the namespace's
 # openshift.io/sa.scc.uid-range, or sets spec.runtimeClassName to a runtime
 # whose SCC differs. In

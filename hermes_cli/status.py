@@ -451,11 +451,14 @@ def show_status(args):
             if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount/token")
             else (k8s_cfg.get("kubeconfig") or "KUBECONFIG / ~/.kube/config")
         )
-        print(f"  Provisioner:  {k8s_cfg.get('provisioner', 'pod')}")
+        provisioner = k8s_cfg.get('provisioner', 'pod')
+        print(f"  Provisioner:  {provisioner}")
         print(f"  Namespace:    {k8s_cfg.get('namespace') or '(from ServiceAccount)'}")
-        print(f"  Image:        {k8s_cfg.get('image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
-        print(f"  Pod template: {'customised' if k8s_cfg.get('pod_template') else '(hardened default)'}")
-        print(f"  Persistent:   {bool(k8s_cfg.get('persistent', False))}")
+        if provisioner == "sandbox":
+            warm_pool = (k8s_cfg.get('sandbox') or {}).get('warm_pool')
+            print(f"  Warm pool:    {warm_pool or '(NOT SET — required)'}")
+        else:
+            print(f"  Pod template: {'customised' if k8s_cfg.get('pod_template') else '(default base)'}")
         print(f"  SDK:          {check_mark(sdk_ok)} {sdk_label}")
         print(f"  Auth:         {auth}")
     elif terminal_env == "vercel_sandbox":

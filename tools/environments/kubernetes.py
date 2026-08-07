@@ -1,11 +1,13 @@
 """Kubernetes session-pod execution environment.
 
 Runs each agent command by exec-ing into a per-session pod in a Kubernetes
-cluster.  Provisioning sits behind :class:`WorkspaceProvisioner` so the raw-API
-:class:`PodProvisioner` (``provisioner: pod``) can be swapped for the
-operator-CR ``SandboxProvisioner`` in :mod:`tools.environments.kubernetes_sandbox`
-(``agents.x-k8s.io/v1beta1`` ``Sandbox``, reconciled by agent-sandbox-operator)
-without touching the exec loop.
+cluster.  Session pods are STATELESS: the workspace is an emptyDir that dies
+with the pod.  Provisioning sits behind :class:`WorkspaceProvisioner` so the
+raw-API :class:`PodProvisioner` (``provisioner: pod``) can be swapped for the
+:class:`~tools.environments.kubernetes_sandbox.SandboxClaimProvisioner`
+(``provisioner: sandbox``), which checks a pre-warmed sandbox out of a
+`kubernetes-sigs/agent-sandbox <https://github.com/kubernetes-sigs/agent-sandbox>`_
+``SandboxWarmPool`` via a ``SandboxClaim``, without touching the exec loop.
 
 Configuration policy
 --------------------
@@ -17,27 +19,31 @@ that only ``tools.terminal_tool`` reads.  ``.env`` is for secrets, and this
 backend has no credential surface at all — in-cluster auth is the projected
 ServiceAccount token the kubelet mounts, which Hermes never reads or stores.
 
-Pod shape policy — the config defines the API call
---------------------------------------------------
-The schema models what the BACKEND has to reason about (placement, auth, the
-exec target, workspace lifetime).  Everything that is merely ``PodSpec`` is
-expressed as ``terminal.kubernetes.pod_template``, a single PodTemplateSpec
-merged over a DEFAULT base by :func:`merge_pod_template`.  The base is a set of
-defaults that make the out-of-box config produce a working pod; it is not a
-constraint.  Nothing here is reserved: a ``pod_template`` may override any
-field, including the exec container's ``command``, ``args``, ``restartPolicy``,
+Pod shape policy — who authors the pod depends on the provisioner
+-----------------------------------------------------------------
+``provisioner: pod``: the operator authors the pod in Hermes config.
+Everything that is merely ``PodSpec`` is expressed as
+``terminal.kubernetes.pod_template``, a single PodTemplateSpec merged over a
+DEFAULT base by :func:`merge_pod_template`.  The base is a set of defaults that
+make the out-of-box config produce a working pod; it is not a constraint.
+Nothing here is reserved: a ``pod_template`` may override any field, including
+the exec container's ``image``, ``command``, ``args``, ``restartPolicy``,
 ``volumeMounts`` and ``securityContext``.
+
+``provisioner: sandbox``: the CLUSTER authors the pod.  The admin owns a
+``SandboxTemplate`` and a ``SandboxWarmPool``; Hermes only creates a
+``SandboxClaim`` naming the pool and execs into the pod it is bound to.
+``pod_template`` is not consulted on that path.
 
 Validation of the pod's CONTENT is the cluster's job, not Hermes'.  SCC, Pod
 Security Admission, ValidatingAdmissionPolicy, NetworkPolicy and RBAC decide
-authoritatively what a session pod may be, and every create/patch this backend
+authoritatively what a session pod may be, and every create this backend
 issues passes ``field_validation="Strict"`` so a malformed or unknown field
-comes back as a ``400`` naming the exact JSON path.  An in-process
-approximation of admission control would be redundant and, being an
-approximation, wrong.  :func:`validate_kubernetes_config` therefore checks only
-what the API server cannot see: the ``provisioner`` enum, and the handful of
-types needed to build the request at all.  A pod that cannot serve exec fails
-visibly at the first command; that is the operator's error to see.
+comes back as a ``400`` naming the exact JSON path.  There is deliberately NO
+in-process config validation: an in-process approximation of admission control
+would be redundant and, being an approximation, wrong.  A pod that cannot
+serve exec fails visibly at the first command; that is the operator's error to
+see.
 
 Merge rule for ``pod_template``
 -------------------------------
@@ -104,10 +110,11 @@ _EXEC_GRACE_SECONDS = 15
 _SYNC_SENTINEL = "__HERMES_TAR_EOF__"
 _STDIN_CHUNK_BYTES = 64 * 1024
 MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "hermes-agent"}
-# Stamped on every workspace PVC Hermes creates, and required before one is
-# adopted. A PVC cannot carry an ownerReference (it must outlive the agent
-# pod), so this is the only provenance an adopting agent can read.
-PVC_INSTANCE_ANNOTATION = "hermes.nousresearch.com/created-by-instance"
+# Default base image for `provisioner: pod`. Not a config key: override it in
+# pod_template (spec.containers[] merged by name), where every other pod field
+# already lives. `provisioner: sandbox` gets its image from the cluster's
+# SandboxTemplate.
+DEFAULT_SESSION_IMAGE = "nikolaik/python-nodejs:python3.11-nodejs20"
 
 
 # ---------------------------------------------------------------------------
@@ -124,54 +131,39 @@ DEFAULT_KUBERNETES_CONFIG: dict[str, Any] = {
     "namespace": "",                  # "" -> the projected SA namespace file
     "kubeconfig": "",                 # out-of-cluster dev only (a path, not a secret)
     "context": "",                    # kubeconfig context; ignored in-cluster
-    # --- workload ------------------------------------------------------
-    # Base image. Kept top-level (rather than folded into pod_template)
-    # because it is the per-task override channel: RL/benchmark harnesses
-    # swap it per task through container_config["kubernetes_image"].  A
-    # pod_template that pins spec.containers[].image wins and DISABLES that.
-    "image": "nikolaik/python-nodejs:python3.11-nodejs20",
-    # The container this backend execs into. Also the name the default base
-    # builds; a pod_template may rename or replace it, in which case set this
-    # key to match or the exec lands nowhere.
+    # --- exec target ----------------------------------------------------
+    # The container this backend execs into. For `pod` it is also the name the
+    # default base builds; for `sandbox` it must name a container in the
+    # cluster's SandboxTemplate, or the exec lands nowhere.
     "container_name": "workspace",
-    # Where the workspace volume is mounted. Also the environment's default
-    # cwd, so it is backend behaviour, not just pod shape.
+    # Where the workspace lives. Also the environment's default cwd, so it is
+    # backend behaviour, not just pod shape.
     "mount_path": "/workspace",
-    # THE user layer. A PodTemplateSpec merged over the default base by
-    # merge_pod_template() with RFC 7386 semantics (maps merge, null removes,
-    # lists replace) plus the containers/initContainers-by-name exception.
-    # Nothing is reserved: every field is overridable.
+    # THE user layer for `provisioner: pod`. A PodTemplateSpec merged over the
+    # default base by merge_pod_template() with RFC 7386 semantics (maps merge,
+    # null removes, lists replace) plus the containers/initContainers-by-name
+    # exception. Nothing is reserved: every field is overridable, including
+    # the exec container's image. Ignored by `provisioner: sandbox` (the
+    # cluster's SandboxTemplate owns the pod shape there).
     "pod_template": {},
     # Whether the operator DECLARES this backend's session pods disposable
     # enough to skip Hermes' dangerous-command approval prompts. Declared,
     # never inferred: Hermes does not read the pod back to guess. Default
     # false = the prompts stay on.
     "trusted_sandbox": False,
-    # --- workspace lifetime -------------------------------------------
-    "persistent": False,
-    "volume": {
-        "size": "10Gi",               # "" -> {container_disk}Mi (50Gi by default)
-        "storage_class_name": "",     # "" -> omit (cluster default StorageClass)
-        "access_modes": ["ReadWriteOnce"],
-        # "" -> hermes-ws-<task>, which every Hermes instance in the namespace
-        # running that task id SHARES. Set an explicit name when several
-        # agents share a namespace and must not share a workspace.
-        "claim_name": "",
-    },
-    # spec.activeDeadlineSeconds, but the APPLICATION rule is backend logic
-    # static YAML cannot express: ephemeral pods always, persistent pods only
-    # when no ownerReference could be resolved (nothing else would reap them).
-    "active_deadline_seconds": 14400,  # 0 -> omit
+    # --- lifetime -------------------------------------------------------
+    # Leak backstop. `pod`: spec.activeDeadlineSeconds. `sandbox`: the claim's
+    # lifecycle.shutdownTime (now + this many seconds). 0 -> omit.
+    "active_deadline_seconds": 14400,
     "ready_timeout_seconds": 120,
     "owner_reference": "auto",        # auto | off
     # --- sandbox provisioner only -------------------------------------
     "sandbox": {
-        "api_group": "agents.x-k8s.io",
-        "api_version": "v1beta1",
-        # The Sandbox CR spec, submitted verbatim for the CRD's own schema to
-        # validate. `podTemplate` is overwritten by the rendered template this
-        # backend injects.
-        "spec": {},
+        # The SandboxWarmPool (extensions.agents.x-k8s.io) this backend claims
+        # sandboxes from. The pool, and the SandboxTemplate it instantiates,
+        # are the cluster admin's objects: they own the pod shape, Hermes only
+        # checks a sandbox out. REQUIRED when provisioner: sandbox.
+        "warm_pool": "",
     },
 }
 
@@ -307,76 +299,19 @@ def merge_kubernetes_config(user_config: Any) -> dict:
 def _mapping(node: Any, key: str) -> dict:
     """``node[key]`` when it is a mapping, else ``{}``.
 
-    ``(kcfg.get("volume") or {})`` is not the same thing: a scalar written where
-    a block belongs sails through ``or`` and raises ``AttributeError`` at the
-    next ``.get``.
+    ``(kcfg.get("sandbox") or {})`` is not the same thing: a scalar written
+    where a block belongs sails through ``or`` and raises ``AttributeError`` at
+    the next ``.get``.
     """
     value = node.get(key) if isinstance(node, dict) else None
     return value if isinstance(value, dict) else {}
 
 
-def validate_kubernetes_config(kcfg: Any) -> list[str]:
-    """Return the config problems Hermes is the only one who CAN see.
-
-    Deliberately tiny. Everything about the pod's CONTENT — quantities, RFC-1123
-    names, duplicate mountPaths, securityContext combinations, unknown or
-    misspelled PodSpec fields — is checked authoritatively by the API server
-    (``field_validation="Strict"`` makes an unknown or duplicated field a ``400``
-    naming the exact JSON path) and constrained authoritatively by the cluster's
-    SCC / Pod Security Admission / ValidatingAdmissionPolicy / RBAC. Re-deriving
-    any of that here would be an approximation of admission control, redundant
-    where it agreed and wrong where it did not.
-
-    What remains is Hermes-side config the API server never sees:
-
-    * ``provisioner`` — it selects which Kubernetes API this backend calls, so
-      an unknown value has no request to be rejected by;
-    * the types needed to BUILD a request at all — ``pod_template`` must be a
-      mapping to merge, ``sandbox.spec`` must be a mapping to carry the injected
-      ``podTemplate``. A scalar there is a ``TypeError`` in a manifest builder,
-      not a message from the cluster.
-
-    A pod that is well-formed but cannot serve exec (no shell, a ``command``
-    that exits, a securityContext the kubelet refuses) is NOT a problem this
-    function reports. It fails visibly on the first command, and that failure is
-    the operator's to see.
-    """
-    if kcfg is not None and not isinstance(kcfg, dict):
-        return [
-            f"terminal.kubernetes must be a mapping (got {type(kcfg).__name__})"
-        ]
-    problems: list[str] = []
-    if not isinstance(kcfg, dict):
-        return problems
-
-    provisioner = str(kcfg.get("provisioner") or "").strip().lower()
-    if provisioner not in VALID_PROVISIONERS:
-        problems.append(
-            f"terminal.kubernetes.provisioner must be one of "
-            f"{', '.join(VALID_PROVISIONERS)} (got {provisioner!r})"
-        )
-
-    pod_template = kcfg.get("pod_template")
-    if pod_template is not None and not isinstance(pod_template, dict):
-        problems.append(
-            "terminal.kubernetes.pod_template must be a mapping (a "
-            f"PodTemplateSpec); got {type(pod_template).__name__}"
-        )
-
-    sandbox = kcfg.get("sandbox")
-    if sandbox is not None and not isinstance(sandbox, dict):
-        problems.append(
-            f"terminal.kubernetes.sandbox must be a mapping (got "
-            f"{type(sandbox).__name__})"
-        )
-    cr_spec = _mapping(kcfg, "sandbox").get("spec")
-    if cr_spec is not None and not isinstance(cr_spec, dict):
-        problems.append(
-            "terminal.kubernetes.sandbox.spec must be a mapping (a Sandbox CR "
-            f"spec); got {type(cr_spec).__name__}"
-        )
-    return problems
-
+# There is deliberately no validate_kubernetes_config(). The API server owns
+# the schema (every create passes fieldValidation=Strict, so a malformed or
+# unknown field is a 400 naming the exact JSON path) and the cluster's
+# admission stack owns what a pod may be. The one thing Hermes must decide
+# itself — which provisioner to build — raises in the environment factory.
 
 
 # ---------------------------------------------------------------------------
@@ -393,34 +328,6 @@ class PodRef:
     container: str
 
 
-@dataclass(frozen=True)
-class Resources:
-    """Fallback sizing derived from the shared ``terminal.container_*`` keys.
-
-    ``cpu`` is whole cores (fractional allowed — 0.5 renders as ``500m``),
-    ``memory_mib`` / ``disk_mib`` are MiB.  They only fill the DEFAULT base's
-    ``requests``; a ``pod_template`` container merged by ``name`` replaces the
-    whole ``resources`` mapping.
-    """
-
-    cpu: float = 1
-    memory_mib: int = 5120
-    disk_mib: int = 51200
-
-
-def _cpu_quantity(cpu: float) -> str:
-    """Render a core count as a Kubernetes CPU quantity."""
-    try:
-        value = float(cpu)
-    except (TypeError, ValueError):
-        return "1"
-    if value <= 0:
-        return "1"
-    if value == int(value):
-        return str(int(value))
-    return f"{int(round(value * 1000))}m"
-
-
 def sanitize_name(raw: str, *, max_len: int = 40) -> str:
     """Slugify *raw* into a safe DNS-1123 label fragment.
 
@@ -435,7 +342,7 @@ def sanitize_name(raw: str, *, max_len: int = 40) -> str:
     # Compared against the RAW input, not a lowercased copy: comparing against
     # `raw.lower()` skipped the hash for case-only normalisation, so "Default"
     # and "default" (two distinct RL/benchmark task ids) landed on the same pod
-    # AND the same PVC and silently shared one credential-file sync.
+    # and silently shared one credential-file sync.
     if len(slug) > max_len or slug != str(raw or ""):
         digest = hashlib.sha1(str(raw or "default").encode("utf-8")).hexdigest()[:6]
         slug = f"{slug[: max_len - 7].strip('-') or 'task'}-{digest}"
@@ -450,8 +357,7 @@ def _instance_discriminator(owner_pod_uid: str = "") -> str:
     both target ``hermes-ws-default``: the second create 409s, gets silently
     "reused", and each agent then execs into (and later deletes) the other's
     workspace.  Derived from the agent pod's UID in-cluster and from the
-    hostname otherwise, so it is stable across restarts and persistent
-    workspaces still resume.
+    hostname otherwise, so it is stable across restarts.
     """
     seed = owner_pod_uid or socket.gethostname() or "hermes"
     return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
@@ -612,15 +518,7 @@ def mount_path(kcfg: dict) -> str:
     return str(kcfg.get("mount_path") or "").strip() or "/workspace"
 
 
-def _default_base(
-    kcfg: dict,
-    *,
-    persistent: bool,
-    image: str,
-    resources: Resources,
-    pvc_name: str,
-    owned: bool = True,
-) -> dict:
+def _default_base(kcfg: dict) -> dict:
     """The DEFAULT pod template, before the user layer.
 
     Defaults, not constraints. Every field below is overridable through
@@ -646,7 +544,7 @@ def _default_base(
     # is outside it (the pod is rejected outright). On vanilla Kubernetes set
     # pod_template.spec.securityContext.runAsUser so runAsNonRoot can schedule
     # a root-default image, plus fsGroup so the non-root uid can write the
-    # emptyDir/PVC (they mount root:root 0755 otherwise).
+    # emptyDir (it mounts root:root 0755 otherwise).
     container_security: dict[str, Any] = {
         "runAsNonRoot": True,
         "allowPrivilegeEscalation": False,
@@ -655,7 +553,10 @@ def _default_base(
 
     container: dict[str, Any] = {
         "name": exec_container,
-        "image": image,
+        # Overridable like everything else, via pod_template's
+        # containers-merged-by-name. Resource requests/limits live there too —
+        # the shared terminal.container_* knobs are NOT read by this backend.
+        "image": DEFAULT_SESSION_IMAGE,
         # Keep the pod alive so we can exec into it repeatedly.
         "command": ["sleep", "infinity"],
         "workingDir": workspace_path,
@@ -667,21 +568,10 @@ def _default_base(
             {"name": TMP_VOLUME_NAME, "mountPath": "/tmp"},
         ],
         "securityContext": container_security,
-        "resources": {
-            "requests": {
-                "cpu": _cpu_quantity(resources.cpu),
-                "memory": f"{resources.memory_mib}Mi",
-            }
-        },
     }
 
-    if persistent:
-        workspace_volume = {
-            "name": WORKSPACE_VOLUME_NAME,
-            "persistentVolumeClaim": {"claimName": pvc_name},
-        }
-    else:
-        workspace_volume = {"name": WORKSPACE_VOLUME_NAME, "emptyDir": {}}
+    # Stateless by design: the workspace dies with the pod.
+    workspace_volume = {"name": WORKSPACE_VOLUME_NAME, "emptyDir": {}}
 
     spec: dict[str, Any] = {
         "restartPolicy": "Never",
@@ -700,33 +590,24 @@ def _default_base(
     }
 
     deadline = int(kcfg.get("active_deadline_seconds") or 0)
-    if deadline > 0 and (not persistent or not owned):
-        # Hard lifetime ceiling (leak backstop). Normally ephemeral-only — a
-        # persistent workspace is meant to be long-lived — but a persistent pod
-        # with no ownerReference has no reaper at all, and its PVC (the durable
-        # half) outlives the pod either way. That conditional is why the key
-        # stays top-level instead of folding into pod_template.
+    if deadline > 0:
+        # Hard lifetime ceiling (leak backstop): a session pod that outlives
+        # its ownerReference GC path — StatefulSet restart, out-of-cluster
+        # dev — is reaped by the kubelet instead of leaking forever.
         spec["activeDeadlineSeconds"] = deadline
 
     return {"metadata": {"labels": dict(MANAGED_BY_LABEL)}, "spec": spec}
 
 
-def render_pod_template(
-    kcfg: dict,
-    *,
-    persistent: bool,
-    image: str,
-    resources: Resources,
-    pvc_name: str,
-    owned: bool = True,
-) -> dict:
+def render_pod_template(kcfg: dict) -> dict:
     """Render THE pod template — the artifact that reaches the API server.
 
-    A default base is built from backend state (image, resources, the workspace
-    volume, the exec container), then ``terminal.kubernetes.pod_template`` is
-    merged over it exactly once by :func:`merge_pod_template` (RFC 7386 plus the
-    containers-by-name exception). :class:`PodProvisioner` wraps the result in a
-    ``Pod``; the sandbox provisioner ASSIGNS it to ``Sandbox.spec.podTemplate``.
+    A default base is built from backend state (the workspace volume, the exec
+    container), then ``terminal.kubernetes.pod_template`` is merged over it
+    exactly once by :func:`merge_pod_template` (RFC 7386 plus the
+    containers-by-name exception). :class:`PodProvisioner` wraps the result in
+    a ``Pod``. The sandbox provisioner never calls this: the cluster's
+    ``SandboxTemplate`` authors that pod.
 
     Nothing here rejects anything. The config defines how the API call is made,
     and the API server validates it — every create/patch this backend issues
@@ -741,18 +622,8 @@ def render_pod_template(
     ``k8s/networkpolicy.yaml`` selects on it, so a template that dropped it
     would break adoption and silently fall out of the admin's policy. It is
     stamped, not validated — set the key if you like, the stamp wins.
-
-    *owned* is False when no ownerReference could be resolved — the one case
-    where a persistent pod also gets the activeDeadlineSeconds backstop, because
-    nothing else would ever reap it.
     """
-    template = merge_pod_template(
-        _default_base(
-            kcfg, persistent=persistent, image=image, resources=resources,
-            pvc_name=pvc_name, owned=owned,
-        ),
-        kcfg.get("pod_template"),
-    )
+    template = merge_pod_template(_default_base(kcfg), kcfg.get("pod_template"))
 
     metadata = template.get("metadata")
     if not isinstance(metadata, dict):
@@ -766,29 +637,48 @@ def render_pod_template(
     return template
 
 
+def effective_image(kcfg: dict) -> str:
+    """The image the exec container will run, for DISPLAY surfaces only.
+
+    Derived from the rendered template (so a ``pod_template`` override is
+    reflected), never an input: there is no ``image`` config key. Returns ""
+    for ``provisioner: sandbox``, where the cluster's SandboxTemplate decides
+    and Hermes cannot know.
+    """
+    if str(kcfg.get("provisioner") or "").strip().lower() == "sandbox":
+        return ""
+    expected = container_name(kcfg)
+    try:
+        containers = render_pod_template(kcfg).get("spec", {}).get("containers")
+    except Exception:
+        return ""
+    for entry in containers if isinstance(containers, list) else []:
+        if isinstance(entry, dict) and entry.get("name") == expected:
+            return str(entry.get("image") or "")
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Provisioners
 # ---------------------------------------------------------------------------
 
 
 class WorkspaceProvisioner(ABC):
-    """Creates and destroys the session pod (and its PVC, when persistent)."""
+    """Creates and destroys the session pod."""
 
     @abstractmethod
-    def ensure(
-        self, task_id: str, persistent: bool, image: str, resources: Resources
-    ) -> PodRef:
+    def ensure(self, task_id: str) -> PodRef:
         """Create (or resume) the session workspace; return a Ready PodRef."""
         ...
 
     @abstractmethod
-    def destroy(self, pod_ref: PodRef, persistent: bool) -> None:
-        """Tear down the session workspace. Keep the PVC iff persistent."""
+    def destroy(self, pod_ref: PodRef) -> None:
+        """Tear down the session workspace."""
         ...
 
 
 class _BaseProvisioner(WorkspaceProvisioner):
-    """Shared naming, PVC handling and readiness polling."""
+    """Shared naming and readiness polling."""
 
     def __init__(self, kcfg: dict, namespace: str, api=None, owner_reference=None):
         self.kcfg = kcfg
@@ -826,20 +716,6 @@ class _BaseProvisioner(WorkspaceProvisioner):
     def workspace_name(self, task_id: str) -> str:
         return f"hermes-ws-{self._instance}-{sanitize_name(task_id)}"
 
-    def pvc_name(self, task_id: str) -> str:
-        # Deliberately NOT instance-scoped: a persistent workspace must resume
-        # for the same task across agent restarts, and the instance
-        # discriminator is derived from the agent pod UID, which changes on
-        # every restart.  The consequence is that two Hermes instances in one
-        # namespace running the same task id share this claim (ReadWriteOnce:
-        # the second pod stays Pending) — set
-        # terminal.kubernetes.volume.claim_name to give an instance its own.
-        # _mapping, not `or {}`: a scalar written where the block belongs sails
-        # through `or` and raises AttributeError at the next .get. pvc_manifest
-        # already reads it this way.
-        configured = str(_mapping(self.kcfg, "volume").get("claim_name") or "").strip()
-        return configured or f"hermes-ws-{sanitize_name(task_id)}"
-
     def container_name(self) -> str:
         return container_name(self.kcfg)
 
@@ -876,167 +752,6 @@ class _BaseProvisioner(WorkspaceProvisioner):
             "exec into a container this backend did not render. The running "
             "pod does not match the template Hermes submitted and evaluated."
         )
-
-    # -- PVC ------------------------------------------------------------
-    def pvc_manifest(self, task_id: str, resources: Resources) -> dict:
-        vol = _mapping(self.kcfg, "volume")
-        size = str(vol.get("size") or "").strip() or f"{resources.disk_mib}Mi"
-        spec: dict[str, Any] = {
-            "accessModes": list(vol.get("access_modes") or ["ReadWriteOnce"]),
-            "resources": {"requests": {"storage": size}},
-        }
-        storage_class = str(vol.get("storage_class_name") or "").strip()
-        if storage_class:
-            spec["storageClassName"] = storage_class
-        # No ownerRef: a persistent PVC must outlive the agent pod.  The task
-        # label is what a reaper (see k8s/README.md) selects on, since nothing
-        # in this backend ever deletes these claims.
-        return {
-            "apiVersion": "v1",
-            "kind": "PersistentVolumeClaim",
-            "metadata": {
-                "name": self.pvc_name(task_id),
-                "namespace": self.namespace,
-                "labels": {
-                    **MANAGED_BY_LABEL,
-                    "app.kubernetes.io/component": "hermes-workspace",
-                    "hermes.nousresearch.com/task": sanitize_name(task_id),
-                },
-                # Provenance, not identity: the claim carries no ownerReference
-                # (it must outlive the agent pod), so this stamp is what an
-                # adopting agent can check.  See _assert_pvc_is_ours.
-                "annotations": {PVC_INSTANCE_ANNOTATION: self._instance},
-            },
-            "spec": spec,
-        }
-
-    @staticmethod
-    def _metadata_map(obj, field: str) -> dict:
-        """``metadata.<field>`` as a dict, from an SDK object or a plain dict."""
-        value = getattr(getattr(obj, "metadata", None), field, None)
-        if value is None and isinstance(obj, dict):
-            value = _dig_dict(obj, "metadata").get(field)
-        return value if isinstance(value, dict) else {}
-
-    def _assert_pvc_is_ours(self, pvc, name: str, task_id: str) -> None:
-        """Refuse to adopt a PVC this backend cannot tie to a Hermes workspace.
-
-        Adoption is not free: the claim is mounted at ``mount_path``, which is
-        the agent's cwd, and ``KubernetesEnvironment`` immediately syncs its
-        credential files into ``<cwd>/.hermes`` — i.e. into this claim, at
-        rest, on a volume Hermes never deletes.
-
-        What can be proved here is weaker than on the pod path, and the
-        difference is deliberate rather than an oversight: the claim carries no
-        ownerReference (it must outlive the agent pod) and its name is task-
-        scoped rather than instance-scoped, because a persistent workspace must
-        resume for the same task after the agent pod is replaced.  So there is
-        no per-instance secret to check.  What IS checked is the complete
-        provenance stamp ``pvc_manifest`` writes — the managed-by label, the
-        component label, the task label and the creating instance annotation —
-        rather than the single well-known managed-by label, which any workload
-        with ``persistentvolumeclaims/create`` could set on a claim it made
-        under the conventional name.  A claim missing the stamp is refused
-        (fail closed) with instructions, and a claim stamped by a DIFFERENT
-        instance is logged, because cross-instance sharing is designed but
-        should never be silent.
-
-        Honest limitation, also stated in k8s/README.md: every field here is
-        forgeable by anything that can create a labelled PVC in the session
-        namespace.  ``persistentvolumeclaims/create`` in that namespace is a
-        trust boundary; keep it to Hermes (RBAC), and prefer an explicit
-        ``terminal.kubernetes.volume.claim_name``.
-        """
-        labels = self._metadata_map(pvc, "labels")
-        annotations = self._metadata_map(pvc, "annotations")
-        managed_by_key, managed_by_value = next(iter(MANAGED_BY_LABEL.items()))
-        advice = (
-            " The agent's credential files are synced into this claim. Set "
-            "terminal.kubernetes.volume.claim_name to a name of your own, or "
-            "let Hermes create the claim."
-        )
-        if labels.get(managed_by_key) != managed_by_value:
-            raise self._refuse(name, (
-                f"persistentvolumeclaim {name} already exists and is not a "
-                f"Hermes workspace ({managed_by_key}="
-                f"{labels.get(managed_by_key)!r}); refusing to mount it." + advice
-            ))
-        if labels.get("app.kubernetes.io/component") != "hermes-workspace":
-            raise self._refuse(name, (
-                f"persistentvolumeclaim {name} already exists and does not carry "
-                "the Hermes workspace component label; refusing to mount it."
-                + advice
-            ))
-        configured = str(_mapping(self.kcfg, "volume").get("claim_name") or "").strip()
-        if not configured:
-            # Conventional name -> it must be the claim for THIS task. A
-            # configured claim is the operator's own choice and may legitimately
-            # be shared across task ids.
-            want_task = sanitize_name(task_id)
-            if labels.get("hermes.nousresearch.com/task") != want_task:
-                raise self._refuse(name, (
-                    f"persistentvolumeclaim {name} already exists and is "
-                    f"labelled for task "
-                    f"{labels.get('hermes.nousresearch.com/task')!r}, not "
-                    f"{want_task!r}; refusing to mount it." + advice
-                ))
-        stamp = annotations.get(PVC_INSTANCE_ANNOTATION)
-        if not stamp:
-            raise self._refuse(name, (
-                f"persistentvolumeclaim {name} already exists but carries no "
-                f"{PVC_INSTANCE_ANNOTATION} stamp, so this backend cannot "
-                "establish that a Hermes agent created it; refusing to mount "
-                "it." + advice + " A claim you pre-created, or one left by a "
-                "Hermes build older than this stamp, needs the annotation added "
-                "(any value) to record that decision: kubectl -n <ns> annotate "
-                f"pvc {name} {PVC_INSTANCE_ANNOTATION}=adopted"
-            ))
-        if stamp != self._instance:
-            # Designed: two agents running the same task id share the claim.
-            # Never silent: it is another agent's workspace and its files.
-            logger.warning(
-                "k8s: adopting persistentvolumeclaim %s created by Hermes "
-                "instance %s (this instance is %s). Sharing a workspace claim "
-                "is by design for the same task id, but the agent's credential "
-                "files are synced into it — set "
-                "terminal.kubernetes.volume.claim_name to keep them apart.",
-                name, stamp, self._instance,
-            )
-
-    def _ensure_pvc(self, task_id: str, resources: Resources) -> None:
-        from kubernetes.client.exceptions import ApiException
-
-        name = self.pvc_name(task_id)
-        try:
-            existing = self._api.read_namespaced_persistent_volume_claim(
-                name=name, namespace=self.namespace
-            )
-            self._assert_pvc_is_ours(existing, name, task_id)
-            return
-        except ApiException as exc:
-            if exc.status != 404:
-                raise
-        try:
-            self._api.create_namespaced_persistent_volume_claim(
-                namespace=self.namespace,
-                body=self.pvc_manifest(task_id, resources),
-                **STRICT_FIELD_VALIDATION,
-            )
-        except ApiException as exc:
-            # Lost a create race — the PVC exists, which is what we wanted, but
-            # the winner still has to be a Hermes workspace.
-            if exc.status != 409:
-                raise
-            try:
-                raced = self._api.read_namespaced_persistent_volume_claim(
-                    name=name, namespace=self.namespace
-                )
-            except Exception as read_exc:
-                raise self._refuse(name, (
-                    f"persistentvolumeclaim {name} already exists but could not "
-                    f"be read ({read_exc}); refusing to mount it."
-                )) from read_exc
-            self._assert_pvc_is_ours(raced, name, task_id)
 
     # -- readiness ------------------------------------------------------
     def _pod_failure_detail(self, pod) -> str:
@@ -1128,26 +843,17 @@ class _BaseProvisioner(WorkspaceProvisioner):
 
 
 class PodProvisioner(_BaseProvisioner):
-    """Creates session pods/PVCs directly via the Kubernetes core API.
+    """Creates session pods directly via the Kubernetes core API.
 
-    The pod shape is deliberately constrained: no host namespaces, a no-perms
-    ServiceAccount with its token unmounted, ``runAsNonRoot``, drop-ALL
-    capabilities, no privilege escalation, ``seccompProfile: RuntimeDefault``.
-    The session pod carries an ownerReference to the agent's own pod so it is
-    garbage-collected if the agent crashes.
+    The default pod shape is deliberately conservative: no host namespaces, a
+    no-perms ServiceAccount with its token unmounted, ``runAsNonRoot``,
+    drop-ALL capabilities, no privilege escalation, ``seccompProfile:
+    RuntimeDefault``.  The session pod carries an ownerReference to the
+    agent's own pod so it is garbage-collected if the agent crashes.
     """
 
-    def pod_manifest(
-        self, task_id: str, persistent: bool, image: str, resources: Resources
-    ) -> dict:
-        template = render_pod_template(
-            self.kcfg,
-            persistent=persistent,
-            image=image,
-            resources=resources,
-            pvc_name=self.pvc_name(task_id),
-            owned=self._owner_reference is not None,
-        )
+    def pod_manifest(self, task_id: str) -> dict:
+        template = render_pod_template(self.kcfg)
         metadata = dict(template["metadata"])
         metadata["name"] = self.workspace_name(task_id)
         metadata["namespace"] = self.namespace
@@ -1207,26 +913,21 @@ class PodProvisioner(_BaseProvisioner):
         # Ownership has to be proved, not assumed.
         return any(getattr(o, "uid", None) == our_uid for o in owners)
 
-    def ensure(
-        self, task_id: str, persistent: bool, image: str, resources: Resources
-    ) -> PodRef:
+    def ensure(self, task_id: str) -> PodRef:
         from kubernetes.client.exceptions import ApiException
-
-        if persistent:
-            self._ensure_pvc(task_id, resources)
 
         pod_name = self.workspace_name(task_id)
         try:
             self._api.create_namespaced_pod(
                 namespace=self.namespace,
-                body=self.pod_manifest(task_id, persistent, image, resources),
+                body=self.pod_manifest(task_id),
                 **STRICT_FIELD_VALIDATION,
             )
         except ApiException as exc:
             if exc.status != 409:
                 raise
-            # 409 = the pod already exists (persistent resume after a soft
-            # stop, or a racing session in this same agent).
+            # 409 = the pod already exists (a racing session in this same
+            # agent, or a leftover from a previous run).
             if not self._is_ours(pod_name):
                 raise self._refuse(pod_name, (
                     f"session pod {pod_name} already exists and was not created "
@@ -1236,16 +937,13 @@ class PodProvisioner(_BaseProvisioner):
         pod = self.wait_pod_ready(pod_name)
         return PodRef(self.namespace, pod_name, self.exec_container(pod))
 
-    def destroy(self, pod_ref: PodRef, persistent: bool) -> None:
+    def destroy(self, pod_ref: PodRef) -> None:
         # A pod we refused to adopt is a pod we must not delete: the refusal
         # raises out of ensure(), and the environment's teardown path then asks
         # to destroy the workspace under exactly that name.
         if not self._may_delete(pod_ref.pod_name):
             return
         self._delete_pod(pod_ref.namespace, pod_ref.pod_name)
-        # Persistent: keep the PVC so the next session resumes the filesystem.
-        # There is deliberately no automatic PVC deletion — see
-        # `hermes` docs / k8s/README.md for the reaper story.
 
 
 # ---------------------------------------------------------------------------
@@ -1298,20 +996,14 @@ class KubernetesEnvironment(BaseEnvironment):
         self,
         provisioner: WorkspaceProvisioner,
         task_id: str,
-        persistent: bool,
-        image: str,
         cwd: str = "/workspace",
         timeout: int = 60,
-        resources: "Resources | None" = None,
         api=None,
         sync_files: bool = True,
     ):
         super().__init__(cwd=cwd, timeout=timeout)
         self._provisioner = provisioner
-        self._persistent = persistent
         self._task_id = task_id
-        self._image = image
-        self._resources = resources or Resources()
         self._exec_api = api  # configured CoreV1Api; falls back to a fresh one
         self._lock = threading.Lock()
         self._sync_manager = None
@@ -1320,12 +1012,7 @@ class KubernetesEnvironment(BaseEnvironment):
         self._hermes_base = posixpath.join(cwd or "/workspace", ".hermes")
 
         try:
-            self._pod_ref = provisioner.ensure(
-                task_id=task_id,
-                persistent=persistent,
-                image=image,
-                resources=self._resources,
-            )
+            self._pod_ref = provisioner.ensure(task_id=task_id)
         except BaseException:
             # A pod created but never Ready (image pull, quota, SCC denial)
             # would otherwise linger until activeDeadlineSeconds.
@@ -1359,7 +1046,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 else f"hermes-ws-{task_id}",
                 WORKSPACE_CONTAINER_NAME,
             )
-            self._provisioner.destroy(ref, self._persistent)
+            self._provisioner.destroy(ref)
         except Exception:
             pass
 
@@ -1377,14 +1064,9 @@ class KubernetesEnvironment(BaseEnvironment):
                 return self._pod_ref
         logger.warning(
             "k8s: session pod for task %s is gone; provisioning a new one — "
-            "an ephemeral workspace starts empty again.", self._task_id,
+            "the workspace starts empty again.", self._task_id,
         )
-        pod_ref = self._provisioner.ensure(
-            task_id=self._task_id,
-            persistent=self._persistent,
-            image=self._image,
-            resources=self._resources,
-        )
+        pod_ref = self._provisioner.ensure(task_id=self._task_id)
         with self._lock:
             self._pod_ref = pod_ref
         # A fresh pod has none of the synced files or the env snapshot.
@@ -1769,29 +1451,28 @@ class KubernetesEnvironment(BaseEnvironment):
         if ref is None:
             return
         try:
-            self._provisioner.destroy(ref, self._persistent)
+            self._provisioner.destroy(ref)
         except Exception as exc:
             logger.warning("k8s: cleanup failed: %s", exc)
 
 
 __all__ = [
     "DEFAULT_KUBERNETES_CONFIG",
+    "DEFAULT_SESSION_IMAGE",
     "VALID_PROVISIONERS",
     "SESSION_SERVICE_ACCOUNT",
     "STRICT_FIELD_VALIDATION",
     "MANAGED_BY_LABEL",
-    "PVC_INSTANCE_ANNOTATION",
     "PodRef",
-    "Resources",
     "WorkspaceProvisioner",
     "PodProvisioner",
     "KubernetesEnvironment",
     "render_pod_template",
     "merge_pod_template",
+    "effective_image",
     "container_name",
     "mount_path",
     "merge_kubernetes_config",
-    "validate_kubernetes_config",
     "load_kubernetes_apis",
     "resolve_namespace",
     "resolve_owner_reference",

@@ -362,24 +362,27 @@ DEFAULT_CONFIG = {
         # for secrets, and this backend has no credential surface — in-cluster
         # auth is the ServiceAccount token the kubelet projects into the pod.
         #
-        # The schema models only what the BACKEND reasons about; everything that
-        # is merely PodSpec goes in `pod_template`, ONE PodTemplateSpec merged
-        # over a DEFAULT base with RFC 7386 (JSON merge patch) semantics.
-        # Nothing is reserved — validating and constraining the pod is the
-        # cluster's job (fieldValidation=Strict, SCC / PSA / admission policy).
+        # The schema models only what the BACKEND reasons about; everything
+        # that is merely PodSpec goes in `pod_template` (provisioner: pod), ONE
+        # PodTemplateSpec merged over a DEFAULT base with RFC 7386 (JSON merge
+        # patch) semantics — or in the cluster admin's SandboxTemplate
+        # (provisioner: sandbox). Nothing is reserved — validating and
+        # constraining the pod is the cluster's job (fieldValidation=Strict,
+        # SCC / PSA / admission policy).
         #
-        # `pod_template` and `sandbox.spec` are free-form YAML, so they are not
-        # `hermes config set` surface (a PodTemplateSpec is not a dotted-scalar
-        # field); edit config.yaml directly. See cli-config.yaml.example OPTION 7.
+        # `pod_template` is free-form YAML, so it is not `hermes config set`
+        # surface (a PodTemplateSpec is not a dotted-scalar field); edit
+        # config.yaml directly. See cli-config.yaml.example OPTION 7.
         #
         # Mirror of tools/environments/kubernetes.py:DEFAULT_KUBERNETES_CONFIG.
         # A literal is required here so `hermes config set` key validation, the
         # desktop settings schema, and `hermes config show` can walk it; the two
         # are pinned together by tests/tools/test_kubernetes_config_schema.py.
         "kubernetes": {
-            # pod     = raw Pod (+ optional PVC) via the core API
-            # sandbox = Sandbox CR (agents.x-k8s.io/v1beta1) reconciled by
-            #           agent-sandbox-operator; exec still targets its pod
+            # pod     = raw Pod via the core API; pod shape from pod_template
+            # sandbox = SandboxClaim (extensions.agents.x-k8s.io/v1beta1)
+            #           checked out of an agent-sandbox SandboxWarmPool; pod
+            #           shape from the cluster admin's SandboxTemplate
             "provisioner": "pod",
             # "" -> the projected ServiceAccount namespace file (in-cluster).
             # Deliberately not env-var resolvable.
@@ -389,19 +392,18 @@ DEFAULT_CONFIG = {
             # ambient KUBECONFIG / ~/.kube/config.
             "kubeconfig": "",
             "context": "",
-            # Base image. Stays top-level because it is the per-task override
-            # channel for RL/benchmark harnesses; a pod_template that pins
-            # spec.containers[].image wins and disables that.
-            "image": "nikolaik/python-nodejs:python3.11-nodejs20",
-            # Container this backend execs into, and the one the default base
-            # builds. Rename it here if a pod_template renames it.
+            # Container this backend execs into. For `pod` also the name the
+            # default base builds; for `sandbox` it must name a container in
+            # the SandboxTemplate.
             "container_name": "workspace",
-            # Workspace mount, and the session's default cwd.
+            # Where the workspace lives, and the session's default cwd.
             "mount_path": "/workspace",
-            # THE user layer: a PodTemplateSpec merged over the default base
-            # with RFC 7386 semantics — mappings merge, null removes, lists
-            # REPLACE wholesale — except spec.containers / spec.initContainers,
-            # which merge element-wise on `name`. Nothing is reserved.
+            # THE user layer for provisioner: pod. A PodTemplateSpec merged
+            # over the default base with RFC 7386 semantics — mappings merge,
+            # null removes, lists REPLACE wholesale — except spec.containers /
+            # spec.initContainers, which merge element-wise on `name`. Nothing
+            # is reserved (the image lives here too). Ignored by provisioner:
+            # sandbox.
             "pod_template": {},
             # Declares that this backend's session pods are disposable enough
             # to skip Hermes' dangerous-command approval prompts. Declared by
@@ -409,34 +411,19 @@ DEFAULT_CONFIG = {
             # SCC / Pod Security Admission / admission policy / NetworkPolicy,
             # which Hermes cannot see. Default false = prompts stay ON.
             "trusted_sandbox": False,
-            # Deliberately NOT inherited from container_persistent (True for
-            # docker/daytona): a cluster sandbox defaults to ephemeral.
-            "persistent": False,
-            "volume": {
-                "size": "10Gi",             # "" -> {container_disk}Mi (50Gi)
-                "storage_class_name": "",   # "" -> cluster default StorageClass
-                "access_modes": ["ReadWriteOnce"],
-                # "" -> hermes-ws-<task>, which every Hermes instance in the
-                # namespace running that task id SHARES (ReadWriteOnce: the
-                # second pod stays Pending). Set an explicit name when several
-                # agents share a namespace.
-                "claim_name": "",
-            },
-            # spec.activeDeadlineSeconds, kept top-level because the rule for
-            # APPLYING it is backend logic YAML cannot express: ephemeral pods
-            # always, persistent pods only when no ownerReference resolved
-            # (nothing else would reap them). 0 omits.
+            # Leak backstop. pod: spec.activeDeadlineSeconds. sandbox: the
+            # claim's lifecycle.shutdownTime (now + this many seconds).
+            # 0 omits.
             "active_deadline_seconds": 14400,
             "ready_timeout_seconds": 120,
             "owner_reference": "auto",      # auto | off
             # Read only when provisioner: sandbox.
             "sandbox": {
-                "api_group": "agents.x-k8s.io",
-                "api_version": "v1beta1",
-                # Sandbox CR spec, submitted verbatim for the CRD's own
-                # schema to validate. `podTemplate` is overwritten by the
-                # rendered template this backend injects.
-                "spec": {},
+                # SandboxWarmPool to claim sandboxes from. The pool and its
+                # SandboxTemplate are the cluster admin's objects — they own
+                # the pod shape; Hermes only checks a sandbox out. REQUIRED
+                # for provisioner: sandbox.
+                "warm_pool": "",
             },
         },
         # Persistent shell — keep a long-lived bash shell across execute() calls
@@ -3208,7 +3195,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 35,
+    "_config_version": 36,
 }
 
 # Optional environment variables that enhance functionality

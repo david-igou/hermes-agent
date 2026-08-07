@@ -328,10 +328,11 @@ terminal:
 
 # -----------------------------------------------------------------------------
 # OPTION 7: Kubernetes session pods
-# Each session runs in its own pod in a Kubernetes / OpenShift cluster; every
-# command is exec'd into that pod.
+# Each session runs in its own STATELESS pod in a Kubernetes / OpenShift
+# cluster; every command is exec'd into that pod and the workspace (an
+# emptyDir) dies with it.
 # Great for: running Hermes in-cluster with real workload isolation, kata /
-#            sandboxed-containers runtimes, cluster-managed quotas and storage
+#            sandboxed-containers runtimes, cluster-managed quotas
 # Requires: pip install 'hermes-agent[kubernetes]' (NOT lazy-installed: the
 #           terminal tool stays disabled until the client is importable) and the
 #           RBAC in k8s/rbac.yaml
@@ -341,12 +342,21 @@ terminal:
 # this backend has no credential of its own: in-cluster auth is the projected
 # ServiceAccount token the kubelet mounts into the Hermes pod.
 # -----------------------------------------------------------------------------
-# The schema models only what the BACKEND has to reason about. Everything that
-# is merely PodSpec lives in ONE `pod_template` PodTemplateSpec merged over a
-# DEFAULT base — defaults that make the out-of-box config produce a working
-# pod, NOT constraints. Nothing is reserved: a pod_template may override any
-# field, including the exec container's command, args, restartPolicy,
-# volumeMounts and securityContext.
+# Two provisioners; who AUTHORS the pod is the difference:
+#
+#   provisioner: pod      you author the pod, in ONE `pod_template`
+#                         PodTemplateSpec merged over a DEFAULT base — defaults
+#                         that make the out-of-box config produce a working
+#                         pod, NOT constraints. Nothing is reserved: image,
+#                         command, args, restartPolicy, volumeMounts,
+#                         securityContext — all overridable.
+#   provisioner: sandbox  your CLUSTER ADMIN authors the pod, once, in an
+#                         agent-sandbox SandboxTemplate; a SandboxWarmPool
+#                         keeps sandboxes pre-provisioned from it and Hermes
+#                         checks one out per session with a SandboxClaim
+#                         (extensions.agents.x-k8s.io/v1beta1). pod_template
+#                         is IGNORED on this path. See k8s/README.md for the
+#                         admin-side objects.
 #
 # Merge rule for pod_template: JSON merge patch, RFC 7386 — mappings merge
 # recursively, a `null` REMOVES the key it names, and lists REPLACE wholesale
@@ -356,12 +366,17 @@ terminal:
 # container without restating its image, command and mounts. A container the
 # base does not declare is appended.
 #
-# Validating and constraining the POD is the cluster's job, not Hermes'. Every
-# create this backend issues passes fieldValidation=Strict, so a malformed or
-# unknown field is a 400 naming the exact JSON path; what a session pod is
-# ALLOWED to be is decided by SCC, Pod Security Admission, your
-# ValidatingAdmissionPolicy, NetworkPolicy and RBAC. A pod that cannot serve
-# exec fails at the first command — visibly, which is the point.
+# Validating and constraining the POD is the cluster's job, not Hermes' —
+# there is NO in-process config validation. Every create this backend issues
+# passes fieldValidation=Strict, so a malformed or unknown field is a 400
+# naming the exact JSON path; what a session pod is ALLOWED to be is decided
+# by SCC, Pod Security Admission, your ValidatingAdmissionPolicy,
+# NetworkPolicy and RBAC. A pod that cannot serve exec fails at the first
+# command — visibly, which is the point.
+#
+# NOTE: the shared container_cpu / container_memory / container_disk /
+# container_persistent keys below are NOT read by this backend. Resources go
+# in pod_template (or the SandboxTemplate), like every other pod field.
 #
 # terminal:
 #   backend: "kubernetes"
@@ -369,22 +384,22 @@ terminal:
 #   timeout: 180
 #   lifetime_seconds: 300
 #   kubernetes:
-#     provisioner: "pod"           # pod     = raw Pod (+PVC) via the core API
-#                                  # sandbox = Sandbox CR (agents.x-k8s.io/v1beta1)
-#                                  #           reconciled by agent-sandbox-operator
+#     provisioner: "pod"           # pod | sandbox (see above)
 #     namespace: ""                # "" -> the in-cluster ServiceAccount namespace
 #     kubeconfig: ""               # out-of-cluster dev only (a PATH, not a secret)
 #     context: ""
 #
-#     image: "nikolaik/python-nodejs:python3.11-nodejs20"
-#     container_name: "workspace"  # the container Hermes execs into, and the
-#                                  # one the default base builds. Rename it
-#                                  # here if a pod_template renames it.
-#     mount_path: "/workspace"     # workspace mount, and the session's cwd
+#     container_name: "workspace"  # the container Hermes execs into. For
+#                                  # `pod` also the one the default base
+#                                  # builds; for `sandbox` it must name a
+#                                  # container in the SandboxTemplate.
+#     mount_path: "/workspace"     # where the workspace lives, and the
+#                                  # session's cwd
 #
-#     pod_template: {}             # PodTemplateSpec merged over the default
-#                                  # base (see the merge rule above). This is
-#                                  # where runtimeClassName, nodeSelector,
+#     pod_template: {}             # provisioner: pod only. PodTemplateSpec
+#                                  # merged over the default base (see the
+#                                  # merge rule above). This is where image,
+#                                  # runtimeClassName, nodeSelector,
 #                                  # tolerations, resources, imagePullPolicy,
 #                                  # imagePullSecrets, env, labels, annotations
 #                                  # and securityContext live.
@@ -405,33 +420,22 @@ terminal:
 #                                  # which Hermes cannot see. Leave false unless
 #                                  # you have locked the namespace down.
 #
-#     persistent: false            # opt-in retained PVC per task; NOT inherited
-#                                  # from container_persistent
-#     volume:
-#       size: "10Gi"               # "" -> {container_disk}Mi (50Gi by default)
-#       storage_class_name: ""     # "" -> cluster default StorageClass
-#       access_modes: ["ReadWriteOnce"]
-#       claim_name: ""             # "" -> hermes-ws-<task>, SHARED by every
-#                                  # Hermes instance in the namespace running
-#                                  # that task id (RWO: the second pod stays
-#                                  # Pending). Pin it per instance to avoid that.
-#     active_deadline_seconds: 14400   # leak backstop: ephemeral pods always,
-#                                      # persistent pods only when no
-#                                      # ownerReference resolved. 0 omits.
-#     ready_timeout_seconds: 120       # raise for slow pulls / kata runtimes
+#     active_deadline_seconds: 14400   # leak backstop. pod: spec.active-
+#                                      # DeadlineSeconds; sandbox: the claim's
+#                                      # lifecycle.shutdownTime. 0 omits.
+#     ready_timeout_seconds: 120       # raise for slow pulls / kata cold starts
+#                                      # on provisioner: pod (a warm pool makes
+#                                      # this a non-issue on sandbox)
 #     owner_reference: "auto"          # auto | off (GC session pods with the agent pod)
 #
 #     sandbox:                     # only read when provisioner: sandbox
-#       api_group: "agents.x-k8s.io"
-#       api_version: "v1beta1"
-#       spec: {}                   # Sandbox CR spec, submitted VERBATIM for the
-#                                  # CRD's own schema to validate under
-#                                  # fieldValidation=Strict. podTemplate is
-#                                  # injected from pod_template above, so a
-#                                  # podTemplate written here is overwritten.
+#       warm_pool: ""              # REQUIRED there: the SandboxWarmPool to
+#                                  # claim sandboxes from. The pool and its
+#                                  # SandboxTemplate are your cluster admin's
+#                                  # objects — see k8s/README.md.
 #
-# Minimal OpenShift 4.21 + kata example — note that runtimeClassName and
-# resources are plain PodSpec, so they go in pod_template:
+# Minimal OpenShift 4.21 + kata example (provisioner: pod) — note that image,
+# runtimeClassName and resources are plain PodSpec, so they go in pod_template:
 # terminal:
 #   backend: "kubernetes"
 #   kubernetes:
@@ -442,12 +446,22 @@ terminal:
 #         runtimeClassName: "kata"
 #         containers:
 #           - name: "workspace"    # merged by `name` onto the default base
+#             image: "nikolaik/python-nodejs:python3.11-nodejs20"
 #             resources:
 #               requests: {cpu: "500m", memory: "2Gi"}
 #               limits:   {cpu: "2",    memory: "4Gi"}
+#
+# Same isolation via an admin-owned warm pool (provisioner: sandbox):
+# terminal:
+#   backend: "kubernetes"
+#   kubernetes:
+#     provisioner: "sandbox"
+#     namespace: "hermes-agents"
+#     sandbox:
+#       warm_pool: "hermes-session-pool"
 
 #
-# --- Container resource limits (docker, singularity, modal, daytona, kubernetes -- ignored for local/ssh) ---
+# --- Container resource limits (docker, singularity, modal, daytona -- ignored for local/ssh/kubernetes) ---
 # These settings apply to all container backends. They control the resources
 # allocated to the sandbox and whether its filesystem persists across sessions.
   container_cpu: 1              # CPU cores

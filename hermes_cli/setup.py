@@ -1617,8 +1617,10 @@ def setup_terminal_backend(config: dict):
         provisioner_idx = prompt_choice(
             "Workspace provisioner:",
             [
-                "pod - raw Pod + optional PVC via the Kubernetes API (default)",
-                "sandbox - Sandbox CR reconciled by agent-sandbox-operator",
+                "pod - raw Pod via the Kubernetes API; you author the pod "
+                "shape in pod_template (default)",
+                "sandbox - SandboxClaim checked out of an agent-sandbox "
+                "SandboxWarmPool; your cluster admin authors the pod shape",
             ],
             0 if k8s_cfg.get("provisioner", "pod") == "pod" else 1,
         )
@@ -1630,24 +1632,32 @@ def setup_terminal_backend(config: dict):
         )
         k8s_cfg["namespace"] = (namespace or "").strip()
 
-        image = prompt(
-            "    Session pod image",
-            default=k8s_cfg.get("image", "nikolaik/python-nodejs:python3.11-nodejs20"),
-        )
-        if image:
-            k8s_cfg["image"] = image.strip()
-
+        if k8s_cfg["provisioner"] == "sandbox":
+            sandbox_cfg = k8s_cfg.setdefault("sandbox", {})
+            warm_pool = prompt(
+                "    SandboxWarmPool to claim sandboxes from (required; "
+                "created by your cluster admin)",
+                default=sandbox_cfg.get("warm_pool", ""),
+            )
+            sandbox_cfg["warm_pool"] = (warm_pool or "").strip()
+            if not sandbox_cfg["warm_pool"]:
+                print_warning(
+                    "provisioner: sandbox needs terminal.kubernetes.sandbox."
+                    "warm_pool — sessions will fail until it is set."
+                )
+        else:
+            print_info(
+                "  The pod (image, runtimeClassName for kata, nodeSelector, "
+                "tolerations, resources, extra volumes, securityContext) is "
+                "authored in terminal.kubernetes.pod_template — one "
+                "PodTemplateSpec merged over a default base (RFC 7386 "
+                "semantics). Edit config.yaml directly; see "
+                "cli-config.yaml.example (OPTION 7)."
+            )
         print_info(
-            "  Everything else about the pod (runtimeClassName for kata, "
-            "nodeSelector, tolerations, resources, extra volumes, "
-            "securityContext) goes in terminal.kubernetes.pod_template — one "
-            "PodTemplateSpec merged over a default base (RFC 7386 semantics). "
-            "Edit config.yaml "
-            "directly; see cli-config.yaml.example (OPTION 7)."
-        )
-        print_info(
-            "  Apply k8s/rbac.yaml so the agent ServiceAccount can create and "
-            "exec into session pods, then run `hermes doctor` to verify RBAC."
+            "  Apply k8s/rbac.yaml so the agent ServiceAccount can provision "
+            "and exec into session pods, then run `hermes doctor` to verify "
+            "RBAC."
         )
 
     elif selected_backend == "ssh":

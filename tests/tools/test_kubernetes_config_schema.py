@@ -190,30 +190,27 @@ def test_config_set_cannot_mirror_the_block_into_dotenv():
     assert "terminal.kubernetes" in _TERMINAL_ENV_MIRROR_EXCLUDED
     # Nested paths never resolve to an env var at all.
     assert terminal_config_env_var_for_key("terminal.kubernetes.namespace") is None
-    assert terminal_config_env_var_for_key("terminal.kubernetes.image") is None
+    assert terminal_config_env_var_for_key("terminal.kubernetes.container_name") is None
 
 
 def test_nested_kubernetes_keys_validate_as_known_config_keys():
     """`hermes config set terminal.kubernetes.namespace foo` must be accepted,
     which requires every scalar to be enumerated in DEFAULT_CONFIG.
 
-    `pod_template` and `sandbox.spec` are deliberately NOT in this list: they
-    are free-form PodTemplateSpec / CR spec, not dotted-scalar surface, and are
-    edited in config.yaml directly."""
+    `pod_template` is deliberately NOT in this list: it is a free-form
+    PodTemplateSpec, not dotted-scalar surface, and is edited in config.yaml
+    directly."""
     from hermes_cli.config import _validate_config_key
 
     for key in (
         "terminal.kubernetes.namespace",
         "terminal.kubernetes.provisioner",
-        "terminal.kubernetes.image",
         "terminal.kubernetes.container_name",
         "terminal.kubernetes.mount_path",
-        "terminal.kubernetes.persistent",
         "terminal.kubernetes.active_deadline_seconds",
         "terminal.kubernetes.ready_timeout_seconds",
         "terminal.kubernetes.owner_reference",
-        "terminal.kubernetes.volume.storage_class_name",
-        "terminal.kubernetes.sandbox.api_group",
+        "terminal.kubernetes.sandbox.warm_pool",
     ):
         is_known, suggestion = _validate_config_key(key)
         assert is_known, (
@@ -235,6 +232,12 @@ def test_deleted_kubernetes_keys_are_not_recognised():
         "terminal.kubernetes.resources.limits.memory",
         "terminal.kubernetes.sandbox.template_ref",
         "terminal.kubernetes.pod_template_overrides",
+        # The stateless / claim-based cut (v36):
+        "terminal.kubernetes.image",
+        "terminal.kubernetes.persistent",
+        "terminal.kubernetes.volume.storage_class_name",
+        "terminal.kubernetes.sandbox.api_group",
+        "terminal.kubernetes.sandbox.api_version",
     ):
         is_known, _ = _validate_config_key(key)
         assert not is_known, f"{key} was hard-cut but still validates"
@@ -274,20 +277,11 @@ def test_the_migration_deletes_the_hard_cut_keys_and_renames_the_provisioner():
     assert "runtime_class_name" not in kube and "service_account" not in kube
     assert set(kube["sandbox"]) <= {"api_group", "api_version", "spec"}
     # sandbox.spec carries the CR fields but never a second pod template.
+    # (v36 then deletes api_group/api_version/spec entirely.)
     assert kube["sandbox"]["spec"]["networkPolicy"] == {"egress": "deny"}
     assert "podTemplate" not in kube["sandbox"]["spec"]
     # The user is TOLD what was dropped rather than discovering it at runtime.
     assert any("runtime_class_name" in w for w in results["warnings"]), results
-
-    # And the migration's OUTPUT must satisfy the validator that now rejects
-    # unknown keys — a migration that leaves the file failing validation just
-    # moves the loud failure somewhere less useful.
-    from tools.environments.kubernetes import (
-        merge_kubernetes_config,
-        validate_kubernetes_config,
-    )
-
-    assert validate_kubernetes_config(merge_kubernetes_config(kube)) == []
 
 
 def test_the_approval_skip_migration_writes_the_key_explicitly():
@@ -314,15 +308,6 @@ def test_the_approval_skip_migration_writes_the_key_explicitly():
     assert written["terminal"]["kubernetes"]["trusted_sandbox"] is False
     assert any("trusted_sandbox" in w for w in results["warnings"]), results
 
-    from tools.environments.kubernetes import (
-        merge_kubernetes_config,
-        validate_kubernetes_config,
-    )
-
-    assert validate_kubernetes_config(
-        merge_kubernetes_config(written["terminal"]["kubernetes"])
-    ) == []
-
 
 def test_the_approval_skip_migration_never_overwrites_an_explicit_choice():
     """An operator who already opted in keeps the skip."""
@@ -340,6 +325,64 @@ def test_the_approval_skip_migration_never_overwrites_an_explicit_choice():
         config_mod.read_raw_config, config_mod._persist_migration = saved
 
     assert written == {}, "migration rewrote an explicit trusted_sandbox"
+
+
+def test_the_stateless_migration_moves_the_image_and_deletes_the_rest():
+    """v35 -> v36: session pods became stateless and the sandbox provisioner
+    became claim-based. `image` is MOVED into pod_template (intent preserved);
+    `persistent`, `volume` and the old sandbox.{api_group,api_version,spec}
+    keys are deleted with a warning naming the replacement."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.config_migrations import _migrate_to_36
+
+    on_disk = {"terminal": {"kubernetes": {
+        "image": "quay.io/hermes/session:1",
+        "persistent": True,
+        "volume": {"size": "10Gi", "claim_name": "mine"},
+        "sandbox": {"api_group": "agents.x-k8s.io", "api_version": "v1beta1",
+                    "spec": {"ttlSeconds": 900}},
+    }}}
+    written = {}
+    saved = (config_mod.read_raw_config, config_mod._persist_migration)
+    try:
+        config_mod.read_raw_config = lambda: on_disk
+        config_mod._persist_migration = lambda cfg: written.update(cfg)
+        results = {"config_added": [], "warnings": []}
+        _migrate_to_36(results, quiet=True)
+    finally:
+        config_mod.read_raw_config, config_mod._persist_migration = saved
+
+    kube = written["terminal"]["kubernetes"]
+    containers = kube["pod_template"]["spec"]["containers"]
+    assert {"name": "workspace", "image": "quay.io/hermes/session:1"} in containers
+    for gone in ("image", "persistent", "volume"):
+        assert gone not in kube
+    assert kube["sandbox"] == {}
+    assert any("warm_pool" in w for w in results["warnings"]), results
+
+
+def test_the_stateless_migration_respects_a_pinned_pod_template_image():
+    """A pod_template that already pins the exec container's image wins; the
+    old `image` key is dropped, not silently promoted over it."""
+    from hermes_cli import config as config_mod
+    from hermes_cli.config_migrations import _migrate_to_36
+
+    on_disk = {"terminal": {"kubernetes": {
+        "image": "old:1",
+        "pod_template": {"spec": {"containers": [
+            {"name": "workspace", "image": "pinned:1"}]}},
+    }}}
+    written = {}
+    saved = (config_mod.read_raw_config, config_mod._persist_migration)
+    try:
+        config_mod.read_raw_config = lambda: on_disk
+        config_mod._persist_migration = lambda cfg: written.update(cfg)
+        _migrate_to_36({"config_added": [], "warnings": []}, quiet=True)
+    finally:
+        config_mod.read_raw_config, config_mod._persist_migration = saved
+
+    containers = written["terminal"]["kubernetes"]["pod_template"]["spec"]["containers"]
+    assert containers == [{"name": "workspace", "image": "pinned:1"}]
 
 
 def test_trusted_sandbox_is_config_set_surface():
@@ -415,12 +458,8 @@ def test_backend_modules_import_without_the_kubernetes_sdk():
     try:
         k8s = importlib.import_module(modules[0])
         importlib.import_module(modules[1])
-        template = k8s.render_pod_template(
-            k8s.merge_kubernetes_config({}), persistent=False, image="i:1",
-            resources=k8s.Resources(), pvc_name="pvc",
-        )
-        assert template["spec"]["containers"][0]["image"] == "i:1"
-        assert k8s.validate_kubernetes_config(k8s.merge_kubernetes_config({})) == []
+        template = k8s.render_pod_template(k8s.merge_kubernetes_config({}))
+        assert template["spec"]["containers"][0]["image"] == k8s.DEFAULT_SESSION_IMAGE
     finally:
         builtins.__import__ = real_import
         for name in modules:

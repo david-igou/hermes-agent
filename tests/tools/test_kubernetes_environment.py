@@ -27,18 +27,17 @@ import pytest
 
 from tools.environments.kubernetes import (
     DEFAULT_KUBERNETES_CONFIG,
+    DEFAULT_SESSION_IMAGE,
     KubernetesEnvironment,
     PodProvisioner,
     PodRef,
-    Resources,
     WorkspaceProvisioner,
     merge_kubernetes_config,
     render_pod_template,
     sanitize_name,
-    validate_kubernetes_config,
 )
 
-# merge_pod_template and the sandbox provisioner are imported inside the tests
+# merge_pod_template and the claim provisioner are imported inside the tests
 # that use them, so this module still imports against a build that lacks them.
 
 
@@ -102,9 +101,9 @@ def _kcfg(**overrides):
 
 
 def _sandbox_cls():
-    from tools.environments.kubernetes_sandbox import SandboxProvisioner
+    from tools.environments.kubernetes_sandbox import SandboxClaimProvisioner
 
-    return SandboxProvisioner
+    return SandboxClaimProvisioner
 
 
 OWNER_REF = {
@@ -115,6 +114,8 @@ OWNER_REF = {
     "controller": False,
     "blockOwnerDeletion": False,
 }
+
+MANAGED_BY = "app.kubernetes.io/managed-by"
 
 
 # ---------------------------------------------------------------------------
@@ -160,100 +161,64 @@ def test_partial_config_still_yields_every_default():
     assert merged["namespace"] == "hermes-agents"
     assert merged["provisioner"] == "pod"
     assert merged["container_name"] == "workspace"
-    assert merged["volume"]["access_modes"] == ["ReadWriteOnce"]
-    assert merged["sandbox"]["api_group"] == "agents.x-k8s.io"
+    assert merged["sandbox"]["warm_pool"] == ""
 
 
 def test_partial_nested_config_merges_rather_than_replaces():
-    merged = merge_kubernetes_config(
-        {"volume": {"size": "20Gi"}, "sandbox": {"api_version": "v1"}}
-    )
-    assert merged["volume"]["size"] == "20Gi"
-    assert merged["volume"]["access_modes"] == ["ReadWriteOnce"]
-    assert merged["sandbox"]["api_version"] == "v1"
-    assert merged["sandbox"]["api_group"] == "agents.x-k8s.io"
+    merged = merge_kubernetes_config({"sandbox": {"warm_pool": "pool-a"}})
+    assert merged["sandbox"]["warm_pool"] == "pool-a"
+    assert merged["provisioner"] == "pod"
 
 
 def test_merge_does_not_mutate_defaults():
     merged = merge_kubernetes_config({"pod_template": {"spec": {}}})
     merged["pod_template"]["spec"]["hostPID"] = True
-    merged["sandbox"]["spec"]["ttlSeconds"] = 5
+    merged["sandbox"]["warm_pool"] = "mutated"
     assert DEFAULT_KUBERNETES_CONFIG["pod_template"] == {}
-    assert DEFAULT_KUBERNETES_CONFIG["sandbox"]["spec"] == {}
+    assert DEFAULT_KUBERNETES_CONFIG["sandbox"]["warm_pool"] == ""
 
 
-def test_validation_rejects_an_unknown_provisioner():
-    """`provisioner` selects which Kubernetes API this backend calls, so an
-    unknown value has no request to be rejected by — it is one of the two
-    things the API server cannot check for us."""
-    problems = validate_kubernetes_config(_kcfg(provisioner="operator"))
-    assert any("provisioner" in p for p in problems)
+def test_there_is_no_in_process_config_validator():
+    """The one Hermes-side decision (the provisioner enum) raises in the
+    environment factory; everything else — quantities, RFC-1123 names, mount
+    collisions, unknown fields — is the API server's to reject under
+    fieldValidation=Strict. An in-process approximation would be redundant
+    where it agreed and wrong where it did not."""
+    import tools.environments.kubernetes as k8s_mod
 
-
-def test_validation_leaves_pod_content_to_the_api_server():
-    """A bogus quantity, a bad RFC-1123 name and a /tmp mount collision are all
-    things the API server rejects with the exact JSON path under
-    fieldValidation=Strict. Hermes deliberately says nothing about them: an
-    in-process approximation would be redundant where it agreed and wrong where
-    it did not."""
-    assert validate_kubernetes_config(_kcfg(volume={"size": "2 gigabytes"})) == []
-    assert validate_kubernetes_config(_kcfg(container_name="Not Valid")) == []
-    assert validate_kubernetes_config(_kcfg(mount_path="/tmp")) == []
-    assert validate_kubernetes_config(_kcfg(pod_template={"spec": {
-        "securityContext": {"runAsUser": 0, "runAsNonRoot": False},
-    }})) == []
-
-
-def test_validation_reports_the_types_it_needs_to_build_a_request():
-    """The other half of what the API server cannot do for us: a scalar where a
-    mapping belongs is a TypeError inside a manifest builder, never an HTTP
-    response."""
-    assert any("pod_template" in p
-               for p in validate_kubernetes_config(_kcfg(pod_template=["a"])))
-    assert any("sandbox.spec" in p for p in validate_kubernetes_config(
-        _kcfg(sandbox={"api_group": "g", "api_version": "v", "spec": "nope"})))
-    assert any("terminal.kubernetes must be a mapping"
-               in p for p in validate_kubernetes_config("nope"))
+    assert not hasattr(k8s_mod, "validate_kubernetes_config")
 
 
 def test_the_old_provisioner_name_is_gone():
-    """`direct` was renamed `pod` — a hard cut, so the old value must FAIL
-    rather than quietly keep working through an alias."""
+    """`direct` was renamed `pod` — a hard cut, enforced by the factory."""
     from tools.environments.kubernetes import VALID_PROVISIONERS
 
     assert VALID_PROVISIONERS == ("pod", "sandbox")
-    assert any(
-        "provisioner" in p
-        for p in validate_kubernetes_config(_kcfg(provisioner="direct"))
-    )
-
-
-def test_default_config_is_valid():
-    assert validate_kubernetes_config(merge_kubernetes_config({})) == []
 
 
 def test_hard_cut_keys_are_not_in_the_schema():
-    """The ~30 PodSpec-shaped keys collapsed into pod_template. No aliases, no
-    shim: the schema is the 15 top-level keys the backend reasons about
-    (20 leaves counting volume.* and sandbox.*)."""
-    # Named, not counted: a bare `== 14` fails for any legitimate new key and
+    """The PodSpec-shaped keys collapsed into pod_template, and the stateless
+    cut removed the persistence and image sugar on top. No aliases, no shim."""
+    # Named, not counted: a bare count fails for any legitimate new key and
     # names no offender. This fails for the same input and says which key.
     assert set(DEFAULT_KUBERNETES_CONFIG) == {
-        "provisioner", "namespace", "kubeconfig", "context", "image",
+        "provisioner", "namespace", "kubeconfig", "context",
         "container_name", "mount_path", "pod_template", "trusted_sandbox",
-        "persistent", "volume", "active_deadline_seconds",
-        "ready_timeout_seconds", "owner_reference", "sandbox",
+        "active_deadline_seconds", "ready_timeout_seconds",
+        "owner_reference", "sandbox",
     }, sorted(DEFAULT_KUBERNETES_CONFIG)
     gone = {
         "image_pull_policy", "image_pull_secrets", "service_account",
         "automount_service_account_token", "runtime_class_name",
         "node_selector", "tolerations", "labels", "annotations", "env",
         "security_context", "resources", "pod_template_overrides",
+        # The stateless / claim-based cut:
+        "image", "persistent", "volume",
     }
     assert not (gone & set(DEFAULT_KUBERNETES_CONFIG))
-    assert set(DEFAULT_KUBERNETES_CONFIG["sandbox"]) == {
-        "api_group", "api_version", "spec",
-    }
+    # ONE sandbox-side key: the pool to claim from. The pod shape is the
+    # cluster admin's SandboxTemplate, so api_group/api_version/spec are gone.
+    assert set(DEFAULT_KUBERNETES_CONFIG["sandbox"]) == {"warm_pool"}
     assert "pod_template" in DEFAULT_KUBERNETES_CONFIG
 
 
@@ -268,82 +233,43 @@ def _provisioner(**overrides):
     )
 
 
-def test_ephemeral_pod_uses_emptydir_and_carries_ownerref():
-    pod = _provisioner().pod_manifest(
-        "abc", persistent=False, image="img:1", resources=Resources()
-    )
+def test_pod_uses_emptydir_and_carries_ownerref():
+    """Stateless by design: the workspace is an emptyDir that dies with the
+    pod. There is no PVC surface at all."""
+    pod = _provisioner().pod_manifest("abc")
     vols = {v["name"]: v for v in pod["spec"]["volumes"]}
     assert vols["workspace"]["emptyDir"] == {}
     mount = pod["spec"]["containers"][0]["volumeMounts"][0]
     assert mount["mountPath"] == "/workspace"
     assert pod["metadata"]["ownerReferences"][0]["uid"] == OWNER_REF["uid"]
+    assert not any("persistentVolumeClaim" in v for v in pod["spec"]["volumes"])
 
 
-def test_persistent_pod_references_pvc_by_task_id():
+def test_there_is_no_pvc_surface():
+    """The stateless cut removed pvc_name/pvc_manifest/_ensure_pvc wholesale —
+    nothing in the backend can create, adopt or mount a claim."""
     p = _provisioner()
-    pod = p.pod_manifest("mytask", persistent=True, image="img:1", resources=Resources())
-    vol = pod["spec"]["volumes"][0]
-    assert vol["persistentVolumeClaim"]["claimName"] == "hermes-ws-mytask"
-
-
-def test_pvc_manifest_has_no_ownerref():
-    """A persistent PVC must outlive the agent pod, so it gets no ownerRef."""
-    pvc = _provisioner().pvc_manifest("mytask", resources=Resources(disk_mib=10240))
-    assert pvc["metadata"]["name"] == "hermes-ws-mytask"
-    assert "ownerReferences" not in pvc["metadata"]
-    # Conservative explicit default rather than 50Gi derived from container_disk.
-    assert pvc["spec"]["resources"]["requests"]["storage"] == "10Gi"
-    assert "storageClassName" not in pvc["spec"]
-    # Nothing else reaps these claims, so a reaper needs a selector.
-    assert pvc["metadata"]["labels"]["hermes.nousresearch.com/task"] == "mytask"
-
-
-def test_pvc_size_still_falls_back_to_container_disk_when_cleared():
-    pvc = _provisioner(volume={"size": ""}).pvc_manifest(
-        "mytask", resources=Resources(disk_mib=10240)
-    )
-    assert pvc["spec"]["resources"]["requests"]["storage"] == "10240Mi"
-
-
-def test_pvc_name_can_be_pinned_so_instances_do_not_share_a_workspace():
-    """pvc_name() is task-scoped but not instance-scoped, so two agents in one
-    namespace collide on hermes-ws-default (RWO: the second pod stays
-    Pending). volume.claim_name is the escape hatch."""
-    default = _provisioner().pvc_name("default")
-    pinned = _provisioner(volume={"claim_name": "hermes-ws-agent-a"}).pvc_name(
-        "default"
-    )
-    assert default == "hermes-ws-default"
-    assert pinned == "hermes-ws-agent-a"
-
-
-def test_pvc_honours_configured_storage_class_and_size():
-    p = PodProvisioner(
-        _kcfg(volume={"size": "20Gi", "storage_class_name": "truenas-nvme",
-                      "access_modes": ["ReadWriteMany"]}),
-        "hermes", api=None, owner_reference=OWNER_REF,
-    )
-    pvc = p.pvc_manifest("mytask", resources=Resources())
-    assert pvc["spec"]["resources"]["requests"]["storage"] == "20Gi"
-    assert pvc["spec"]["storageClassName"] == "truenas-nvme"
-    assert pvc["spec"]["accessModes"] == ["ReadWriteMany"]
+    for attr in ("pvc_name", "pvc_manifest", "_ensure_pvc", "_assert_pvc_is_ours"):
+        assert not hasattr(p, attr), attr
 
 
 def test_pod_manifest_omits_ownerref_when_owner_unknown():
     """K8s rejects an ownerReference with an empty name/uid with a 422."""
     p = PodProvisioner(_kcfg(), "hermes", api=None, owner_reference=None)
-    pod = p.pod_manifest("abc", persistent=False, image="img:1", resources=Resources())
+    pod = p.pod_manifest("abc")
     assert "ownerReferences" not in pod["metadata"]
 
 
-def test_ephemeral_pod_has_active_deadline_persistent_does_not():
+def test_every_pod_gets_the_active_deadline_backstop():
     p = PodProvisioner(
         _kcfg(active_deadline_seconds=999), "hermes", api=None, owner_reference=OWNER_REF
     )
-    ephemeral = p.pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
-    persistent = p.pod_manifest("abc", persistent=True, image="i:1", resources=Resources())
-    assert ephemeral["spec"]["activeDeadlineSeconds"] == 999
-    assert "activeDeadlineSeconds" not in persistent["spec"]
+    assert p.pod_manifest("abc")["spec"]["activeDeadlineSeconds"] == 999
+    # 0 omits it.
+    off = PodProvisioner(
+        _kcfg(active_deadline_seconds=0), "hermes", api=None, owner_reference=OWNER_REF
+    )
+    assert "activeDeadlineSeconds" not in off.pod_manifest("abc")["spec"]
 
 
 def test_the_default_base_is_a_sane_starting_point():
@@ -351,9 +277,7 @@ def test_the_default_base_is_a_sane_starting_point():
     every one of them is overridable (see the override tests below). They exist
     so the out-of-box config produces a pod that starts, stays up, can be
     exec'd into, and satisfies OpenShift restricted-v2 without extra RBAC."""
-    pod = _provisioner().pod_manifest(
-        "abc", persistent=False, image="img:1", resources=Resources()
-    )
+    pod = _provisioner().pod_manifest("abc")
     spec = pod["spec"]
     assert spec["restartPolicy"] == "Never"
     assert spec["automountServiceAccountToken"] is False
@@ -373,6 +297,12 @@ def test_the_default_base_is_a_sane_starting_point():
     assert "runAsUser" not in spec["securityContext"]
     assert "fsGroup" not in spec["securityContext"]
     assert "runAsUser" not in sc
+    # The base image is a constant, not a config key: override it in
+    # pod_template like every other pod field.
+    assert spec["containers"][0]["image"] == DEFAULT_SESSION_IMAGE
+    # The shared terminal.container_* knobs are NOT read: resources live in
+    # pod_template only, so the base declares none.
+    assert "resources" not in spec["containers"][0]
 
 
 def test_pod_template_reaches_the_manifest():
@@ -392,7 +322,7 @@ def test_pod_template_reaches_the_manifest():
                             "env": [{"name": "HTTPS_PROXY", "value": "http://p:3128"}]}],
         },
     })
-    pod = p.pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
+    pod = p.pod_manifest("abc")
     spec = pod["spec"]
     assert spec["runtimeClassName"] == "kata"
     assert spec["nodeSelector"] == {"node-role.kubernetes.io/worker": ""}
@@ -406,31 +336,42 @@ def test_pod_template_reaches_the_manifest():
     assert container["imagePullPolicy"] == "Always"
     assert {"name": "HTTPS_PROXY", "value": "http://p:3128"} in container["env"]
     # ...and the merge kept the base container intact.
-    assert container["image"] == "i:1"
+    assert container["image"] == DEFAULT_SESSION_IMAGE
     assert container["command"] == ["sleep", "infinity"]
     # Merge, not replace, at the spec level too.
     assert spec["restartPolicy"] == "Never"
 
 
-def test_resources_come_from_the_shared_container_keys():
-    """terminal.container_cpu / container_memory feed the BASE; a pod_template
-    container merges over it by name."""
-    default_pod = _provisioner().pod_manifest(
-        "abc", persistent=False, image="i:1",
-        resources=Resources(cpu=0.5, memory_mib=2048),
-    )
-    requests = default_pod["spec"]["containers"][0]["resources"]["requests"]
-    assert requests == {"cpu": "500m", "memory": "2048Mi"}
-    assert "limits" not in default_pod["spec"]["containers"][0]["resources"]
-
+def test_resources_and_image_live_in_pod_template_only():
+    """The shared terminal.container_cpu/memory/disk knobs and the old `image`
+    sugar key are gone: every sibling backend honours the shared knobs, this
+    backend documents that it does not, and the pod_template is the one place
+    pod shape lives."""
     explicit = _provisioner(pod_template={"spec": {"containers": [
-        {"name": "workspace", "resources": {
+        {"name": "workspace",
+         "image": "quay.io/hermes/session:1",
+         "resources": {
             "requests": {"cpu": "250m", "memory": "1Gi"},
             "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "8Gi"}}},
-    ]}}).pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
-    res = explicit["spec"]["containers"][0]["resources"]
-    assert res["requests"] == {"cpu": "250m", "memory": "1Gi"}
-    assert res["limits"] == {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "8Gi"}
+    ]}}).pod_manifest("abc")
+    container = explicit["spec"]["containers"][0]
+    assert container["image"] == "quay.io/hermes/session:1"
+    assert container["resources"]["requests"] == {"cpu": "250m", "memory": "1Gi"}
+    assert container["resources"]["limits"] == {
+        "cpu": "2", "memory": "4Gi", "ephemeral-storage": "8Gi"}
+    # The merge kept the rest of the base container.
+    assert container["command"] == ["sleep", "infinity"]
+
+
+def test_effective_image_is_derived_for_display_only():
+    from tools.environments.kubernetes import effective_image
+
+    assert effective_image(_kcfg()) == DEFAULT_SESSION_IMAGE
+    assert effective_image(_kcfg(pod_template={"spec": {"containers": [
+        {"name": "workspace", "image": "quay.io/x:1"}]}})) == "quay.io/x:1"
+    # The cluster's SandboxTemplate decides on the claim path; Hermes cannot
+    # know, and says so with an empty string.
+    assert effective_image(_kcfg(provisioner="sandbox")) == ""
 
 
 def test_tmp_emptydir_is_unconditional():
@@ -438,9 +379,7 @@ def test_tmp_emptydir_is_unconditional():
     always mounts an emptyDir there. Overridable like everything else — a
     pod_template that replaces spec.volumes drops it, and the session's env
     tracking then fails visibly on the first command."""
-    pod = _provisioner().pod_manifest(
-        "abc", persistent=False, image="i:1", resources=Resources()
-    )
+    pod = _provisioner().pod_manifest("abc")
     mounts = {m["mountPath"] for m in pod["spec"]["containers"][0]["volumeMounts"]}
     assert "/tmp" in mounts
     assert any(v["name"] == "tmp" for v in pod["spec"]["volumes"])
@@ -448,7 +387,7 @@ def test_tmp_emptydir_is_unconditional():
 
 def test_mount_path_is_configurable():
     p = _provisioner(mount_path="/home/agent")
-    pod = p.pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
+    pod = p.pod_manifest("abc")
     container = pod["spec"]["containers"][0]
     assert container["workingDir"] == "/home/agent"
     assert container["volumeMounts"][0]["mountPath"] == "/home/agent"
@@ -464,9 +403,6 @@ def test_pod_name_is_instance_scoped():
         owner_reference={**OWNER_REF, "uid": "22222222-2222-2222-2222-222222222222"},
     )
     assert a.workspace_name("default") != b.workspace_name("default")
-    # The PVC is NOT instance-scoped — a persistent workspace must resume for
-    # the same task after an agent restart.
-    assert a.pvc_name("default") == b.pvc_name("default")
 
 
 # ---------------------------------------------------------------------------
@@ -495,72 +431,20 @@ def _provisioner_with_api(api, **overrides):
     )
 
 
-def test_ensure_ephemeral_creates_pod_only():
+def test_ensure_creates_pod_only():
     api = MagicMock()
     api.read_namespaced_pod.return_value = _running_pod()
     p = _provisioner_with_api(api)
 
-    ref = p.ensure("abc", persistent=False, image="img:1", resources=Resources())
+    ref = p.ensure("abc")
 
-    api.create_namespaced_pod.assert_called_once()
-    api.create_namespaced_persistent_volume_claim.assert_not_called()
-    assert api.create_namespaced_pod.call_args.kwargs["field_validation"] == "Strict"
-    assert ref.pod_name == p.workspace_name("abc")
-    assert ref.container == "workspace"
-
-
-def test_ensure_persistent_creates_pvc_then_pod():
-    from kubernetes.client.exceptions import ApiException
-
-    api = MagicMock()
-    api.read_namespaced_pod.return_value = _running_pod()
-    api.read_namespaced_persistent_volume_claim.side_effect = ApiException(status=404)
-    p = _provisioner_with_api(api)
-
-    p.ensure("mytask", persistent=True, image="img:1", resources=Resources())
-
-    api.create_namespaced_persistent_volume_claim.assert_called_once()
     api.create_namespaced_pod.assert_called_once()
     # Without fieldValidation=Strict an unknown field is accepted with 201 and
     # silently dropped, and the python client discards the API server's
     # "Warning: 299 - unknown field" header, so nothing is logged.
-    for call in (api.create_namespaced_persistent_volume_claim,
-                 api.create_namespaced_pod):
-        assert call.call_args.kwargs["field_validation"] == "Strict"
-
-
-def _hermes_pvc(labels=None, annotations=None, task="mytask", instance=None):
-    """A PVC as the API returns it, carrying the stamp pvc_manifest writes."""
-    from tools.environments.kubernetes import PVC_INSTANCE_ANNOTATION
-
-    default_labels = {
-        "app.kubernetes.io/managed-by": "hermes-agent",
-        "app.kubernetes.io/component": "hermes-workspace",
-        "hermes.nousresearch.com/task": task,
-    }
-    if instance is None:
-        instance = PodProvisioner(
-            _kcfg(), "hermes", api=None, owner_reference=OWNER_REF
-        )._instance
-    return SimpleNamespace(
-        metadata=SimpleNamespace(
-            name="hermes-ws-mytask",
-            labels=default_labels if labels is None else labels,
-            annotations={PVC_INSTANCE_ANNOTATION: instance}
-            if annotations is None else annotations,
-        )
-    )
-
-
-def test_ensure_persistent_skips_existing_pvc():
-    api = MagicMock()
-    api.read_namespaced_pod.return_value = _running_pod()
-    api.read_namespaced_persistent_volume_claim.return_value = _hermes_pvc()
-    p = _provisioner_with_api(api)
-
-    p.ensure("mytask", persistent=True, image="img:1", resources=Resources())
-
-    api.create_namespaced_persistent_volume_claim.assert_not_called()
+    assert api.create_namespaced_pod.call_args.kwargs["field_validation"] == "Strict"
+    assert ref.pod_name == p.workspace_name("abc")
+    assert ref.container == "workspace"
 
 
 def test_ensure_reuses_our_own_pod_on_conflict():
@@ -574,7 +458,7 @@ def test_ensure_reuses_our_own_pod_on_conflict():
     )
     p = _provisioner_with_api(api)
 
-    ref = p.ensure("abc", persistent=False, image="img:1", resources=Resources())
+    ref = p.ensure("abc")
     assert ref.pod_name == p.workspace_name("abc")
 
 
@@ -591,7 +475,7 @@ def test_ensure_refuses_to_hijack_another_agents_pod():
     p = _provisioner_with_api(api)
 
     with pytest.raises(RuntimeError, match="not created by this Hermes instance"):
-        p.ensure("abc", persistent=False, image="img:1", resources=Resources())
+        p.ensure("abc")
 
 
 def test_wait_ready_surfaces_image_pull_failures_immediately():
@@ -616,15 +500,15 @@ def test_wait_ready_surfaces_image_pull_failures_immediately():
     )
     p = _provisioner_with_api(api, ready_timeout_seconds=30)
     with pytest.raises(RuntimeError) as excinfo:
-        p.ensure("abc", persistent=False, image="nope:1", resources=Resources())
+        p.ensure("abc")
     assert "ImagePullBackOff" in str(excinfo.value)
     assert "pull access denied" in str(excinfo.value)
 
 
-def test_destroy_deletes_pod_and_keeps_pvc():
+def test_destroy_deletes_the_pod():
     api = MagicMock()
     p = _provisioner_with_api(api)
-    p.destroy(PodRef("hermes", "hermes-ws-abc", "workspace"), persistent=True)
+    p.destroy(PodRef("hermes", "hermes-ws-abc", "workspace"))
     api.delete_namespaced_pod.assert_called_once()
     kwargs = api.delete_namespaced_pod.call_args.kwargs
     assert kwargs["name"] == "hermes-ws-abc"
@@ -632,149 +516,211 @@ def test_destroy_deletes_pod_and_keeps_pvc():
     # `sleep infinity` as PID 1 ignores SIGTERM; without grace 0 every teardown
     # waits the full 30s default, on the interrupt path.
     assert kwargs["grace_period_seconds"] == 0
-    api.delete_namespaced_persistent_volume_claim.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# SandboxProvisioner
+# SandboxClaimProvisioner — consumes agent-sandbox the way it is designed:
+# claim from an admin-owned warm pool; never author a pod.
 # ---------------------------------------------------------------------------
 
 
-def _sandbox_provisioner(api=None, custom=None, **sandbox_overrides):
+CLAIM_GROUP = "extensions.agents.x-k8s.io"
+SANDBOX_GROUP = "agents.x-k8s.io"
+POD_NAME_ANN = "agents.x-k8s.io/pod-name"
+
+
+def _sandbox_provisioner(api=None, custom=None, warm_pool="hermes-pool",
+                         **kcfg_overrides):
     return _sandbox_cls()(
-        _kcfg(provisioner="sandbox", sandbox=sandbox_overrides),
+        _kcfg(provisioner="sandbox", sandbox={"warm_pool": warm_pool},
+              **kcfg_overrides),
         "hermes", api=api, owner_reference=OWNER_REF, custom_api=custom,
     )
 
 
-def test_sandbox_manifest_shape():
-    manifest = _sandbox_provisioner().sandbox_manifest(
-        "abc", persistent=False, image="img:1", resources=Resources()
-    )
-    assert manifest["apiVersion"] == "agents.x-k8s.io/v1beta1"
-    assert manifest["kind"] == "Sandbox"
-    assert manifest["metadata"]["namespace"] == "hermes"
-    assert manifest["metadata"]["ownerReferences"][0]["uid"] == OWNER_REF["uid"]
-    spec = manifest["spec"]["podTemplate"]["spec"]
-    assert spec["containers"][0]["name"] == "workspace"
-    assert spec["containers"][0]["image"] == "img:1"
+def _bound_claim(sandbox_name="sb-1"):
+    return {
+        "status": {
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "sandbox": {"name": sandbox_name},
+        }
+    }
 
 
-def test_sandbox_pod_template_matches_the_pod_provisioners_pod_spec():
-    """The same dict feeds both provisioners — the Sandbox CRD is itself
-    spec.podTemplate.spec — so flipping provisioner cannot change the workload
-    shape."""
-    kcfg = _kcfg(pod_template={"spec": {"runtimeClassName": "kata"}})
-    pod_p = PodProvisioner(kcfg, "hermes", api=None, owner_reference=OWNER_REF)
-    sandbox = _sandbox_cls()(
-        kcfg, "hermes", api=None, owner_reference=OWNER_REF, custom_api=None
-    )
-    pod_spec = pod_p.pod_manifest(
-        "abc", persistent=False, image="i:1", resources=Resources()
-    )["spec"]
-    sandbox_spec = sandbox.sandbox_manifest(
-        "abc", persistent=False, image="i:1", resources=Resources()
-    )["spec"]["podTemplate"]["spec"]
-    assert pod_spec == sandbox_spec
-    assert sandbox_spec["runtimeClassName"] == "kata"
+def _sandbox_cr(name="sb-1", uid="sandbox-uid", pod_annotation=None):
+    metadata = {"name": name, "uid": uid, "annotations": {}}
+    if pod_annotation:
+        metadata["annotations"][POD_NAME_ANN] = pod_annotation
+    return {"metadata": metadata, "status": {}}
 
 
-def test_sandbox_spec_carries_cr_fields_and_the_injected_pod_template():
-    """sandbox.spec is the Sandbox CR spec (ttlSeconds, networkPolicy, ...);
-    podTemplate is ASSIGNED from the one rendered template, never merged."""
-    manifest = _sandbox_provisioner(
-        spec={"ttlSeconds": 900, "networkPolicy": {"egress": "deny"}}
-    ).sandbox_manifest("abc", persistent=False, image="i:1", resources=Resources())
-    assert manifest["spec"]["ttlSeconds"] == 900
-    assert manifest["spec"]["networkPolicy"] == {"egress": "deny"}
-    assert manifest["spec"]["podTemplate"]["spec"]["restartPolicy"] == "Never"
-
-
-def test_sandbox_ensure_creates_cr_and_waits_for_pod():
+def _claim_custom_api(claim=None, sandbox=None):
+    """A CustomObjectsApi mock that serves the claim and the bound Sandbox."""
     custom = MagicMock()
-    name_holder = {}
+    claim = claim if claim is not None else _bound_claim()
+    sandbox = sandbox if sandbox is not None else _sandbox_cr()
 
     def _get(**kwargs):
-        name_holder["name"] = kwargs["name"]
-        return {
-            "status": {
-                "conditions": [{"type": "Ready", "status": "True"}],
-                "podRef": {"name": "sandbox-pod-1"},
-            }
-        }
+        if kwargs["plural"] == "sandboxclaims":
+            return claim
+        if kwargs["plural"] == "sandboxes":
+            return sandbox
+        raise AssertionError(f"unexpected plural {kwargs['plural']}")
 
     custom.get_namespaced_custom_object.side_effect = _get
+    return custom
+
+
+def _pod_owned_by_sandbox(uid="sandbox-uid", containers=("workspace",)):
+    return _running_pod(owners=[SimpleNamespace(uid=uid)], containers=containers)
+
+
+def test_claim_manifest_shape():
+    manifest = _sandbox_provisioner().claim_manifest("abc")
+    assert manifest["apiVersion"] == f"{CLAIM_GROUP}/v1beta1"
+    assert manifest["kind"] == "SandboxClaim"
+    assert manifest["metadata"]["namespace"] == "hermes"
+    assert manifest["metadata"]["ownerReferences"][0]["uid"] == OWNER_REF["uid"]
+    spec = manifest["spec"]
+    assert spec["warmPoolRef"] == {"name": "hermes-pool"}
+    # Disposable by declaration: the controller default (Retain) would leave
+    # the claim behind on expiry.
+    assert spec["lifecycle"]["shutdownPolicy"] == "Delete"
+    # NO pod spec, ever: the admin's SandboxTemplate owns the pod shape, and
+    # env/volumeClaimTemplates would force a cold start past the pool.
+    assert "podTemplate" not in spec
+    assert "env" not in spec
+    assert "volumeClaimTemplates" not in spec
+
+
+def test_claim_carries_the_shutdown_time_backstop():
+    manifest = _sandbox_provisioner(active_deadline_seconds=3600).claim_manifest("abc")
+    shutdown = manifest["spec"]["lifecycle"]["shutdownTime"]
+    assert shutdown.endswith("Z")
+    # 0 omits it, matching activeDeadlineSeconds on the pod path.
+    off = _sandbox_provisioner(active_deadline_seconds=0).claim_manifest("abc")
+    assert "shutdownTime" not in off["spec"]["lifecycle"]
+
+
+def test_claim_manifest_requires_a_warm_pool():
+    """warmPoolRef is REQUIRED by the v1beta1 CRD — claims only draw from
+    pools — so an unset warm_pool is the one config error this provisioner
+    reports itself, with the admin-side fix named."""
+    with pytest.raises(RuntimeError, match="warm_pool"):
+        _sandbox_provisioner(warm_pool="").claim_manifest("abc")
+
+
+def test_claim_stamps_the_managed_by_label_on_claim_and_pod():
+    manifest = _sandbox_provisioner().claim_manifest("abc")
+    assert manifest["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
+    # additionalPodMetadata propagates to the bound pod, which is what the
+    # shipped NetworkPolicy selects on.
+    assert manifest["spec"]["additionalPodMetadata"]["labels"][MANAGED_BY] == (
+        "hermes-agent"
+    )
+
+
+def test_claim_ensure_binds_and_resolves_the_pod():
+    custom = _claim_custom_api()
     api = MagicMock()
-    api.read_namespaced_pod.return_value = _running_pod()
+    api.read_namespaced_pod.return_value = _pod_owned_by_sandbox()
 
     p = _sandbox_provisioner(api=api, custom=custom)
-    ref = p.ensure("abc", persistent=False, image="img:1", resources=Resources())
+    ref = p.ensure("abc")
 
-    custom.create_namespaced_custom_object.assert_called_once()
     call = custom.create_namespaced_custom_object.call_args.kwargs
-    assert call["group"] == "agents.x-k8s.io"
-    assert call["plural"] == "sandboxes"
+    assert call["group"] == CLAIM_GROUP
+    assert call["plural"] == "sandboxclaims"
     assert call["field_validation"] == "Strict"
-    assert ref.pod_name == "sandbox-pod-1"
-    # Exec targets the reconciled pod, not the CR.
+    # No annotation on the Sandbox -> the pod is named after it.
+    assert ref.pod_name == "sb-1"
     api.read_namespaced_pod.assert_called()
 
 
-def test_sandbox_ensure_falls_back_to_label_lookup_for_pod_name():
-    custom = MagicMock()
-    custom.get_namespaced_custom_object.return_value = {
-        "status": {"conditions": [{"type": "Ready", "status": "True"}]}
-    }
+def test_claim_ensure_honours_the_adopted_pod_annotation():
+    """A warm-pool Sandbox adopts a pre-created pod and records its name in
+    the agents.x-k8s.io/pod-name annotation — resolvePodName() semantics."""
+    custom = _claim_custom_api(sandbox=_sandbox_cr(pod_annotation="warm-pod-7"))
     api = MagicMock()
-    api.list_namespaced_pod.return_value = SimpleNamespace(
-        items=[SimpleNamespace(metadata=SimpleNamespace(name="labelled-pod"))]
-    )
-    api.read_namespaced_pod.return_value = _running_pod()
+    api.read_namespaced_pod.return_value = _pod_owned_by_sandbox()
 
-    p = _sandbox_provisioner(api=api, custom=custom)
-    ref = p.ensure("abc", persistent=False, image="img:1", resources=Resources())
-    assert ref.pod_name == "labelled-pod"
+    ref = _sandbox_provisioner(api=api, custom=custom).ensure("abc")
+    assert ref.pod_name == "warm-pod-7"
 
 
-def test_sandbox_ensure_reports_missing_crd_actionably():
+def test_claim_ensure_reports_missing_crd_actionably():
     from kubernetes.client.exceptions import ApiException
 
     custom = MagicMock()
     custom.create_namespaced_custom_object.side_effect = ApiException(status=404)
     p = _sandbox_provisioner(api=MagicMock(), custom=custom)
-    with pytest.raises(RuntimeError, match="agent-sandbox-operator"):
-        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+    with pytest.raises(RuntimeError, match="extensions"):
+        p.ensure("abc")
 
 
-def test_sandbox_destroy_deletes_the_custom_resource():
+def test_claim_ensure_surfaces_pool_exhaustion_in_the_timeout():
     custom = MagicMock()
-    api = MagicMock()
-    api.read_namespaced_pod.return_value = _running_pod()
     custom.get_namespaced_custom_object.return_value = {
-        "status": {"conditions": [{"type": "Ready", "status": "True"}],
-                   "podRef": {"name": "sandbox-pod-1"}}
+        "status": {"conditions": [{"type": "Ready", "status": "False",
+                                   "reason": "DependenciesNotReady",
+                                   "message": "no warm sandbox available"}]}
     }
-    p = _sandbox_provisioner(api=api, custom=custom)
-    ref = p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+    p = _sandbox_provisioner(api=MagicMock(), custom=custom,
+                             ready_timeout_seconds=1)
+    with pytest.raises(TimeoutError) as excinfo:
+        p.ensure("abc")
+    assert "hermes-pool" in str(excinfo.value)
+    assert "no warm sandbox available" in str(excinfo.value)
 
-    p.destroy(ref, persistent=False)
+
+def test_claim_destroy_deletes_the_claim_only():
+    """Deleting the claim cascades (shutdownPolicy: Delete): controller owns
+    the Sandbox, the Sandbox owns the pod."""
+    custom = _claim_custom_api()
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _pod_owned_by_sandbox()
+    p = _sandbox_provisioner(api=api, custom=custom)
+    ref = p.ensure("abc")
+
+    p.destroy(ref)
     kwargs = custom.delete_namespaced_custom_object.call_args.kwargs
-    assert kwargs["plural"] == "sandboxes"
-    # Deleting the CR is what tears the pod down; the pod name differs from it.
+    assert kwargs["plural"] == "sandboxclaims"
+    assert kwargs["group"] == CLAIM_GROUP
     assert kwargs["name"] == p.workspace_name("abc")
     api.delete_namespaced_pod.assert_not_called()
 
 
-def test_sandbox_provisioner_lives_in_its_own_module():
-    """Requirement 7: the sandbox provisioner is cleanly separable — this file
-    plus the factory branch plus the three sandbox.* keys. The shared module
-    must not import it."""
+def test_claim_provisioner_lives_in_its_own_module():
+    """The claim provisioner is cleanly separable — its module plus the factory
+    branch plus the sandbox.warm_pool key. The shared module must not import
+    it."""
     import tools.environments.kubernetes as k8s_mod
 
-    assert not hasattr(k8s_mod, "SandboxProvisioner")
+    assert not hasattr(k8s_mod, "SandboxClaimProvisioner")
     from tools.environments.kubernetes import WorkspaceProvisioner
 
     assert issubclass(_sandbox_cls(), WorkspaceProvisioner)
+
+
+def test_claim_provisioner_never_renders_a_pod_template(monkeypatch):
+    """The whole point of the claim model: Hermes has no pod-authoring surface
+    on this path. pod_template belongs to provisioner: pod, and the admin's
+    SandboxTemplate owns the pod here."""
+    import tools.environments.kubernetes as k8s_mod
+
+    def _boom(*a, **kw):
+        raise AssertionError("the claim provisioner rendered a pod template")
+
+    monkeypatch.setattr(k8s_mod, "render_pod_template", _boom)
+    custom = _claim_custom_api()
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _pod_owned_by_sandbox()
+    p = _sandbox_provisioner(
+        api=api, custom=custom,
+        pod_template={"spec": {"hostPID": True}},  # present, and ignored
+    )
+    ref = p.ensure("abc")
+    assert ref.pod_name == "sb-1"
 
 
 # ---------------------------------------------------------------------------
@@ -838,7 +784,7 @@ class _FakeWSClient:
         return self._returncode
 
 
-def _make_k8s_env(monkeypatch, exec_results, persistent=False, api=None):
+def _make_k8s_env(monkeypatch, exec_results, api=None):
     """exec_results: list of _FakeWSClient factories / tuples per exec call."""
     monkeypatch.setattr("tools.environments.base.is_interrupted", lambda: False)
 
@@ -863,8 +809,6 @@ def _make_k8s_env(monkeypatch, exec_results, persistent=False, api=None):
     env = KubernetesEnvironment(
         provisioner=provisioner,
         task_id="abc",
-        persistent=persistent,
-        image="img:1",
         cwd="/workspace",
         timeout=30,
         api=api,
@@ -912,7 +856,7 @@ def test_cleanup_calls_provisioner_destroy(monkeypatch):
     env.cleanup()
     env._provisioner.destroy.assert_called_once()
     args, _kwargs = env._provisioner.destroy.call_args
-    assert args[1] is False  # persistent flag
+    assert args[0].pod_name == "hermes-ws-abc"
 
 
 def test_cleanup_is_idempotent(monkeypatch):
@@ -922,7 +866,7 @@ def test_cleanup_is_idempotent(monkeypatch):
     assert env._provisioner.destroy.call_count == 1
 
 
-def test_cancel_does_not_destroy_the_ephemeral_pod(monkeypatch):
+def test_cancel_does_not_destroy_the_pod(monkeypatch):
     """_wait_for_process calls _kill_process() on an ORDINARY TIMEOUT as well
     as on a user interrupt (base.py:1127). Destroying the pod there deleted
     /workspace — every file the agent had just written — on any command that
@@ -931,18 +875,6 @@ def test_cancel_does_not_destroy_the_ephemeral_pod(monkeypatch):
     client = _FakeWSClient(open_cycles=10_000)
     env = _make_k8s_env(monkeypatch, [("", 0), client])
     handle = env._run_bash("sleep 1")
-    handle.kill()
-    assert client.closed is True
-    env._provisioner.destroy.assert_not_called()
-    assert env._pod_ref is not None
-
-
-def test_persistent_cancel_closes_stream_without_deleting_pod(monkeypatch):
-    """The PR left cancel() a no-op for persistent sessions, leaking the exec
-    thread, its websocket and a pipe fd for the full command duration."""
-    client = _FakeWSClient(open_cycles=10_000)
-    env = _make_k8s_env(monkeypatch, [("", 0), client], persistent=True)
-    handle = env._run_bash("sleep 3600")
     handle.kill()
     assert client.closed is True
     env._provisioner.destroy.assert_not_called()
@@ -999,8 +931,8 @@ def test_failed_ensure_does_not_orphan_a_pod(monkeypatch):
 
     with pytest.raises(TimeoutError):
         KubernetesEnvironment(
-            provisioner=provisioner, task_id="abc", persistent=False,
-            image="img:1", cwd="/workspace", timeout=30, sync_files=False,
+            provisioner=provisioner, task_id="abc",
+            cwd="/workspace", timeout=30, sync_files=False,
         )
     provisioner.destroy.assert_called_once()
 
@@ -1033,7 +965,8 @@ def _install_fake_backend(monkeypatch):
         k8s_mod, "PodProvisioner", lambda *a, **kw: MagicMock(name="pod")
     )
     monkeypatch.setattr(
-        sandbox_mod, "SandboxProvisioner", lambda *a, **kw: MagicMock(name="sandbox")
+        sandbox_mod, "SandboxClaimProvisioner",
+        lambda *a, **kw: MagicMock(name="sandbox"),
     )
     monkeypatch.setattr(
         k8s_mod, "load_kubernetes_apis", lambda kcfg: (MagicMock(), MagicMock())
@@ -1054,32 +987,10 @@ def test_factory_builds_kubernetes_env(monkeypatch):
     )
     assert isinstance(env, fake_cls)
     assert captured["task_id"] == "abc"
-    assert captured["persistent"] is False
-
-
-def test_factory_k8s_defaults_ephemeral_even_when_container_persistent_true(monkeypatch):
-    import tools.terminal_tool as tt
-
-    captured, _ = _install_fake_backend(monkeypatch)
-    tt._create_environment(
-        env_type="kubernetes", image="img:1", cwd="/workspace", timeout=30,
-        container_config={"container_persistent": True,
-                          "kubernetes": {"namespace": "hermes"}},
-        task_id="abc",
-    )
-    assert captured["persistent"] is False
-
-
-def test_factory_k8s_persistent_opt_in(monkeypatch):
-    import tools.terminal_tool as tt
-
-    captured, _ = _install_fake_backend(monkeypatch)
-    tt._create_environment(
-        env_type="kubernetes", image="img:1", cwd="/workspace", timeout=30,
-        container_config={"kubernetes": {"namespace": "hermes", "persistent": True}},
-        task_id="abc",
-    )
-    assert captured["persistent"] is True
+    # Stateless: the environment takes no persistence, image or resource
+    # arguments at all — the pod shape carries all of that.
+    for gone in ("persistent", "image", "resources"):
+        assert gone not in captured, captured
 
 
 def test_factory_selects_sandbox_provisioner(monkeypatch):
@@ -1089,36 +1000,32 @@ def test_factory_selects_sandbox_provisioner(monkeypatch):
     _install_fake_backend(monkeypatch)
     seen = {}
     monkeypatch.setattr(
-        sandbox_mod, "SandboxProvisioner",
+        sandbox_mod, "SandboxClaimProvisioner",
         lambda *a, **kw: seen.setdefault("sandbox", MagicMock()),
     )
     tt._create_environment(
         env_type="kubernetes", image="img:1", cwd="/workspace", timeout=30,
         container_config={"kubernetes": {"namespace": "hermes",
-                                         "provisioner": "sandbox"}},
+                                         "provisioner": "sandbox",
+                                         "sandbox": {"warm_pool": "pool"}}},
         task_id="abc",
     )
     assert "sandbox" in seen
 
 
-@pytest.mark.parametrize("kubernetes_config, expected", [
-    # The provisioner enum: it picks which Kubernetes API is called, so an
-    # unknown value never becomes a request the server could reject.
-    ({"provisioner": "operator"}, "provisioner"),
-    # The types needed to BUILD a request. A scalar here is a TypeError inside
-    # a manifest builder, never an HTTP response.
-    ({"pod_template": "not-a-mapping"}, "pod_template"),
-    ({"provisioner": "sandbox", "sandbox": {"spec": 7}}, "sandbox.spec"),
-])
-def test_factory_rejects_invalid_config(monkeypatch, kubernetes_config, expected):
+@pytest.mark.parametrize("bad", ["operator", "direct"])
+def test_factory_rejects_an_unknown_provisioner(monkeypatch, bad):
+    """The ONE Hermes-side config decision: the provisioner selects which
+    Kubernetes API is called, so an unknown value never becomes a request the
+    server could reject. Everything else is the API server's to validate."""
     import tools.terminal_tool as tt
 
     _install_fake_backend(monkeypatch)
-    with pytest.raises(ValueError, match=expected):
+    with pytest.raises(ValueError, match="provisioner"):
         tt._create_environment(
             env_type="kubernetes", image="img:1", cwd="/workspace", timeout=30,
             container_config={"kubernetes": {"namespace": "hermes",
-                                             **kubernetes_config}},
+                                             "provisioner": bad}},
             task_id="abc",
         )
 
@@ -1151,7 +1058,10 @@ def test_check_requirements_kubernetes_present(monkeypatch):
     assert tt.check_terminal_requirements() is True
 
 
-def test_check_requirements_rejects_invalid_config(monkeypatch):
+def test_check_requirements_does_not_validate_config(monkeypatch):
+    """Requirements gate = "is the client importable", nothing else. Config
+    problems surface as the factory's ValueError or the API server's 400 —
+    both name the offender, which a False here never could."""
     import tools.terminal_tool as tt
 
     monkeypatch.setattr(
@@ -1159,7 +1069,7 @@ def test_check_requirements_rejects_invalid_config(monkeypatch):
         lambda: {"env_type": "kubernetes", "kubernetes": {"provisioner": "nope"}},
     )
     monkeypatch.setattr(tt.importlib.util, "find_spec", lambda name, *a, **k: object())
-    assert tt.check_terminal_requirements() is False
+    assert tt.check_terminal_requirements() is True
 
 
 def test_live_terminal_tool_kubernetes_image_and_container_config(monkeypatch):
@@ -1196,10 +1106,15 @@ def test_live_terminal_tool_kubernetes_image_and_container_config(monkeypatch):
     monkeypatch.setenv("TERMINAL_ENV", "kubernetes")
     # The ONLY kubernetes env var: the internal JSON bridge payload. There is
     # deliberately no TERMINAL_KUBERNETES_POD_SA / _IMAGE / _NAMESPACE.
+    # The image is authored in pod_template like every other pod field, and
+    # the `kubernetes_image` display value is DERIVED from the rendered
+    # template.
     monkeypatch.setenv(
         "TERMINAL_KUBERNETES",
         json.dumps({"namespace": "hermes", "container_name": "devbox",
-                    "image": "quay.io/hermes/session:1"}),
+                    "pod_template": {"spec": {"containers": [
+                        {"name": "devbox",
+                         "image": "quay.io/hermes/session:1"}]}}}),
     )
 
     # An isolation-keyed override keeps _resolve_container_task_id from
@@ -1376,10 +1291,7 @@ def test_concurrent_execs_do_not_poison_the_shared_api_client(monkeypatch):
 
 
 def test_container_name_is_configurable_and_reaches_the_manifest():
-    template = render_pod_template(
-        _kcfg(container_name="devbox"), persistent=False, image="img:1",
-        resources=Resources(), pvc_name="pvc",
-    )
+    template = render_pod_template(_kcfg(container_name="devbox"))
     assert template["spec"]["containers"][0]["name"] == "devbox"
 
 
@@ -1387,7 +1299,7 @@ def test_pod_ensure_targets_the_configured_container():
     api = MagicMock()
     api.read_namespaced_pod.return_value = _running_pod(containers=("devbox",))
     p = _provisioner_with_api(api, container_name="devbox")
-    ref = p.ensure("abc", persistent=False, image="img:1", resources=Resources())
+    ref = p.ensure("abc")
     assert ref.container == "devbox"
 
 
@@ -1590,7 +1502,6 @@ def test_trusted_sandbox_is_the_only_input_to_the_approval_skip():
     # Every one of these used to flip the verdict on its own. Now none of them
     # does: the declaration is the whole input.
     for hostile in (
-        {"persistent": True},
         {"pod_template": {"spec": {"hostPID": True, "hostNetwork": True}}},
         {"pod_template": {"spec": {"automountServiceAccountToken": True,
                                    "serviceAccountName": "cluster-admin-sa"}}},
@@ -1649,9 +1560,6 @@ def test_docker_host_access_dispatches_to_the_kubernetes_evaluator():
 # ---------------------------------------------------------------------------
 
 
-MANAGED_BY = "app.kubernetes.io/managed-by"
-
-
 @pytest.mark.parametrize("pod_template, check", [
     # The exec container's process. It used to be pinned and any attempt to set
     # it was a config error; a pod that exits immediately is now the operator's
@@ -1698,46 +1606,8 @@ def test_a_pod_template_can_override_anything_in_the_base(pod_template, check):
     What a session pod is ALLOWED to be is decided by SCC / Pod Security
     Admission / ValidatingAdmissionPolicy / RBAC, and whether it is well-formed
     is decided by the API server under fieldValidation=Strict."""
-    kcfg = _kcfg(pod_template=pod_template)
-    assert validate_kubernetes_config(kcfg) == []
-    template = render_pod_template(
-        kcfg, persistent=False, image="i:1", resources=Resources(),
-        pvc_name="hermes-ws",
-    )
+    template = render_pod_template(_kcfg(pod_template=pod_template))
     assert check(template["spec"]), template["spec"]
-
-
-def test_the_sandbox_cr_spec_is_submitted_verbatim():
-    """`sandboxTemplateRef` and every other CR field used to be rejected or to
-    cost the approval skip. The CRD's own schema validates them now, under
-    fieldValidation=Strict, and what the operator does with them is the
-    cluster's business."""
-    cr_spec = {"sandboxTemplateRef": {"name": "privileged"},
-               "ttlSeconds": 900, "whateverTheCrdAdded": {"x": 1}}
-    kcfg = _kcfg(provisioner="sandbox",
-                 sandbox={"api_group": "agents.x-k8s.io",
-                          "api_version": "v1beta1", "spec": cr_spec})
-    assert validate_kubernetes_config(kcfg) == []
-
-    manifest = _sandbox_provisioner(spec=cr_spec).sandbox_manifest(
-        "abc", persistent=False, image="i:1", resources=Resources()
-    )
-    assert manifest["spec"]["sandboxTemplateRef"] == {"name": "privileged"}
-    assert manifest["spec"]["whateverTheCrdAdded"] == {"x": 1}
-
-
-def test_the_injected_pod_template_wins_over_one_written_in_sandbox_spec():
-    """`spec.podTemplate` is ASSIGNED, not merged: the same rendered dict feeds
-    both provisioners. A podTemplate written in config is overwritten rather
-    than rejected — there is nothing to reject, and one source is still one
-    source."""
-    manifest = _sandbox_provisioner(
-        spec={"podTemplate": {"spec": {"hostPID": True}}}
-    ).sandbox_manifest("abc", persistent=False, image="i:1",
-                       resources=Resources())
-    pod_spec = manifest["spec"]["podTemplate"]["spec"]
-    assert pod_spec["hostPID"] is False, "the config-written podTemplate won"
-    assert pod_spec["containers"][0]["name"] == "workspace"
 
 
 # ---------------------------------------------------------------------------
@@ -1748,20 +1618,9 @@ def test_the_injected_pod_template_wins_over_one_written_in_sandbox_spec():
 def test_the_managed_by_label_is_on_the_rendered_template():
     template = render_pod_template(
         _kcfg(pod_template={"metadata": {"labels": {"team": "hermes"}}}),
-        persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
     )
     assert template["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
     assert template["metadata"]["labels"]["team"] == "hermes"
-
-
-def test_sandbox_manifest_keeps_the_managed_by_label():
-    manifest = _sandbox_provisioner().sandbox_manifest(
-        "abc", persistent=False, image="i:1", resources=Resources()
-    )
-    assert manifest["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
-    assert manifest["spec"]["podTemplate"]["metadata"]["labels"][MANAGED_BY] == (
-        "hermes-agent"
-    )
 
 
 def test_the_label_survives_any_attempt_to_change_or_delete_it():
@@ -1775,12 +1634,7 @@ def test_the_label_survives_any_attempt_to_change_or_delete_it():
                     {"metadata": None},
                     {"metadata": {"labels": None}},
                     {"metadata": {"labels": 7}}):
-        kcfg = _kcfg(pod_template=overlay)
-        assert validate_kubernetes_config(kcfg) == [], overlay
-        template = render_pod_template(
-            kcfg, persistent=False, image="i:1", resources=Resources(),
-            pvc_name="hermes-ws",
-        )
+        template = render_pod_template(_kcfg(pod_template=overlay))
         assert template["metadata"]["labels"][MANAGED_BY] == "hermes-agent", overlay
 
 
@@ -1801,55 +1655,60 @@ def test_ensure_refuses_an_unowned_pod_that_carries_our_label():
     )
     p = _provisioner_with_api(api)
     with pytest.raises(RuntimeError, match="not created by this Hermes instance"):
-        p.ensure("abc", persistent=False, image="img:1", resources=Resources())
+        p.ensure("abc")
 
 
-def test_sandbox_refuses_to_adopt_a_cr_it_did_not_create():
+def test_claim_refuses_to_adopt_one_it_did_not_create():
     from kubernetes.client.exceptions import ApiException
 
-    custom = MagicMock()
+    custom = _claim_custom_api(
+        claim={"metadata": {"uid": "claim-uid",
+                            "ownerReferences": [{"uid": "somebody-else"}]},
+               **_bound_claim()},
+    )
     custom.create_namespaced_custom_object.side_effect = ApiException(status=409)
-    custom.get_namespaced_custom_object.return_value = {
-        "metadata": {"uid": "sb-uid",
-                     "ownerReferences": [{"uid": "somebody-else"}]},
-        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
-    }
     p = _sandbox_provisioner(api=MagicMock(), custom=custom)
     with pytest.raises(RuntimeError, match="not created by this Hermes instance"):
-        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+        p.ensure("abc")
 
 
-def test_sandbox_resumes_its_own_cr_on_conflict():
+def test_claim_resumes_its_own_on_conflict():
     from kubernetes.client.exceptions import ApiException
 
-    custom = MagicMock()
+    claim = {"metadata": {"uid": "claim-uid",
+                          "ownerReferences": [{"uid": OWNER_REF["uid"]}]},
+             **_bound_claim()}
+    custom = _claim_custom_api(claim=claim)
     custom.create_namespaced_custom_object.side_effect = ApiException(status=409)
-    custom.get_namespaced_custom_object.return_value = {
-        "metadata": {"uid": "sb-uid", "ownerReferences": [{"uid": OWNER_REF["uid"]}]},
-        "status": {"conditions": [{"type": "Ready", "status": "True"}],
-                   "podRef": {"name": "sandbox-pod-1"}},
-    }
     api = MagicMock()
-    api.read_namespaced_pod.return_value = _running_pod()
+    api.read_namespaced_pod.return_value = _pod_owned_by_sandbox()
     p = _sandbox_provisioner(api=api, custom=custom)
-    ref = p.ensure("abc", persistent=False, image="i:1", resources=Resources())
-    assert ref.pod_name == "sandbox-pod-1"
+    ref = p.ensure("abc")
+    assert ref.pod_name == "sb-1"
 
 
-def test_sandbox_refuses_a_pod_owned_by_a_different_sandbox():
-    custom = MagicMock()
-    custom.get_namespaced_custom_object.return_value = {
-        "metadata": {"uid": "sb-uid"},
-        "status": {"conditions": [{"type": "Ready", "status": "True"}],
-                   "podRef": {"name": "someone-elses-pod"}},
-    }
+def test_claim_refuses_a_pod_not_owned_by_the_bound_sandbox():
+    """The next thing that happens to the resolved pod is a credential-file
+    upload, so ownership is POSITIVELY established: the pod must carry an
+    ownerReference to the Sandbox the claim reports — a co-tenant's pod under
+    the same name is refused."""
+    custom = _claim_custom_api()
     api = MagicMock()
     api.read_namespaced_pod.return_value = _running_pod(
         owners=[SimpleNamespace(uid="another-sandbox")]
     )
     p = _sandbox_provisioner(api=api, custom=custom)
-    with pytest.raises(RuntimeError, match="not owned by sandbox"):
-        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+    with pytest.raises(RuntimeError, match="ownerReference"):
+        p.ensure("abc")
+
+
+def test_claim_refuses_an_unowned_pod():
+    custom = _claim_custom_api()
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _running_pod(owners=[])
+    p = _sandbox_provisioner(api=api, custom=custom)
+    with pytest.raises(RuntimeError, match="ownerReference"):
+        p.ensure("abc")
 
 
 # ---------------------------------------------------------------------------
@@ -1929,12 +1788,11 @@ def test_containers_merge_element_wise_by_name():
             {"name": "workspace", "resources": {"limits": {"cpu": "2"}}},
             {"name": "sidecar", "image": "proxy:1"},
         ], "initContainers": [{"name": "prep", "image": "busybox"}]}}),
-        persistent=False, image="img:1", resources=Resources(), pvc_name="pvc",
     )
     workspace, sidecar = template["spec"]["containers"]
     # Merged by name: the base container's own fields survive...
     assert workspace["name"] == "workspace"
-    assert workspace["image"] == "img:1"
+    assert workspace["image"] == DEFAULT_SESSION_IMAGE
     assert workspace["command"] == ["sleep", "infinity"]
     assert workspace["volumeMounts"]
     assert workspace["securityContext"]["allowPrivilegeEscalation"] is False
@@ -2003,7 +1861,6 @@ def test_pod_template_security_context_values_reach_the_manifest():
     template = render_pod_template(
         _kcfg(pod_template={"spec": {"securityContext": {
             "runAsNonRoot": False, "runAsUser": 0, "fsGroup": 0}}}),
-        persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
     )
     assert template["spec"]["securityContext"]["runAsUser"] == 0
     assert template["spec"]["securityContext"]["fsGroup"] == 0
@@ -2011,41 +1868,35 @@ def test_pod_template_security_context_values_reach_the_manifest():
     sane = render_pod_template(
         _kcfg(pod_template={"spec": {"securityContext": {
             "runAsUser": 1000, "fsGroup": 1000}}}),
-        persistent=False, image="i:1", resources=Resources(), pvc_name="pvc",
     )
     assert sane["spec"]["securityContext"]["runAsUser"] == 1000
     # The base's hardening survived the merge.
     assert sane["spec"]["securityContext"]["runAsNonRoot"] is True
 
 
-def test_persistent_pod_without_an_owner_reference_gets_the_deadline_backstop():
-    """A persistent pod with no ownerReference has no reaper at all; its PVC
-    (the durable half) outlives the pod anyway."""
-    owned = PodProvisioner(_kcfg(), "hermes", api=None, owner_reference=OWNER_REF)
-    orphan = PodProvisioner(_kcfg(), "hermes", api=None, owner_reference=None)
-    assert "activeDeadlineSeconds" not in owned.pod_manifest(
-        "abc", persistent=True, image="i:1", resources=Resources())["spec"]
-    assert orphan.pod_manifest(
-        "abc", persistent=True, image="i:1", resources=Resources()
-    )["spec"]["activeDeadlineSeconds"] == 14400
-
-
-def test_wait_sandbox_does_not_list_pods_on_every_poll():
-    """The label-selector fallback issues three LISTs; running it per 0.5s poll
-    meant up to 720 LISTs per session provisioning."""
+def test_claim_wait_never_lists_pods():
+    """Pod resolution is claim.status -> Sandbox -> annotation/name, all GETs
+    by name. `list pods` is deliberately absent from the RBAC surface."""
+    binding = iter([
+        {"status": {"conditions": []}},
+        {"status": {"conditions": [{"type": "Ready", "status": "False",
+                                    "reason": "DependenciesNotReady"}]}},
+        _bound_claim(),
+    ])
+    sandbox = _sandbox_cr()
     custom = MagicMock()
-    custom.get_namespaced_custom_object.side_effect = [
-        {"metadata": {"uid": "sb"}, "status": {"conditions": []}},
-        {"metadata": {"uid": "sb"}, "status": {"conditions": []}},
-        {"metadata": {"uid": "sb"},
-         "status": {"conditions": [{"type": "Ready", "status": "True"}],
-                    "podRef": {"name": "sandbox-pod-1"}}},
-    ]
+
+    def _get(**kwargs):
+        if kwargs["plural"] == "sandboxclaims":
+            return next(binding)
+        return sandbox
+
+    custom.get_namespaced_custom_object.side_effect = _get
     api = MagicMock()
-    api.read_namespaced_pod.return_value = _running_pod()
+    api.read_namespaced_pod.return_value = _pod_owned_by_sandbox()
     p = _sandbox_provisioner(api=api, custom=custom)
-    ref = p.ensure("abc", persistent=False, image="i:1", resources=Resources())
-    assert ref.pod_name == "sandbox-pod-1"
+    ref = p.ensure("abc")
+    assert ref.pod_name == "sb-1"
     api.list_namespaced_pod.assert_not_called()
 
 
@@ -2117,7 +1968,10 @@ def test_shipped_policies_do_not_document_deleted_config_keys():
         text = (K8S_DIR / name).read_text(encoding="utf-8")
         for gone in ("template_ref", "use_claim", "spec_overrides",
                      "pod_template_overrides", "security_context",
-                     "runtime_class_name"):
+                     "runtime_class_name",
+                     # the stateless / claim-based cut
+                     "kubernetes.persistent", "volume.claim_name",
+                     "sandbox.spec", "api_group"):
             assert gone not in text, f"{name} still documents {gone}"
 
 
@@ -2128,30 +1982,18 @@ def test_networkpolicy_and_readme_state_what_the_label_selector_covers():
     assert "app.kubernetes.io/managed-by" in text
     assert "AFTER the user's" in text
     readme = (K8S_DIR / "README.md").read_text(encoding="utf-8")
-    assert "credential files at rest" in readme
     # The retraction survives in prose: the backend does not claim to bound a
     # compromised agent's direct API calls.
     assert "compromised agent" in readme
-
-
-def test_pvc_adoption_refuses_a_foreign_claim():
-    """The PVC is mounted at the agent's cwd and the session-start sync writes
-    credential files into it, yet adoption had no ownership or label check at
-    all — and pvc_name() is deliberately not instance-scoped."""
-    api = MagicMock()
-    api.read_namespaced_persistent_volume_claim.return_value = _hermes_pvc(
-        labels={"owner": "someone-else"}
-    )
-    p = _provisioner_with_api(api)
-    with pytest.raises(RuntimeError, match="not a Hermes workspace"):
-        p.ensure("mytask", persistent=True, image="img:1", resources=Resources())
-    api.create_namespaced_pod.assert_not_called()
+    # Statelessness is stated, and the claim path's enforcement point is named.
+    assert "stateless" in readme.lower()
+    assert "SandboxTemplate" in readme and "SandboxWarmPool" in readme
 
 
 def test_sanitize_name_hashes_case_only_normalisation():
     """The collision guard compared the slug against a LOWERCASED copy of the
     input, so case-only normalisation never got the hash suffix and two task ids
-    differing only in case shared one pod AND one PVC."""
+    differing only in case shared one pod."""
     assert sanitize_name("Default") != sanitize_name("default")
     assert sanitize_name("Foo-Bar") != sanitize_name("foo-bar")
     assert sanitize_name("default") == "default"
@@ -2193,23 +2035,18 @@ def test_kill_cancels_only_its_own_exec(monkeypatch):
     handle_b.kill()
 
 
-def test_sandbox_refuses_a_pod_resolved_only_by_name_convention():
-    """_resolve_pod_name falls back to the name convention, and
-    _assert_pod_belongs returned early on a pod with no ownerReferences — so a
-    co-tenant's pod under a guessable name was accepted, and the next action is
-    a credential-file upload into it."""
+def test_claim_requires_a_bound_sandbox_name():
+    """The claim's Ready condition alone is not enough: the pod is resolved
+    THROUGH status.sandbox.name, and guessing a name instead would hand the
+    credential-file upload to whatever pod happens to match."""
     custom = MagicMock()
     custom.get_namespaced_custom_object.return_value = {
-        "metadata": {"uid": "sandbox-uid"},
-        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        "status": {"conditions": [{"type": "Ready", "status": "True"}]}
     }
-    api = MagicMock()
-    api.list_namespaced_pod.return_value = SimpleNamespace(items=[])
-    api.read_namespaced_pod.return_value = _running_pod(owners=[])
-
-    p = _sandbox_provisioner(api=api, custom=custom)
-    with pytest.raises(RuntimeError, match="name convention"):
-        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
+    p = _sandbox_provisioner(api=MagicMock(), custom=custom,
+                             ready_timeout_seconds=1)
+    with pytest.raises(TimeoutError):
+        p.ensure("abc")
 
 
 def test_kubernetes_blob_survives_a_backend_selected_by_env_var():
@@ -2262,12 +2099,16 @@ def test_doctor_submits_every_access_review_with_strict_field_validation():
     assert set(reviews.field_validations) == {"Strict"}, reviews.field_validations
 
 
-def test_doctor_probes_the_sandbox_group_the_backend_posts_to():
+def test_doctor_probes_the_claim_surface_the_backend_posts_to():
     reviews = _doctor_rbac_reviews(
         _kcfg(namespace="hermes", provisioner="sandbox",
-              sandbox={"api_group": "custom.example.com"})
+              sandbox={"warm_pool": "pool"})
     )
-    assert ("custom.example.com", "sandboxes", "create") in reviews
+    assert ("extensions.agents.x-k8s.io", "sandboxclaims", "create") in reviews
+    assert ("extensions.agents.x-k8s.io", "sandboxclaims", "delete") in reviews
+    # Read-only sandboxes: never created — Hermes has no pod-authoring surface.
+    assert ("agents.x-k8s.io", "sandboxes", "get") in reviews
+    assert ("agents.x-k8s.io", "sandboxes", "create") not in reviews
     # The sandbox Role deliberately grants no pods create/delete.
     assert ("", "pods", "delete") not in reviews
     assert ("", "pods", "get") in reviews
@@ -2328,7 +2169,8 @@ def _doctor_rbac_reviews(kcfg):
     import tools.terminal_tool as tt
 
     saved = (importlib.util.find_spec, k8s_mod.load_kubernetes_apis,
-             tt._get_env_config, doctor._dry_run_pod_template)
+             tt._get_env_config, doctor._dry_run_pod_template,
+             doctor._dry_run_sandbox_claim, doctor._check_warm_pool)
     try:
         importlib.util.find_spec = lambda name, *a, **k: (
             object() if name == "kubernetes" else saved[0](name, *a, **k)
@@ -2336,10 +2178,13 @@ def _doctor_rbac_reviews(kcfg):
         k8s_mod.load_kubernetes_apis = lambda cfg: (core, MagicMock())
         tt._get_env_config = lambda: {"kubernetes": kcfg}
         doctor._dry_run_pod_template = lambda *a, **kw: None
+        doctor._dry_run_sandbox_claim = lambda *a, **kw: None
+        doctor._check_warm_pool = lambda *a, **kw: None
         doctor._check_kubernetes_backend([])
     finally:
         (importlib.util.find_spec, k8s_mod.load_kubernetes_apis,
-         tt._get_env_config, doctor._dry_run_pod_template) = saved
+         tt._get_env_config, doctor._dry_run_pod_template,
+         doctor._dry_run_sandbox_claim, doctor._check_warm_pool) = saved
         for name, value in original.items():
             if value is None:
                 delattr(kclient, name)
@@ -2357,7 +2202,7 @@ def test_doctor_dry_runs_the_rendered_pod_with_strict_field_validation():
     from hermes_cli import doctor
 
     core = MagicMock()
-    doctor._dry_run_pod_template(_kcfg(), "hermes", core, False, [])
+    doctor._dry_run_pod_template(_kcfg(), "hermes", core, [])
 
     kwargs = core.create_namespaced_pod.call_args.kwargs
     assert kwargs["dry_run"] == "All"
@@ -2377,13 +2222,13 @@ def test_doctor_reports_the_api_servers_rejection_as_a_failure():
     core = MagicMock()
     core.create_namespaced_pod.side_effect = ApiException(status=400, reason="Bad")
     issues: list[str] = []
-    doctor._dry_run_pod_template(_kcfg(), "hermes", core, False, issues)
+    doctor._dry_run_pod_template(_kcfg(), "hermes", core, issues)
     assert any("pod_template" in issue for issue in issues), issues
 
     core = MagicMock()
     core.create_namespaced_pod.side_effect = ApiException(status=403, reason="No")
     issues = []
-    doctor._dry_run_pod_template(_kcfg(), "hermes", core, False, issues)
+    doctor._dry_run_pod_template(_kcfg(), "hermes", core, issues)
     assert issues == []
 
 
@@ -2417,54 +2262,29 @@ _CLEAN_PROBES = [
 
 @pytest.mark.parametrize("pod_template", _CLEAN_PROBES)
 def test_ordinary_overrides_still_produce_an_exec_able_pod(pod_template):
-    """Both provisioners submit the SAME rendered template, the exec container
-    is still there under the configured name, and the managed-by stamp
-    survived."""
+    """The exec container is still there under the configured name, and the
+    managed-by stamp survived."""
     kcfg = _kcfg(pod_template=pod_template)
-    assert validate_kubernetes_config(kcfg) == []
-
     pod = PodProvisioner(
         kcfg, "hermes", api=None, owner_reference=OWNER_REF,
-    ).pod_manifest("abc", persistent=False, image="i:1", resources=Resources())
-    sandbox = _sandbox_cls()(
-        dict(kcfg, provisioner="sandbox"), "hermes", api=None,
-        owner_reference=OWNER_REF, custom_api=None,
-    ).sandbox_manifest("abc", persistent=False, image="i:1",
-                       resources=Resources())
-    assert pod["spec"] == sandbox["spec"]["podTemplate"]["spec"]
-
-    for template in ({"metadata": pod["metadata"], "spec": pod["spec"]},
-                     sandbox["spec"]["podTemplate"]):
-        spec = template["spec"]
-        workspace = [c for c in spec["containers"] if c["name"] == "workspace"]
-        assert len(workspace) == 1, spec["containers"]
-        assert workspace[0]["command"] == ["sleep", "infinity"]
-        assert template["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
+    ).pod_manifest("abc")
+    spec = pod["spec"]
+    workspace = [c for c in spec["containers"] if c["name"] == "workspace"]
+    assert len(workspace) == 1, spec["containers"]
+    assert workspace[0]["command"] == ["sleep", "infinity"]
+    assert pod["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
 
 
-@pytest.mark.parametrize("overrides, expected", [
-    ({"sandbox": "oops"}, "terminal.kubernetes.sandbox must be a mapping"),
-    ({"provisioner": "sandbox", "sandbox": {"spec": "oops"}},
-     "terminal.kubernetes.sandbox.spec must be a mapping"),
-    ({"pod_template": "oops"},
-     "terminal.kubernetes.pod_template must be a mapping"),
-])
-def test_a_non_mapping_block_is_a_message_not_a_crash(overrides, expected):
-    """The types the validator still checks, and the only reason it checks
-    them: a scalar here is a TypeError or an AttributeError inside a manifest
-    builder, never an HTTP response the API server could name a path in."""
-    kcfg = _kcfg(**overrides)
-    problems = validate_kubernetes_config(kcfg)
-    assert any(expected in p for p in problems), problems
-
-
-def test_a_non_mapping_volume_block_is_left_to_the_api_server():
-    """`volume` is different: `_mapping()` already tolerates a scalar there and
-    the resulting PVC is a request the API server rejects by name. Nothing for
-    Hermes to add."""
-    assert validate_kubernetes_config(_kcfg(volume="oops")) == []
-    pvc = _provisioner(volume="oops").pvc_manifest("t", resources=Resources())
-    assert pvc["spec"]["accessModes"] == ["ReadWriteOnce"]
+def test_a_non_mapping_sandbox_block_is_tolerated():
+    """_mapping() shields the claim provisioner from a scalar written where
+    the sandbox block belongs; the missing warm_pool then raises with the
+    actionable message rather than an AttributeError."""
+    p = _sandbox_cls()(
+        _kcfg(provisioner="sandbox", sandbox="oops"),
+        "hermes", api=None, owner_reference=OWNER_REF, custom_api=None,
+    )
+    with pytest.raises(RuntimeError, match="warm_pool"):
+        p.claim_manifest("abc")
 
 
 # ---------------------------------------------------------------------------
@@ -2491,17 +2311,16 @@ def test_refusing_to_adopt_a_foreign_pod_does_not_delete_it():
     # cleanup path lives.
     with pytest.raises(RuntimeError, match="not created by this Hermes instance"):
         KubernetesEnvironment(
-            provisioner=provisioner, task_id="abc", persistent=False,
-            image="i:1", api=api, sync_files=False,
+            provisioner=provisioner, task_id="abc", api=api, sync_files=False,
         )
     api.delete_namespaced_pod.assert_not_called()
 
 
 def test_an_unreadable_pod_is_not_deleted_either():
     """`except ApiException: return False` turned a 403 on `get pods` (or any
-    transient API error) into "not ours" — and the cleanup path then deleted the
-    agent's own live persistent workspace. Unreadable is its own answer, and it
-    fails closed in BOTH directions."""
+    transient API error) into "not ours" — and the cleanup path then deleted
+    another agent's live workspace. Unreadable is its own answer, and it fails
+    closed in BOTH directions."""
     from kubernetes.client.exceptions import ApiException
 
     api = MagicMock()
@@ -2510,96 +2329,28 @@ def test_an_unreadable_pod_is_not_deleted_either():
     p = _provisioner_with_api(api)
 
     with pytest.raises(RuntimeError, match="ownership could not be read"):
-        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
-    p.destroy(PodRef("hermes", p.workspace_name("abc"), "workspace"),
-              persistent=False)
+        p.ensure("abc")
+    p.destroy(PodRef("hermes", p.workspace_name("abc"), "workspace"))
     api.delete_namespaced_pod.assert_not_called()
 
 
-def test_refusing_to_adopt_a_foreign_sandbox_does_not_delete_it():
-    """Same shape on the CR path, plus its own extra: destroy() fell back to
+def test_refusing_to_adopt_a_foreign_claim_does_not_delete_it():
+    """Same shape on the claim path, plus its own extra: destroy() fell back to
     `[pod_ref.pod_name]` precisely when _created_names was empty, which is
     exactly the state _assert_ours leaves behind when it refuses."""
     from kubernetes.client.exceptions import ApiException
 
-    custom = MagicMock()
+    custom = _claim_custom_api(
+        claim={"metadata": {"uid": "c",
+                            "ownerReferences": [{"uid": "SOMEONE-ELSE"}]},
+               **_bound_claim()},
+    )
     custom.create_namespaced_custom_object.side_effect = ApiException(status=409)
-    custom.get_namespaced_custom_object.return_value = {
-        "metadata": {"uid": "sb", "ownerReferences": [{"uid": "SOMEONE-ELSE"}]},
-    }
-    api = MagicMock()
-    p = _sandbox_provisioner(api=api, custom=custom)
+    p = _sandbox_provisioner(api=MagicMock(), custom=custom)
 
-    with pytest.raises(RuntimeError) as excinfo:
-        p.ensure("abc", persistent=False, image="i:1", resources=Resources())
-    assert "not created by this Hermes instance" in str(excinfo.value)
-    # ...and it is called a sandbox, not a "sandboxe".
-    assert "sandboxe " not in str(excinfo.value)
+    with pytest.raises(RuntimeError, match="not created by this Hermes instance"):
+        p.ensure("abc")
 
-    p.destroy(PodRef("hermes", p.workspace_name("abc"), "workspace"),
-              persistent=False)
+    p.destroy(PodRef("hermes", p.workspace_name("abc"), "workspace"))
     custom.delete_namespaced_custom_object.assert_not_called()
-
-
-def test_pvc_adoption_requires_the_whole_hermes_provenance_stamp():
-    """The claim is mounted at the agent's cwd and the session-start sync writes
-    credential files into it, and its name is deliberately predictable
-    (`hermes-ws-<task>`, task ids collapse to "default"). Accepting anything
-    that carries ONE well-known label meant anything able to create a labelled
-    PVC in the namespace could pre-create the claim and be handed those files.
-
-    What is checkable here is provenance, not identity — the claim carries no
-    ownerReference by design — so the whole stamp is required and a missing one
-    fails closed."""
-    from kubernetes.client.exceptions import ApiException
-    from tools.environments.kubernetes import PVC_INSTANCE_ANNOTATION
-
-    def _refuses(pvc, match):
-        api = MagicMock()
-        api.read_namespaced_persistent_volume_claim.return_value = pvc
-        p = _provisioner_with_api(api)
-        with pytest.raises(RuntimeError, match=match):
-            p.ensure("mytask", persistent=True, image="i:1", resources=Resources())
-        api.create_namespaced_pod.assert_not_called()
-
-    # No Hermes labels at all (round-2 case, still refused).
-    _refuses(_hermes_pvc(labels={"owner": "someone-else"}), "not a Hermes workspace")
-    # The managed-by label alone — the shape anything with PVC create can make.
-    _refuses(_hermes_pvc(labels={MANAGED_BY: "hermes-agent"}, annotations={}),
-             "component label")
-    # Right labels, but for another task's workspace.
-    _refuses(_hermes_pvc(task="someone-elses-task"), "labelled for task")
-    # Everything but the provenance stamp: no Hermes agent recorded creating it.
-    _refuses(_hermes_pvc(annotations={}), "carries no")
-
-    # A claim Hermes itself created is adopted, and the stamp is what it writes.
-    api = MagicMock()
-    api.read_namespaced_persistent_volume_claim.return_value = _hermes_pvc()
-    api.read_namespaced_pod.return_value = _running_pod()
-    p = _provisioner_with_api(api)
-    p.ensure("mytask", persistent=True, image="i:1", resources=Resources())
-    api.create_namespaced_persistent_volume_claim.assert_not_called()
-
-    api.read_namespaced_persistent_volume_claim.side_effect = ApiException(status=404)
-    p.ensure("mytask", persistent=True, image="i:1", resources=Resources())
-    body = api.create_namespaced_persistent_volume_claim.call_args.kwargs["body"]
-    assert body["metadata"]["annotations"][PVC_INSTANCE_ANNOTATION] == p._instance
-
-
-def test_pvc_adoption_across_instances_stays_possible_but_is_logged(caplog):
-    """Two agents running the same task id SHARE the claim by design (the name
-    is task-scoped so a persistent workspace resumes after the agent pod is
-    replaced). That must keep working — and must never be silent, because the
-    agent's credential files are synced into someone else's workspace."""
-    api = MagicMock()
-    api.read_namespaced_persistent_volume_claim.return_value = _hermes_pvc(
-        instance="another0"
-    )
-    api.read_namespaced_pod.return_value = _running_pod()
-    p = _provisioner_with_api(api)
-    with caplog.at_level("WARNING"):
-        p.ensure("mytask", persistent=True, image="i:1", resources=Resources())
-    assert any("another0" in record.getMessage() for record in caplog.records), (
-        caplog.records
-    )
 

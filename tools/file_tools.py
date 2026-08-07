@@ -1169,7 +1169,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             elif env_type == "daytona":
                 image = overrides.get("daytona_image") or config["daytona_image"]
             elif env_type == "kubernetes":
-                image = overrides.get("kubernetes_image") or config["kubernetes_image"]
+                # Display-only: the image is authored in pod_template (or the
+                # cluster's SandboxTemplate), not selected per task.
+                image = config["kubernetes_image"]
             else:
                 image = ""
 

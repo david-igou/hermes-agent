@@ -146,7 +146,7 @@ For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persi
 | **daytona** | Daytona workspace | Full (cloud container) | Managed cloud dev environments |
 | **vercel_sandbox** | Vercel Sandbox | Full (cloud microVM) | Cloud execution with snapshot-backed filesystem persistence |
 | **singularity** | Singularity/Apptainer container | Namespaces (--containall) | HPC clusters, shared machines |
-| **kubernetes** | Per-session pod in your cluster | Full (pod, no-perms SA, optional kata runtime) | Running Hermes in-cluster with cluster-managed quotas and storage |
+| **kubernetes** | Per-session pod in your cluster | Full (pod, no-perms SA, optional kata runtime) | Running Hermes in-cluster with cluster-managed quotas |
 
 ### Local Backend
 
@@ -428,7 +428,7 @@ OIDC tokens are short-lived and should not be used as the documented deployment 
 
 ### Kubernetes Backend
 
-Runs each session in its own pod in a Kubernetes or OpenShift cluster; every command is exec'd into that pod. Built for running Hermes itself in-cluster.
+Runs each session in its own **stateless** pod in a Kubernetes or OpenShift cluster; every command is exec'd into that pod and the workspace (an emptyDir) dies with it. Built for running Hermes itself in-cluster.
 
 **Every setting is a `config.yaml` key under `terminal.kubernetes.*`. There are no `TERMINAL_KUBERNETES_*` environment variables**, and none should be added — `.env` is for secrets, and this backend has no credential of its own: in-cluster authentication is the projected ServiceAccount token the kubelet mounts into the Hermes pod.
 
@@ -439,28 +439,27 @@ terminal:
   kubernetes:
     provisioner: pod               # pod | sandbox
     namespace: ""                  # "" -> the in-cluster ServiceAccount namespace
-    image: nikolaik/python-nodejs:python3.11-nodejs20
-    container_name: workspace      # the container Hermes builds and execs into
+    container_name: workspace      # the container Hermes execs into
     mount_path: /workspace
-    persistent: false              # opt-in retained PVC per task
     ready_timeout_seconds: 120
-    pod_template:                  # everything that is merely PodSpec
+    pod_template:                  # provisioner: pod — everything that is PodSpec
       spec:
         runtimeClassName: kata     # OpenShift sandboxed containers
         containers:
           - name: workspace        # merged onto the default base by `name`
+            image: nikolaik/python-nodejs:python3.11-nodejs20
             resources:
               requests: {cpu: "500m", memory: "2Gi"}
               limits:   {cpu: "2",    memory: "4Gi"}
 ```
 
-The schema models only what the backend has to reason about — object placement, cluster auth, the exec target, workspace lifetime. Everything else is plain `PodSpec` and lives in **`pod_template`**, a single `PodTemplateSpec` merged over a **default** base. `cli-config.yaml.example` (OPTION 7) documents the full key set.
+The schema models only what the backend has to reason about — object placement, cluster auth, the exec target. Everything else is plain `PodSpec` and lives in **`pod_template`** (for `provisioner: pod`), a single `PodTemplateSpec` merged over a **default** base — or in the cluster admin's `SandboxTemplate` (for `provisioner: sandbox`). The shared `container_cpu` / `container_memory` / `container_disk` / `container_persistent` keys are **not** read by this backend. `cli-config.yaml.example` (OPTION 7) documents the full key set.
 
 **Merge rule for `pod_template`:** JSON merge patch, [RFC 7386](https://www.rfc-editor.org/rfc/rfc7386) — mappings merge recursively, a `null` removes the key it names, and lists replace wholesale (`volumes`, `volumeMounts`, `env`, `tolerations`, `imagePullSecrets`, `ports`, all of them). The one exception is `spec.containers` and `spec.initContainers`, which merge element-wise on `name` so you can set `resources` on the workspace container without restating its image, command and mounts. A container the base does not declare is appended.
 
 **Nothing is reserved.** The base is a set of defaults that make the out-of-box config produce a working pod, not a constraint: a `pod_template` may override any field in it, including the exec container's `command`, `args`, `restartPolicy`, `volumeMounts` and `securityContext`. If the result cannot serve exec, that fails visibly at the first command. The one value Hermes stamps after the merge is the `app.kubernetes.io/managed-by: hermes-agent` label, which is how it finds and adopts its own session pods and what the shipped NetworkPolicy selects on.
 
-**Validation is the cluster's job.** Hermes checks the `provisioner` enum and the handful of types needed to build a request at all; what a session pod may be is decided by SCC, Pod Security Admission, `ValidatingAdmissionPolicy`, NetworkPolicy and RBAC, which the cluster administrator owns.
+**Validation is the cluster's job.** Hermes performs no in-process config validation beyond the `provisioner` enum (which selects the API to call); what a session pod may be is decided by SCC, Pod Security Admission, `ValidatingAdmissionPolicy`, NetworkPolicy and RBAC, which the cluster administrator owns, and malformed config is rejected by the API server with the exact JSON path named.
 
 **Approval prompts:** Hermes' dangerous-command guards stay on for this backend unless you set `terminal.kubernetes.trusted_sandbox: true`. That is a declaration by the operator, not something Hermes infers by inspecting the pod.
 
@@ -474,7 +473,7 @@ pip install 'hermes-agent[kubernetes]'
 
 There is no lazy install for this backend: the terminal tool stays disabled until the client is importable.
 
-**Required RBAC:** apply `k8s/rbac.yaml` (pick the Role matching your provisioner), then run `hermes doctor` — it issues per-provisioner `SelfSubjectAccessReview` checks (`pod`: create/delete `pods` + create `pods/exec`; `sandbox`: create/delete `sandboxes.agents.x-k8s.io`, get `pods`, create `pods/exec`, and it flags `create pods` being *allowed* as broader than that provisioner needs). See [`k8s/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/k8s/README.md) for the network policy and admission-policy manifests.
+**Required RBAC:** apply `k8s/rbac.yaml` (pick the Role matching your provisioner), then run `hermes doctor` — it issues per-provisioner `SelfSubjectAccessReview` checks (`pod`: create/delete `pods` + get `pods/exec`; `sandbox`: create/delete `sandboxclaims.extensions.agents.x-k8s.io`, get `sandboxes.agents.x-k8s.io`, get `pods`, get `pods/exec`, and it flags `create pods` being *allowed* as broader than that provisioner needs), verifies the configured warm pool exists, and dry-runs the object it would submit. See [`k8s/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/k8s/README.md) for the network policy and admission-policy manifests.
 
 **Authentication:** in-cluster ServiceAccount first, then `terminal.kubernetes.kubeconfig`, then the ambient `KUBECONFIG` / `~/.kube/config` for out-of-cluster development.
 
@@ -482,9 +481,9 @@ There is no lazy install for this backend: the terminal tool stays disabled unti
 
 **Credential files:** the session pod is an execution boundary, not a secrets boundary — registered credential files and skills are synced into it on session start (as with the Modal/Daytona backends). The sync streams over the exec stdin channel, never through exec argv, because exec request URLs land in the API-server audit log.
 
-**Provisioners:** `pod` creates a raw `Pod` (plus a `PersistentVolumeClaim` when `persistent: true`). `sandbox` creates a `Sandbox` custom resource (`agents.x-k8s.io/v1beta1`) reconciled by agent-sandbox-operator and execs into the pod it produces; the agent ServiceAccount then needs `sandboxes` create/delete but not bare `pods` create/delete. Both consume the identical rendered `pod_template` — the Sandbox CRD is itself `spec.podTemplate.spec` — so flipping the provisioner cannot change the workload shape.
+**Provisioners:** who authors the pod is the difference. `pod` creates a raw `Pod` you author in `pod_template`, judged by your admission stack. `sandbox` consumes [kubernetes-sigs/agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) (or the Red Hat build) the way it is designed to be consumed: your cluster admin authors a `SandboxTemplate` and a `SandboxWarmPool`, and Hermes checks a pre-warmed sandbox out per session with a `SandboxClaim` (`terminal.kubernetes.sandbox.warm_pool` names the pool, and is the only sandbox-side key). On that path `pod_template` is ignored, the agent ServiceAccount has no pod-authoring surface at all (`sandboxclaims` + read-only `sandboxes`), the warm pool absorbs kata cold starts, and teardown cascades claim → sandbox → pod via `shutdownPolicy: Delete`. See `k8s/README.md` for the admin-side objects and the exec contract the template must satisfy.
 
-**Persistence:** `terminal.kubernetes.persistent` is deliberately independent of the shared `container_persistent`. A cluster sandbox defaults to ephemeral (`emptyDir`). When enabled, the PVC is retained across sessions and is never deleted by Hermes, so reap old `hermes-ws-*` claims yourself.
+**Persistence:** none, deliberately. Session workspaces are stateless — an `emptyDir` that dies with the pod. There is no PVC surface, no retained state, and nothing to reap; a vanished pod is re-provisioned empty and the skills/credential sync re-runs automatically.
 
 **OpenShift:** leave `pod_template.spec.securityContext.runAsUser` unset so the `restricted-v2` SCC assigns a UID from the namespace range — a hard-coded value outside that range is rejected at admission. Set container `resources.limits` when the namespace has a `ResourceQuota` covering `limits.*`.
 

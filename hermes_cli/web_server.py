@@ -845,10 +845,10 @@ def _memory_provider_options() -> List[str]:
 def _kubernetes_provisioner_options() -> List[str]:
     """The ``terminal.kubernetes.provisioner`` select, DERIVED not duplicated.
 
-    ``pod`` = raw Pod via the core API; ``sandbox`` = a Sandbox CR reconciled
-    by agent-sandbox-operator. This used to be a second literal copy of the
-    enum kept in sync by a comment: when the two drift, the web settings
-    dropdown offers a value ``validate_kubernetes_config`` rejects and the
+    ``pod`` = raw Pod via the core API; ``sandbox`` = a SandboxClaim checked
+    out of an agent-sandbox SandboxWarmPool. This used to be a second literal
+    copy of the enum kept in sync by a comment: when the two drift, the web
+    settings dropdown offers a value the environment factory rejects and the
     operator learns about it as a ``ValueError`` at first session instead of at
     config time. Importing the single source of truth makes that impossible.
 
@@ -13969,17 +13969,25 @@ def _probe_kubernetes_backend(terminal_cfg: dict) -> tuple:
                                "(pip install 'hermes-agent[kubernetes]')")
     try:
         from tools.environments.kubernetes import (
+            VALID_PROVISIONERS,
             in_cluster,
             merge_kubernetes_config,
-            validate_kubernetes_config,
         )
     except Exception as exc:
         return ("unavailable", f"Backend import failed: {exc}")
 
     kcfg = merge_kubernetes_config((terminal_cfg or {}).get("kubernetes"))
-    problems = validate_kubernetes_config(kcfg)
-    if problems:
-        return ("needs_setup", problems[0])
+    provisioner = str(kcfg.get("provisioner") or "").strip().lower()
+    if provisioner not in VALID_PROVISIONERS:
+        return ("needs_setup",
+                "terminal.kubernetes.provisioner must be one of "
+                f"{', '.join(VALID_PROVISIONERS)} (got {provisioner!r})")
+    if provisioner == "sandbox" and not str(
+        (kcfg.get("sandbox") or {}).get("warm_pool") or ""
+    ).strip():
+        return ("needs_setup",
+                "provisioner: sandbox requires terminal.kubernetes.sandbox."
+                "warm_pool to name a SandboxWarmPool (ask your cluster admin)")
     if in_cluster():
         return ("ready", f"in-cluster ServiceAccount, provisioner: {kcfg['provisioner']}")
     kubeconfig = kcfg.get("kubeconfig") or os.environ.get("KUBECONFIG") or ""

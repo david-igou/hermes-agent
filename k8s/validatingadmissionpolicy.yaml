@@ -44,11 +44,12 @@
 # above). An earlier revision of this file claimed the matchCondition "cannot be
 # configured away" — that claim was false and is retracted.
 #
-# NOT COVERED: `provisioner: sandbox`. This policy matches pods CREATE, and in
-# sandbox mode the pod is created by agent-sandbox-operator from the Sandbox CR
-# under the operator's identity, so the match conditions may not hold.
-# Constrain the Sandbox CR instead (or stay on provisioner: pod) if you rely
-# on this policy.
+# NOT COVERED (by design): `provisioner: sandbox`. On that path the pod is
+# created by the agent-sandbox controllers from YOUR SandboxTemplate — Hermes
+# submits no pod spec at all, so there is nothing of Hermes' to police here.
+# Harden the SandboxTemplate itself (it IS the enforcement point) and keep
+# write access to sandboxtemplates/sandboxwarmpools away from the agent's
+# ServiceAccount (see k8s/rbac.yaml).
 #
 # CONSEQUENCE OF THE SECRET RULES BELOW: they deny secret-backed ENV as well as
 # secret volumes, so a `pod_template` block that injects provider API
