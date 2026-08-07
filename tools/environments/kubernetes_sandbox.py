@@ -54,6 +54,7 @@ from typing import Any, Optional
 from tools.environments.kubernetes import (
     INSTANCE_LABEL,
     MANAGED_BY_LABEL,
+    pod_cannot_exec,
     STRICT_FIELD_VALIDATION,
     PodRef,
     _BaseProvisioner,
@@ -420,24 +421,30 @@ class SandboxClaimProvisioner(_BaseProvisioner):
 
         for attempt in (1, 2):
             try:
-                sandbox_name = self._wait_claim(name)
+                return self._bind(name)
             except _ClaimDead as dead:
                 if attempt == 2:
                     raise RuntimeError(str(dead))
-                # Our claim, but its sandbox finished (deadline, OOMKill) or
-                # it expired — the controller never restarts a finished pod,
-                # so replace the claim and bind fresh.
+                # Our claim, but its sandbox is unusable — finished (deadline,
+                # OOMKill), expired, or its exec container died behind a
+                # sidecar. The controller never restarts a finished pod, so
+                # replace the claim and bind fresh.
                 logger.warning("%s; replacing it.", dead)
                 self._delete_claim_and_wait(name)
                 self._create_claim(self.claim_manifest(task_id))
-                continue
-            break
+        raise RuntimeError(f"sandboxclaim {name} could not be bound")
 
+    def _bind(self, name: str) -> PodRef:
+        """One bind attempt: wait for the claim, resolve its pod, prove it is
+        usable. Raises :class:`_ClaimDead` when the caller should replace the
+        claim rather than keep waiting on it."""
+        sandbox_name = self._wait_claim(name)
         # Recorded the moment the claim BINDS: from here on a bound sandbox
         # is checked out of the pool, so teardown must delete it even if the
         # pod checks below fail. (Before binding it is deliberately NOT
         # recorded — see the readiness-timeout note in _wait_claim.)
         self._created_names.add(name)
+
         sandbox = self._get_sandbox(sandbox_name)
         pod_name = self._pod_name_from_sandbox(sandbox)
         if not pod_name:
@@ -445,9 +452,31 @@ class SandboxClaimProvisioner(_BaseProvisioner):
                 f"sandboxclaim {name} is bound to sandbox {sandbox_name!r} "
                 "but no pod name could be resolved from it."
             )
+
+        # The claim's conditions are derived from POD PHASE, which only turns
+        # terminal once EVERY container exits — so a pod whose exec container
+        # died behind a sidecar still reports Ready, and waiting on it just
+        # rebinds the same corpse on every attempt. Ask the pod itself before
+        # committing to it.
+        try:
+            bound = api_call(
+                self._api.read_namespaced_pod,
+                name=pod_name, namespace=self.namespace,
+            )
+        except Exception:
+            bound = None
+        if bound is not None and pod_cannot_exec(bound, self.container_name()):
+            raise _ClaimDead(
+                f"sandboxclaim {name} is bound to sandbox {sandbox_name}, "
+                f"whose pod {pod_name} can no longer serve exec"
+            )
+
         pod = self.wait_pod_ready(pod_name)
         self._assert_pod_belongs(pod, pod_name, sandbox)
         return PodRef(self.namespace, pod_name, self.exec_container(pod))
+
+    def has_outstanding(self) -> bool:
+        return bool(self._created_names)
 
     def destroy(self, pod_ref: PodRef) -> None:
         from kubernetes.client.exceptions import ApiException

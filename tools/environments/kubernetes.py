@@ -807,6 +807,17 @@ class WorkspaceProvisioner(ABC):
         """Tear down the session workspace."""
         ...
 
+    def has_outstanding(self) -> bool:
+        """True when destroy() still has something to release.
+
+        The pod path records nothing beyond the ref the environment holds, so
+        a lost ref means there is nothing left to do. The claim path is
+        different: it tracks BOUND claim names, and a bound claim is a
+        warm-pool sandbox (possibly a kata VM) checked out until shutdownTime
+        — so teardown must run even after the death detector nulled the ref.
+        """
+        return False
+
 
 class _BaseProvisioner(WorkspaceProvisioner):
     """Shared naming and readiness polling."""
@@ -1391,9 +1402,13 @@ class KubernetesEnvironment(BaseEnvironment):
         # emptyDir has only the mount root.
         self.cwd = self._initial_cwd
         self._reset_note_pending = True
-        # A fresh pod has none of the synced files or the env snapshot.
+        # A fresh pod has none of the synced files or the env snapshot. The
+        # sync manager's per-file mtime cache still describes the DEAD pod, and
+        # force=True only bypasses the rate limit — so without dropping that
+        # state first the replacement pod receives nothing at all.
         if self._sync_manager is not None:
             try:
+                self._sync_manager.forget_remote_state()
                 self._sync_manager.sync(force=True)
             except Exception as exc:
                 logger.warning("file re-sync failed: %s", exc)
@@ -1840,9 +1855,24 @@ class KubernetesEnvironment(BaseEnvironment):
             # Final: an orphaned background poller calling _ensure_pod after
             # this must fail, not resurrect the environment into an untracked
             # pod/claim.
+            already_torn_down = self._torn_down
             self._torn_down = True
-        if ref is None:
+        if already_torn_down:
             return
+        if ref is None and not self._provisioner.has_outstanding():
+            # _forget_pod_if_dead may already have nulled the ref. The
+            # provisioner can still hold objects that only destroy() releases
+            # — on the claim path a bound SandboxClaim, i.e. a warm-pool
+            # sandbox (possibly a kata VM) checked out until shutdownTime.
+            return
+        if ref is None:
+            # Synthesise a ref so teardown still runs; the provisioner
+            # deletes by its own recorded names, not by this one.
+            ref = PodRef(
+                getattr(self._provisioner, "namespace", ""),
+                self._provisioner.workspace_name(self._task_id),
+                WORKSPACE_CONTAINER_NAME,
+            )
         try:
             self._provisioner.destroy(ref)
         except Exception as exc:

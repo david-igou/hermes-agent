@@ -2681,6 +2681,7 @@ def test_cleanup_during_provisioning_destroys_the_new_pod(monkeypatch):
         return PodRef("hermes", "hermes-ws-abc", "workspace")
 
     env._provisioner.ensure.side_effect = _ensure_then_teardown
+    env._provisioner.has_outstanding.return_value = False
     env._provisioner.destroy.reset_mock()
     with pytest.raises(RuntimeError, match="cleaned up while provisioning"):
         env._ensure_pod()
@@ -2860,3 +2861,55 @@ def test_an_unexplained_exec_error_still_shows_the_error(monkeypatch):
         monkeypatch, [("", 0), _FakeWSClient(raise_on_update=RuntimeError("boom"))],
         api=api)
     assert "boom" in env.execute("ls", bounded_capture=True)["output"]
+
+
+def test_cleanup_releases_a_bound_claim_after_the_ref_was_dropped(monkeypatch):
+    """_forget_pod_if_dead nulls the ref, and cleanup() used to bail on that —
+    leaving a BOUND claim (a warm-pool sandbox, possibly a kata VM) checked
+    out until shutdownTime, hours later."""
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    env._provisioner.has_outstanding.return_value = True
+    with env._lock:
+        env._pod_ref = None          # the death detector got there first
+    env.cleanup()
+    env._provisioner.destroy.assert_called_once()
+
+
+def test_cleanup_does_nothing_when_the_provisioner_holds_nothing(monkeypatch):
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    env._provisioner.has_outstanding.return_value = False
+    with env._lock:
+        env._pod_ref = None
+    env.cleanup()
+    env._provisioner.destroy.assert_not_called()
+
+
+def test_a_replacement_pod_gets_the_files_again(monkeypatch):
+    """sync(force=True) only bypasses the rate limit — the per-file mtime
+    cache still short-circuits every upload, so without dropping that state a
+    re-provisioned (empty) pod silently received NOTHING."""
+    from kubernetes.client.exceptions import ApiException
+
+    gone = _FakeWSClient(raise_on_update=ApiException(status=404, reason="gone"))
+    env = _make_k8s_env(monkeypatch, [("", 0), gone, ("", 0), ("ok\n", 0)])
+    env._sync_manager = MagicMock()
+    env.execute("ls", bounded_capture=True)      # kills the ref
+    env.execute("echo ok", bounded_capture=True)  # re-provisions
+    env._sync_manager.forget_remote_state.assert_called_once()
+    env._sync_manager.sync.assert_any_call(force=True)
+
+
+def test_a_wedged_bound_pod_replaces_the_claim_instead_of_rebinding_it():
+    """Claim conditions come from POD PHASE, which stays Running while a
+    sidecar lives — so a dead exec container was rebound forever, 45s a try,
+    with the timeout wrongly blaming pool exhaustion."""
+    wedged = _pod_with(terminated_container="workspace")
+    healthy = _pod_owned_by_sandbox()
+    custom = _claim_custom_api()
+    api = MagicMock()
+    api.read_namespaced_pod.side_effect = [wedged, healthy, healthy]
+    p = _sandbox_provisioner(api=api, custom=custom)
+    ref = p.ensure("abc")
+    assert ref.pod_name == "sb-1"
+    custom.delete_namespaced_custom_object.assert_called_once()   # claim replaced
+    assert custom.create_namespaced_custom_object.call_count == 2
