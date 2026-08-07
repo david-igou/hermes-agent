@@ -786,6 +786,11 @@ def _make_k8s_env(monkeypatch, exec_results, api=None):
     provisioner.workspace_name.return_value = "hermes-ws-abc"
     provisioner.namespace = "hermes"
     provisioner.ensure.return_value = PodRef("hermes", "hermes-ws-abc", "workspace")
+    # Explicit: a MagicMock would auto-create `_api`, and every field read off
+    # the resulting fake pod (deletion_timestamp, phase) would be a truthy
+    # sentinel — making every exec error look like a dead pod. Tests that DO
+    # want the liveness check pass a real fake via `api`.
+    provisioner._api = api
 
     calls = {"i": 0}
 
@@ -2829,3 +2834,29 @@ def test_a_bound_claim_is_torn_down_even_if_the_pod_checks_fail():
         p.ensure("abc")
     p.destroy(PodRef("hermes", "sb-1", "workspace"))
     custom.delete_namespaced_custom_object.assert_called()
+
+
+def test_a_dead_pod_reports_something_the_model_can_act_on(monkeypatch):
+    """Exec against a completed pod fails deep inside the websocket client
+    ("'NoneType' object has no attribute 'decode'" — observed on a real
+    DeadlineExceeded pod). Handing that to the model tells it nothing; the
+    failure has to name the cause and the remedy."""
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _pod_with(phase="Failed")
+    broken = _FakeWSClient(
+        raise_on_update=AttributeError("'NoneType' object has no attribute 'decode'"))
+    env = _make_k8s_env(monkeypatch, [("", 0), broken], api=api)
+    out = env.execute("ls", bounded_capture=True)["output"]
+    assert "workspace stopped" in out and "next command" in out
+    assert "NoneType" not in out
+
+
+def test_an_unexplained_exec_error_still_shows_the_error(monkeypatch):
+    """Only a CONFIRMED dead pod gets the friendly message; anything else
+    must keep the diagnostic, or a real bug becomes invisible."""
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _running_pod()
+    env = _make_k8s_env(
+        monkeypatch, [("", 0), _FakeWSClient(raise_on_update=RuntimeError("boom"))],
+        api=api)
+    assert "boom" in env.execute("ls", bounded_capture=True)["output"]

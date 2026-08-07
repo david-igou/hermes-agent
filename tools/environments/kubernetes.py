@@ -1565,7 +1565,7 @@ class KubernetesEnvironment(BaseEnvironment):
             )
         return "".join(chunks), self._safe_returncode(resp)
 
-    def _forget_pod_if_dead(self, exc: Exception) -> None:
+    def _forget_pod_if_dead(self, exc: Exception) -> bool:
         """Drop the pod ref when the pod is gone OR terminal-but-present.
 
         404 is the easy case (the pod was deleted underneath us). The
@@ -1585,7 +1585,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 ref = self._pod_ref
             api = self._exec_api or getattr(self._provisioner, "_api", None)
             if ref is None or api is None:
-                return
+                return False
             try:
                 pod = api_call(
                     api.read_namespaced_pod,
@@ -1595,10 +1595,11 @@ class KubernetesEnvironment(BaseEnvironment):
             except Exception as read_exc:
                 dead = getattr(read_exc, "status", None) == 404
         if not dead:
-            return
+            return False
         with self._lock:
             self._pod_ref = None
         self._snapshot_ready = False
+        return True
 
     def _run_bash(
         self, cmd_string: str, *, login: bool = False, timeout: int = 120,
@@ -1645,8 +1646,17 @@ class KubernetesEnvironment(BaseEnvironment):
                     cancelled = state.cancelled
                 if not cancelled:
                     logger.warning("exec stream error: %s", exc)
-                    chunks.append(f"\n[kubernetes exec error: {exc}]")
-                    self._forget_pod_if_dead(exc)
+                    # Ask whether the pod died BEFORE composing the message:
+                    # exec against a completed pod fails deep inside the
+                    # websocket client ("'NoneType' object has no attribute
+                    # 'decode'"), which tells the model nothing it can act on.
+                    died = self._forget_pod_if_dead(exc)
+                    chunks.append(
+                        "\n[the session workspace stopped (deadline, eviction "
+                        "or OOM) and its files are gone; the next command "
+                        "provisions a fresh one]"
+                        if died else f"\n[kubernetes exec error: {exc}]"
+                    )
                 return "".join(chunks), (130 if cancelled else 1)
             finally:
                 with self._lock:
