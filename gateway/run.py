@@ -1958,6 +1958,8 @@ if _config_path.exists():
                 "modal_image": "TERMINAL_MODAL_IMAGE",
                 "daytona_image": "TERMINAL_DAYTONA_IMAGE",
                 "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
+                # Whole terminal.kubernetes.* block as one internal JSON env var.
+                "kubernetes": "TERMINAL_KUBERNETES",
                 "ssh_host": "TERMINAL_SSH_HOST",
                 "ssh_user": "TERMINAL_SSH_USER",
                 "ssh_port": "TERMINAL_SSH_PORT",
@@ -1998,7 +2000,10 @@ if _config_path.exists():
                         if not _is_ssh_remote_tilde_cwd(_terminal_backend, _val.strip()):
                             _val = os.path.expanduser(_val)
                     if isinstance(_val, (list, dict)):
-                        os.environ[_env_var] = json.dumps(_val)
+                        # default=str: see _terminal_env_value in
+                        # hermes_cli/config.py — a YAML-native date in the pod
+                        # spec would otherwise abort this loop.
+                        os.environ[_env_var] = json.dumps(_val, default=str)
                     else:
                         os.environ[_env_var] = str(_val)
         # Compression config is read directly from config.yaml by run_agent.py

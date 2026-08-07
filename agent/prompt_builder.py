@@ -999,7 +999,7 @@ WSL_ENVIRONMENT_HINT = (
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
     "docker", "singularity", "modal", "daytona", "ssh",
-    "vercel_sandbox", "managed_modal",
+    "vercel_sandbox", "managed_modal", "kubernetes",
 })
 
 
@@ -1015,6 +1015,7 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "daytona": "a Daytona workspace (Linux)",
     "vercel_sandbox": "a Vercel sandbox (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
+    "kubernetes": "a Kubernetes session pod (Linux)",
 }
 
 
@@ -1024,6 +1025,13 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 # disk) because the probe captures live backend state that may change
 # across Hermes restarts.
 _BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
+# One worker per cache key; a prompt build waits at most this long for it.
+# 10s covers a warm pod/exec handshake comfortably; a cold kata boot blows
+# straight through it and lands as a cache hit on the NEXT build instead of
+# stalling this one.
+_BACKEND_PROBE_WAIT_SECONDS = 10.0
+_BACKEND_PROBE_LOCK = threading.Lock()
+_BACKEND_PROBE_THREADS: dict[tuple[str, str], threading.Thread] = {}
 
 
 _WINDOWS_BASH_SHELL_HINT = (
@@ -1044,6 +1052,14 @@ def _probe_remote_backend(env_type: str) -> str | None:
     $HOME, cwd, and user — or None if the probe failed. Result is cached
     per process. Used only for non-local backends where the agent's tools
     operate on a different machine than the host Hermes runs on.
+
+    Bounded: the probe includes ENVIRONMENT CREATION, which for backends that
+    provision real infrastructure (a kubernetes session pod, a kata boot) can
+    take up to ready_timeout_seconds — far past this call's 4s execute budget
+    and squarely inside the user's first prompt build. So the work runs in a
+    worker thread with a hard wait ceiling (same shape as tools/env_probe.py);
+    on expiry the prompt falls back to the static backend description and the
+    worker keeps warming the cache for the next build.
     """
     cwd_hint = os.getenv("TERMINAL_CWD", "")
     cache_key = (env_type, cwd_hint)
@@ -1051,6 +1067,31 @@ def _probe_remote_backend(env_type: str) -> str | None:
     if cached is not None:
         return cached or None
 
+    with _BACKEND_PROBE_LOCK:
+        worker = _BACKEND_PROBE_THREADS.get(cache_key)
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(
+                target=_probe_remote_backend_sync,
+                args=(env_type, cache_key),
+                name=f"backend-probe-{env_type}",
+                daemon=True,
+            )
+            _BACKEND_PROBE_THREADS[cache_key] = worker
+            worker.start()
+    worker.join(_BACKEND_PROBE_WAIT_SECONDS)
+    result = _BACKEND_PROBE_CACHE.get(cache_key)
+    if result is None:
+        logger.debug(
+            "Backend probe for %s still running after %.0fs; using the static "
+            "description for this prompt build.",
+            env_type, _BACKEND_PROBE_WAIT_SECONDS,
+        )
+        return None
+    return result or None
+
+
+def _probe_remote_backend_sync(env_type: str, cache_key: tuple) -> None:
+    """The actual probe; always publishes a cache entry ("" = nothing to say)."""
     try:
         # Import locally: tools/ imports are heavy and only relevant when a
         # non-local backend is actually configured.
@@ -1088,8 +1129,10 @@ def _probe_remote_backend(env_type: str) -> str | None:
             }
 
         container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+        if env_type in {"docker", "singularity", "modal", "daytona",
+                        "vercel_sandbox", "kubernetes"}:
             container_config = {
+                "kubernetes": config.get("kubernetes", {}),
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),
@@ -1124,7 +1167,18 @@ def _probe_remote_backend(env_type: str) -> str | None:
             "\"$(uname -r 2>/dev/null || echo unknown)\" "
             "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
         )
-        result = env.execute(probe_cmd, timeout=4)
+        try:
+            result = env.execute(probe_cmd, timeout=4)
+        finally:
+            # The probe env is never registered in _active_environments, so
+            # cleanup_all_environments() cannot see it. For backends that
+            # provision real infrastructure (a kubernetes session pod, a kata
+            # VM) leaving it to __del__ means a short `hermes -p`/cron run
+            # that exits inside this window orphans it to the deadline.
+            try:
+                env.cleanup()
+            except Exception as cleanup_exc:
+                logger.debug("Backend probe cleanup failed: %s", cleanup_exc)
         if result.get("returncode") != 0:
             logger.debug("Backend probe returned non-zero: %r", result)
             _BACKEND_PROBE_CACHE[cache_key] = ""

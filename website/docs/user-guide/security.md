@@ -501,6 +501,9 @@ If you add names to `terminal.docker_forward_env`, those variables are intention
 | **modal** | Cloud sandbox | ❌ Skipped | Scalable cloud isolation |
 | **daytona** | Cloud sandbox | ❌ Skipped | Persistent cloud workspaces |
 | **vercel_sandbox** | Cloud microVM | ❌ Skipped | Cloud execution with snapshot persistence |
+| **kubernetes** | Session pod | ❌ Skipped (pod is the boundary) | Running Hermes in-cluster |
+
+For `kubernetes`, what a session pod may actually do is decided by SCC, Pod Security Admission, your `ValidatingAdmissionPolicy` and your NetworkPolicy — none of which Hermes can see, and all of which are the real control. Hermes does not attempt to grade the pod it renders. See [`k8s/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/k8s/README.md).
 
 ## Environment Variable Passthrough {#environment-variable-passthrough}
 

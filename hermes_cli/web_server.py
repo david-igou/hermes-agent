@@ -842,6 +842,32 @@ def _memory_provider_options() -> List[str]:
     return list(dict.fromkeys(options))
 
 
+def _kubernetes_kind_options() -> List[str]:
+    """The ``terminal.kubernetes.kind`` select, DERIVED not duplicated.
+
+    Replaced a ``provisioner`` select whose options were a second literal copy
+    of the backend's enum: when the two drift, the dropdown offers a value the
+    factory rejects and the operator learns about it as a ``ValueError`` at
+    first session instead of at config time. Importing the single source of
+    truth makes that impossible — and the source is now the kind table, since
+    ``kind`` is what selects the provisioner.
+
+    The import is function-local and failure-tolerant so a build without the
+    kubernetes extra still renders the settings page. It stays FUNCTION-LOCAL
+    for that reason — this runs at module import, inside the _SCHEMA_OVERRIDES
+    literal — but it is no longer wrapped: every kubernetes SDK import in the
+    backend is itself function-local, so the module loads without the extra,
+    and the old `except: return ["Pod"]` was a second copy of the enum that
+    test_the_web_settings_provisioner_enum_cannot_drift exists to forbid.
+    """
+    from tools.environments.kubernetes import PROVISIONERS_BY_KIND
+
+    # Sorted by KIND, not by the (apiVersion, kind) tuple: the tuple order
+    # puts a CRD group ahead of core "v1", so the dropdown would lead with
+    # SandboxClaim and bury Pod the moment a second kind lands.
+    return sorted({kind for _api, kind in PROVISIONERS_BY_KIND})
+
+
 def _timezone_options() -> List[str]:
     """Return sorted IANA timezone identifiers, cached at import time."""
     try:
@@ -877,7 +903,12 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "terminal.backend": {
         "type": "select",
         "description": "Terminal execution backend",
-        "options": ["local", "docker", "ssh", "modal", "daytona", "vercel_sandbox", "singularity"],
+        "options": ["local", "docker", "ssh", "modal", "daytona", "vercel_sandbox", "singularity", "kubernetes"],
+    },
+    "terminal.kubernetes.kind": {
+        "type": "select",
+        "description": "Kubernetes object kind for session workspaces",
+        "options": _kubernetes_kind_options(),
     },
     "terminal.vercel_runtime": {
         "type": "select",
@@ -13823,6 +13854,11 @@ _TERMINAL_BACKENDS: List[Dict[str, str]] = [
         "description": "Run commands in a Daytona cloud sandbox.",
     },
     {
+        "name": "kubernetes",
+        "label": "Kubernetes",
+        "description": "Run commands in a stateless session pod in a Kubernetes/OpenShift cluster.",
+    },
+    {
         "name": "ssh",
         "label": "SSH",
         "description": "Run commands on a remote host over SSH.",
@@ -13929,6 +13965,42 @@ def _probe_daytona_backend() -> tuple:
     return ("needs_setup", "Set DAYTONA_API_KEY to use the Daytona backend.")
 
 
+def _probe_kubernetes_backend(terminal_cfg: dict) -> tuple:
+    """Return ``(status, detail)`` for the kubernetes backend. Never raises."""
+    import importlib.util as _ilu
+
+    if _ilu.find_spec("kubernetes") is None:
+        return ("needs_setup", "kubernetes client not installed "
+                               "(pip install 'hermes-agent[kubernetes]')")
+    try:
+        from tools.environments.kubernetes import (
+            in_cluster,
+            merge_kubernetes_config,
+            preflight_spec,
+            resolve_provisioner_kind,
+        )
+    except Exception as exc:
+        return ("unavailable", f"Backend import failed: {exc}")
+
+    kcfg = merge_kubernetes_config((terminal_cfg or {}).get("kubernetes"))
+    try:
+        provisioner = resolve_provisioner_kind(kcfg)
+    except ValueError as exc:
+        return ("needs_setup", str(exc))
+    errors, _ = preflight_spec(kcfg)
+    if errors:
+        return ("needs_setup", errors[0])
+    # Explicit kubeconfig wins over the in-cluster SA — see load_core_api.
+    explicit = str(kcfg.get("kubeconfig") or "").strip()
+    if explicit:
+        return ("ready", f"kubeconfig {explicit}, {provisioner} provisioner")
+    if in_cluster():
+        return ("ready", f"in-cluster ServiceAccount, {provisioner} provisioner")
+    if os.environ.get("KUBECONFIG") or os.path.exists(os.path.expanduser("~/.kube/config")):
+        return ("ready", f"ambient kubeconfig, {provisioner} provisioner")
+    return ("needs_setup", "No in-cluster ServiceAccount and no kubeconfig found")
+
+
 def _probe_terminal_backend(name: str, terminal_cfg: dict) -> tuple:
     """Return ``(status, detail)`` for one backend. Never raises."""
     try:
@@ -13944,6 +14016,8 @@ def _probe_terminal_backend(name: str, terminal_cfg: dict) -> tuple:
             return _probe_modal_backend()
         if name == "daytona":
             return _probe_daytona_backend()
+        if name == "kubernetes":
+            return _probe_kubernetes_backend(terminal_cfg)
         return ("unavailable", f"Unknown backend: {name}")
     except Exception as exc:  # pragma: no cover — belt-and-braces guard
         return ("unavailable", f"Probe failed: {exc}")

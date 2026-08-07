@@ -66,13 +66,14 @@ The terminal tool can execute commands in different environments:
 | `modal` | Cloud execution | Serverless, scale |
 | `daytona` | Cloud sandbox workspace | Persistent remote dev environments |
 | `vercel_sandbox` | Vercel Sandbox cloud microVM | Cloud execution with snapshot-backed filesystem persistence |
+| `kubernetes` | Per-session pod in a Kubernetes/OpenShift cluster | Running Hermes in-cluster; optional kata per-session VM isolation |
 
 ### Configuration
 
 ```yaml
 # In ~/.hermes/config.yaml
 terminal:
-  backend: local    # or: docker, ssh, singularity, modal, daytona, vercel_sandbox
+  backend: local    # or: docker, ssh, singularity, modal, daytona, vercel_sandbox, kubernetes
   cwd: "."          # Working directory
   timeout: 180      # Command timeout in seconds
 ```
@@ -157,7 +158,7 @@ Configure CPU, memory, disk, and persistence for all container backends:
 
 ```yaml
 terminal:
-  backend: docker  # or singularity, modal, daytona, vercel_sandbox
+  backend: docker  # or singularity, modal, daytona, vercel_sandbox, kubernetes
   container_cpu: 1              # CPU cores (default: 1)
   container_memory: 5120        # Memory in MB (default: 5GB)
   container_disk: 51200         # Disk in MB (default: 50GB)

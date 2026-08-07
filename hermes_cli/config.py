@@ -3192,6 +3192,12 @@ TERMINAL_CONFIG_ENV_MAP = {
     "modal_image": "TERMINAL_MODAL_IMAGE",
     "daytona_image": "TERMINAL_DAYTONA_IMAGE",
     "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
+    # Nested block: the whole terminal.kubernetes.* mapping is bridged as ONE
+    # internal JSON env var (dict values are json.dumps'd by
+    # _terminal_env_value).  Nested keys are invisible to the .env mirror in
+    # set_config_value, which is exactly what keeps every Kubernetes setting in
+    # config.yaml where policy requires it.
+    "kubernetes": "TERMINAL_KUBERNETES",
     "ssh_host": "TERMINAL_SSH_HOST",
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
@@ -3214,9 +3220,27 @@ TERMINAL_CONFIG_ENV_MAP = {
 }
 
 
+# ``hermes config set terminal.X`` mirrors the bridged value into .env so
+# terminal_tool child processes see it.  These keys are excluded:
+#   terminal.cwd        — handled separately (placeholder resolution)
+#   terminal.kubernetes — .env is for SECRETS ONLY; every Kubernetes setting
+#                         must stay in config.yaml (this is the policy that
+#                         got upstream PR #37591 closed).  Nested paths like
+#                         terminal.kubernetes.namespace already return None
+#                         from terminal_config_env_var_for_key(); this guard
+#                         covers the whole-block form.
+_TERMINAL_ENV_MIRROR_EXCLUDED = frozenset({"terminal.cwd", "terminal.kubernetes"})
+
+
 def _terminal_env_value(value: Any) -> str:
+    # default=str because `terminal.kubernetes.spec` is a PodSpec an operator
+    # is explicitly invited to paste from a real manifest, and YAML parses an
+    # unquoted date/timestamp into a date object. Without it, json.dumps raises
+    # mid-export: TERMINAL_ENV is already set, TERMINAL_KUBERNETES never gets
+    # written, terminal_tool swallows the miss at DEBUG, and the backend runs
+    # on defaults while `hermes doctor` blames a namespace that IS configured.
     if isinstance(value, (list, dict)):
-        return json.dumps(value)
+        return json.dumps(value, default=str)
     return str(value)
 
 
@@ -3265,10 +3289,36 @@ def apply_terminal_config_to_env(
     # backfill-only.
     explicit_keys = terminal_cfg.keys() if config is not None else raw_terminal_cfg.keys()
 
+    # Effective backend = the value TERMINAL_ENV will actually carry, because
+    # that is what tools.terminal_tool._get_env_config() selects on. Reading
+    # terminal_cfg["backend"] instead was wrong twice over: in the merged
+    # config it ALWAYS defaults to "local" (a truthy value), which made the
+    # TERMINAL_ENV fallback dead code, so selecting the backend by environment
+    # variable silently dropped the entire terminal.kubernetes.* block and the
+    # backend ran on DEFAULT_KUBERNETES_CONFIG with nothing logged. This
+    # mirrors the same precedence the loop below applies to the backend key
+    # itself.
+    if "backend" in terminal_cfg and (
+        (should_override and "backend" in explicit_keys)
+        or "TERMINAL_ENV" not in target
+    ):
+        effective_backend = terminal_cfg.get("backend")
+    else:
+        effective_backend = target.get("TERMINAL_ENV") or terminal_cfg.get("backend")
+    effective_backend = str(effective_backend or "").strip().lower()
+
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
             continue
         value = terminal_cfg[cfg_key]
+        if cfg_key == "kubernetes":
+            # Only the kubernetes backend reads this ~1.2KB JSON blob. Exporting
+            # it unconditionally put it in the environment of every child
+            # process the agent spawns, for every backend. (This gate is a size
+            # optimisation on THIS path only — cli.py and gateway/run.py export
+            # the blob unconditionally, which is harmless; dropping it is not.)
+            if effective_backend != "kubernetes":
+                continue
         if cfg_key == "cwd":
             raw_cwd = str(value or "").strip()
             if raw_cwd in {".", "auto", "cwd"}:
@@ -4365,6 +4415,11 @@ def show_config():
     elif terminal.get('backend') == 'vercel_sandbox':
         print(f"  Vercel runtime: {terminal.get('vercel_runtime', 'node24')}")
         print(f"  Vercel auth:    {'configured' if get_env_value('VERCEL_OIDC_TOKEN') or (get_env_value('VERCEL_TOKEN') and get_env_value('VERCEL_PROJECT_ID') and get_env_value('VERCEL_TEAM_ID')) else '(not set)'}")
+    elif terminal.get('backend') == 'kubernetes':
+        k8s = terminal.get('kubernetes', {}) or {}
+        print(f"  Namespace:    {k8s.get('namespace') or '(from in-cluster ServiceAccount)'}")
+        print(f"  Object: {k8s.get('apiVersion', 'v1')}/{k8s.get('kind', 'Pod')}"
+              f"{'' if k8s.get('spec') else ' (spec NOT set — the backend will refuse to start)'}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')
         ssh_user = get_env_value('TERMINAL_SSH_USER')
@@ -4997,7 +5052,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
-    if env_var and key != "terminal.cwd":
+    if env_var and key not in _TERMINAL_ENV_MIRROR_EXCLUDED:
         save_env_value(env_var, _terminal_env_value(value))
 
     # Setting display.skin is an explicit "apply NOW" — bump the skin file's
@@ -5111,7 +5166,7 @@ def unset_config_value(key: str):
 
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     env_var = terminal_config_env_var_for_key(key)
-    if env_var and key != "terminal.cwd":
+    if env_var and key not in _TERMINAL_ENV_MIRROR_EXCLUDED:
         removed = remove_env_value(env_var) or removed
 
     if not removed:

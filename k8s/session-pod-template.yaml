@@ -1,0 +1,164 @@
+---
+# Session pod object — copy this into config.yaml under `terminal.kubernetes`
+# and edit. The config block is shaped like the manifest it creates, so this
+# file drops in as-is and `kubectl explain pod.spec` documents most of it.
+#
+# This backend has NO default pod. `spec` is required and is posted to the API
+# server verbatim: there is no base underneath it and no merge rule, so what
+# you read here is exactly what you get. That is the whole point — you can
+# predict your pod by reading one file.
+#
+# The fields below are not all equal. Most are ordinary hardening you may drop
+# or change freely; a handful are things the BACKEND depends on, and dropping
+# one of those produces a pod that is valid to Kubernetes and broken for
+# Hermes. Those are marked REQUIRED-BY-HERMES with the failure they cause.
+# "What Hermes needs from your template" in README.md is the same list in prose.
+#
+# Everything here is subject to your cluster's admission stack (SCC, Pod
+# Security Admission, ValidatingAdmissionPolicy, NetworkPolicy). Hermes does
+# not validate this template; the API server does, with fieldValidation=Strict,
+# so a typo comes back as a 400 naming the exact JSON path.
+
+# apiVersion + kind are config keys of their own, and `kind` is what selects the
+# provisioner (it replaced a `provisioner: pod` enum that named the same thing
+# twice). Copy this whole block under terminal.kubernetes in config.yaml.
+apiVersion: v1
+kind: Pod
+
+# metadata is yours too: annotations, extra labels and finalizers are posted as
+# written. Only `name` and `namespace` are always Hermes' (the name is computed
+# per process and is how it finds this pod again). ownerReferences is added
+# only if you set none, and the terminal.kubernetes.owned_selector labels are
+# added when absent.
+metadata:
+  labels:
+    # Hermes adds this one when absent. It is the cheap half of the ownership
+    # check (the ownerReference UID is the proof) and what
+    # networkpolicy.yaml and validatingadmissionpolicy.yaml select on. Set it
+    # to something else and yours wins — and those two policies stop matching
+    # your pods.
+    app.kubernetes.io/managed-by: hermes-agent
+
+spec:
+  # REQUIRED-BY-HERMES: at least one container whose `name` equals
+  # terminal.kubernetes.exec_container_name (default "workspace"). Without it
+  # every command fails with `session pod has no container 'workspace'`.
+  containers:
+    - name: workspace
+      # Any image with a shell and coreutils. This one is a plain distro base:
+      # whatever the agent needs beyond that it installs, or you bake your own.
+      image: ubuntu:26.04
+
+      # REQUIRED-BY-HERMES: the container must STAY UP so it can be exec'd into
+      # repeatedly. Without a blocking command the image entrypoint exits, and
+      # under `restartPolicy: Never` the pod reaches phase Succeeded — Hermes
+      # reports `session pod ... entered phase Succeeded` and the session never
+      # starts. Any long-running no-op works; `sleep infinity` is the cheapest.
+      command: ["sleep", "infinity"]
+
+      # REQUIRED-BY-HERMES: this IS the session's default cwd — Hermes reads
+      # it from here, which is why there is no workspace_mount_path config key
+      # to keep in sync. It is what `builtin cd -- <cwd>` resolves against on
+      # every command. Omit it and sessions start in /workspace regardless of
+      # where you mounted anything.
+      workingDir: /workspace
+
+      volumeMounts:
+        # REQUIRED-BY-HERMES: something writable at the workingDir above. An
+        # emptyDir is the stateless default; see README.md "Storage" for PVC
+        # and ephemeral.volumeClaimTemplate variants.
+        - name: workspace
+          mountPath: /workspace
+        # REQUIRED-BY-HERMES: a writable /tmp. init_session() writes its env
+        # snapshot there, so a read-only root filesystem without this mount
+        # silently breaks cwd and environment tracking between commands.
+        - name: tmp
+          mountPath: /tmp
+
+      # Ordinary hardening. Drop or relax freely — your admission stack is what
+      # actually decides. Note that runAsNonRoot with an image whose default
+      # user is root needs a UID from somewhere: OpenShift's restricted-v2 SCC
+      # assigns one (do NOT pin it there), while on vanilla Kubernetes nothing
+      # does, so set spec.securityContext.runAsUser below.
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+
+      # Set resources if the namespace has a LimitRange or ResourceQuota, or
+      # to stop one runaway build evicting its neighbours.
+      # resources:
+      #   requests: {cpu: 500m, memory: 1Gi, ephemeral-storage: 2Gi}
+      #   limits:   {cpu: "2",  memory: 4Gi, ephemeral-storage: 10Gi}
+
+  volumes:
+    - name: workspace
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+
+  # REQUIRED-BY-HERMES (effectively): `sleep` as PID 1 never reaps children, so
+  # a backgrounded command's wrapper zombifies and `kill -0` reports it alive
+  # forever — background completion is never detected. With a shared PID
+  # namespace the sandbox `pause` process is PID 1 and reaps.
+  #
+  # NOT harmless once you add a second container. A shared PID namespace is a
+  # shared /proc: the agent's shell can read another container's
+  # /proc/<pid>/environ and /proc/<pid>/root — including a Secret volume
+  # mounted ONLY into that sidecar — and can signal its processes. Verified on
+  # a live cluster, with `hermes doctor` printing a green tick throughout.
+  # If you add a mesh proxy, a token refresher, or any sidecar holding
+  # credentials, either keep them out of this pod or accept that the agent can
+  # read them.
+  shareProcessNamespace: true
+
+  # A session pod is disposable; restarting it would resurrect an empty
+  # workspace behind an agent that thinks its files are still there.
+  restartPolicy: Never
+
+  # `sleep infinity` as PID 1 ignores SIGTERM, so the default 30s grace stalls
+  # every teardown — and teardown is on the interrupt path.
+  terminationGracePeriodSeconds: 1
+
+  # The session pod holds no cluster credentials. Leave this false unless a
+  # skill genuinely needs the API, and then bind a scoped ServiceAccount
+  # rather than turning this on for the namespace default.
+  automountServiceAccountToken: false
+
+  # No serviceAccountName: the namespace `default` SA, whose token is not
+  # projected (above). rbac.yaml ships an optional `hermes-session-noperms` SA
+  # if you want one with no bindings at all — the ValidatingAdmissionPolicy in
+  # this directory REQUIRES it.
+  # serviceAccountName: hermes-session-noperms
+
+  # Service discovery env vars for every Service in the namespace, injected
+  # into a pod that has no business knowing about them.
+  enableServiceLinks: false
+
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+
+  # Leak backstop. There is no config key for this: it is PodSpec, so it lives
+  # here. Set it — a session pod whose agent died without an ownerReference has
+  # nothing else bounding it. The kubelet STOPS the pod at the deadline (phase
+  # Failed) and leaves the object in place; Hermes deletes it when it next
+  # tries to use it.
+  activeDeadlineSeconds: 14400
+
+  # Vanilla Kubernetes only. `runAsNonRoot: true` above needs a concrete UID
+  # and nothing on a vanilla cluster assigns one, so an image whose default
+  # user is root fails with CreateContainerConfigError. No fsGroup is needed:
+  # the kubelet creates emptyDir directories world-writable.
+  # On OpenShift, OMIT this — restricted-v2 assigns a UID from the namespace's
+  # range and a hardcoded value outside it is rejected at admission.
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+    # runAsUser: 1000
+
+  # OpenShift sandboxed containers (kata). Needs a node pool that offers the
+  # runtime class; see README.md "OpenShift notes".
+  # runtimeClassName: kata

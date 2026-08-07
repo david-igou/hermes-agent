@@ -1,0 +1,123 @@
+# RBAC for the Kubernetes terminal backend (terminal.backend: kubernetes).
+#
+# Grants the agent's ServiceAccount the minimum verbs needed to provision,
+# exec into, and delete session pods IN ITS OWN NAMESPACE only. Session pods
+# are stateless — there is no PVC surface.
+#
+# Replace the placeholders before applying:
+#   <AGENT_NAMESPACE>   namespace where the Hermes pod runs (e.g. "hermes-agents")
+#   <AGENT_SA>          ServiceAccount Hermes runs as (e.g. "hermes")
+#
+# The hermes-session-exec Role below grants the pod lifecycle
+# (create/get/list/delete) plus pods/exec, and nothing else.
+#
+# Pair it with k8s/networkpolicy.yaml (session pods otherwise reach every
+# Service in the cluster) and, on non-OpenShift clusters, with
+# k8s/validatingadmissionpolicy.yaml — "create pods in a namespace" is close to
+# namespace-admin without admission constraints, so the pod's SHAPE wants
+# policing too.
+---
+# OPT-IN. Hermes does NOT default to this SA — the shipped template (k8s/session-pod-template.yaml) omits
+# serviceAccountName, so a session pod gets the namespace's `default` SA and
+# works on a cluster where nothing from this directory has been applied. What
+# keeps the pod credential-free either way is automountServiceAccountToken:
+# false, which the shipped template (k8s/session-pod-template.yaml) sets on the pod itself.
+#
+# Bind this SA explicitly if you want belt and braces (a pod that names an SA
+# with no bindings at all, so a projected token could not be useful even if
+# something turned automounting back on):
+#
+#   terminal:
+#     kubernetes:
+#       spec:
+#         serviceAccountName: hermes-session-noperms
+#
+# The ValidatingAdmissionPolicy in this directory REQUIRES that setting — see
+# its header.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hermes-session-noperms
+  namespace: <AGENT_NAMESPACE>
+automountServiceAccountToken: false
+
+---
+# ── Session pod lifecycle + exec ─────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hermes-session-exec
+  namespace: <AGENT_NAMESPACE>
+rules:
+  # Lifecycle of session pods. `get` also resolves the agent's OWN pod for the
+  # ownerReference that garbage-collects session pods when the agent dies, and
+  # reads pod status for readiness diagnostics (ImagePullBackOff,
+  # CreateContainerConfigError, SCC denial) and the container list.
+  # No `list`: this backend only ever addresses pods BY NAME, and `list pods`
+  # would let a compromised agent enumerate every pod in the namespace (the
+  # Hermes pod itself, any co-tenant) — which get-by-name does not.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "delete"]
+  # Streaming exec into the session pod. `get`, and only `get`: the one exec
+  # call this backend makes is connect_get_namespaced_pod_exec, a websocket
+  # GET, which kube-apiserver authorizes as `get`. kubectl POSTs instead and
+  # so needs `create` — but this Role is bound to the AGENT's ServiceAccount,
+  # which never runs kubectl, so granting `create` here would widen the agent
+  # without enabling anything. Add it only if you also bind this Role to a
+  # human who exec's with kubectl.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hermes-session-exec
+  namespace: <AGENT_NAMESPACE>
+subjects:
+  - kind: ServiceAccount
+    name: <AGENT_SA>
+    namespace: <AGENT_NAMESPACE>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hermes-session-exec
+
+---
+# ── OpenShift only: SCC access for session pods ──────────────────────────────
+# The shipped template (k8s/session-pod-template.yaml) leaves runAsUser unset, so session pods satisfy
+# `restricted-v2`, which every authenticated SA already has via
+# system:authenticated — so you do NOT need this on OpenShift 4.21.
+#
+# You DO need it if your terminal.kubernetes.spec pins
+# spec.securityContext.runAsUser to a UID outside the namespace's
+# openshift.io/sa.scc.uid-range, or sets spec.runtimeClassName to a runtime
+# whose SCC differs. In that case create a custom SCC and bind `use` on it to
+# the SESSION SA:
+#
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: hermes-session-scc
+#   namespace: <AGENT_NAMESPACE>
+# rules:
+#   - apiGroups: ["security.openshift.io"]
+#     resources: ["securitycontextconstraints"]
+#     resourceNames: ["<YOUR_CUSTOM_SCC>"]
+#     verbs: ["use"]
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: hermes-session-scc
+#   namespace: <AGENT_NAMESPACE>
+# subjects:
+#   - kind: ServiceAccount
+#     name: hermes-session-noperms
+#     namespace: <AGENT_NAMESPACE>
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: Role
+#   name: hermes-session-scc

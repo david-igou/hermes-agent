@@ -668,12 +668,16 @@ def load_cli_config() -> Dict[str, Any]:
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
         "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
+        # Whole terminal.kubernetes.* block as one internal JSON env var.
+        "kubernetes": "TERMINAL_KUBERNETES",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal, daytona, vercel_sandbox -- ignored for local/ssh)
+        # Container resource config (docker, singularity, modal, daytona, vercel_sandbox
+        # -- ignored for local/ssh, and for kubernetes, which takes resources from
+        # terminal.kubernetes.spec instead)
         "container_cpu": "TERMINAL_CONTAINER_CPU",
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
@@ -709,7 +713,10 @@ def load_cli_config() -> Dict[str, Any]:
             if _file_has_terminal_config or env_var not in os.environ:
                 val = terminal_config[config_key]
                 if isinstance(val, (list, dict)):
-                    os.environ[env_var] = json.dumps(val)
+                    # default=str: see _terminal_env_value in hermes_cli/config.py
+                    # — a YAML-native date anywhere in the pod spec would
+                    # otherwise abort this loop and half-bridge the config.
+                    os.environ[env_var] = json.dumps(val, default=str)
                 else:
                     os.environ[env_var] = str(val)
     

@@ -326,8 +326,108 @@ terminal:
 #   daytona_image: "nikolaik/python-nodejs:python3.11-nodejs20"
 #   container_disk: 10240          # Daytona max is 10GB per sandbox
 
+# -----------------------------------------------------------------------------
+# OPTION 7: Kubernetes session pods
+# Each session runs in its own STATELESS pod in a Kubernetes / OpenShift
+# cluster; the workspace (an emptyDir) dies with the pod.
+# Great for: running Hermes in-cluster, kata / sandboxed-containers runtimes
+# Requires: pip install 'hermes-agent[kubernetes]' (NOT lazy-installed) and the
+#           RBAC in k8s/rbac.yaml. See k8s/README.md for the deployment
+#           manifests.
 #
-# --- Container resource limits (docker, singularity, modal, daytona -- ignored for local/ssh) ---
+# Every setting lives HERE, in config.yaml — there are no TERMINAL_KUBERNETES_*
+# environment variables. The block is SHAPED LIKE THE MANIFEST it creates:
+# apiVersion / kind / metadata / spec mean what they mean in any manifest, so
+# k8s/session-pod-template.yaml drops in as-is. Validation is the
+# cluster's job: every create passes fieldValidation=Strict, and what a pod may
+# BE is decided by SCC / Pod Security Admission / admission policy /
+# NetworkPolicy.
+#
+# NOTE: container_cpu / container_memory / container_disk / container_persistent
+# below are NOT read by this backend — resources belong in `spec`, like every
+# other pod field.
+#
+# terminal:
+#   backend: "kubernetes"
+#   cwd: "/workspace"              # optional; overrides the exec container's workingDir
+#   timeout: 180
+#   lifetime_seconds: 14400        # IDLE REAPER: the pod is destroyed after
+#                                  # this much tool inactivity, and this
+#                                  # backend has NO persist exemption. At the
+#                                  # shared default (300) an idle user loses
+#                                  # the workspace every five minutes.
+#   kubernetes:
+#     namespace: ""                # "" -> the in-cluster ServiceAccount namespace
+#     kubeconfig: ""               # out-of-cluster dev only (a PATH, not a secret)
+#     context: ""
+#     apiVersion: "v1"             # `kind` selects the provisioner: writing
+#     kind: "Pod"                  # `kind: Pod` already says which one, so
+#                                  # there is no separate provisioner key.
+#     metadata: {}                 # labels/annotations for created objects.
+#                                  # `name` and `namespace` are Hermes'.
+#     owned_selector:              # what marks an object as this backend's:
+#       app.kubernetes.io/managed-by: "hermes-agent"
+#                                  # stamped in when absent, matched before a
+#                                  # 409 is treated as "resume".
+#     exec_container_name: "workspace"  # WHICH container in `spec` to exec
+#                                  # into. A pointer; it does not create one.
+#     spec: {}                     # REQUIRED. The WHOLE PodSpec, posted
+#                                  # verbatim, with no default base underneath
+#                                  # and no merge. Leave it empty and the
+#                                  # backend refuses to start.
+#                                  # `hermes setup` writes a working one; the
+#                                  # annotated copy is k8s/session-pod-template.yaml.
+#                                  # Referencing a Secret from the session
+#                                  # container is DENIED by the shipped
+#                                  # validatingadmissionpolicy.yaml.
+#     ready_timeout_seconds: 120       # raise for slow pulls / kata cold starts
+#     owner_reference: "auto"          # auto | off
+#     # No active_deadline_seconds key: that is spec.activeDeadlineSeconds and
+#     # belongs in `spec` with every other PodSpec field.
+#
+# OpenShift + kata. Note this is the COMPLETE pod — nothing is filled in for
+# you, and every field below earns its place (see k8s/session-pod-template.yaml
+# for which ones Hermes depends on and what breaks without them):
+# terminal:
+#   backend: "kubernetes"
+#   lifetime_seconds: 14400
+#   kubernetes:
+#     namespace: "hermes-agents"
+#     ready_timeout_seconds: 300       # kata cold starts are slow
+#     apiVersion: "v1"
+#     kind: "Pod"
+#     spec:
+#       runtimeClassName: "kata"
+#       containers:
+#         - name: "workspace"              # == exec_container_name
+#           image: "ubuntu:26.04"
+#           command: ["sleep", "infinity"] # must stay up
+#           workingDir: "/workspace"       # THIS is the session cwd
+#           volumeMounts:
+#             - {name: "workspace", mountPath: "/workspace"}
+#             - {name: "tmp", mountPath: "/tmp"}
+#           resources:
+#             requests: {cpu: "500m", memory: "2Gi"}
+#             limits: {cpu: "2", memory: "4Gi", ephemeral-storage: "8Gi"}
+#           securityContext:
+#             runAsNonRoot: true
+#             allowPrivilegeEscalation: false
+#             capabilities: {drop: ["ALL"]}
+#       volumes:
+#         - {name: "workspace", emptyDir: {}}
+#         - {name: "tmp", emptyDir: {}}
+#       restartPolicy: "Never"
+#       shareProcessNamespace: true        # background completion detection
+#       terminationGracePeriodSeconds: 1
+#       automountServiceAccountToken: false
+#       enableServiceLinks: false
+#       activeDeadlineSeconds: 14400
+#       securityContext:                   # no runAsUser: restricted-v2
+#         runAsNonRoot: true               # assigns one on OpenShift
+#         seccompProfile: {type: "RuntimeDefault"}
+
+#
+# --- Container resource limits (docker, singularity, modal, daytona -- ignored for local/ssh/kubernetes) ---
 # These settings apply to all container backends. They control the resources
 # allocated to the sandbox and whether its filesystem persists across sessions.
   container_cpu: 1              # CPU cores

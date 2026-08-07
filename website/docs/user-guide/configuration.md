@@ -116,11 +116,11 @@ Before that stash step, Hermes also restores tracked `package-lock.json` diffs l
 
 ## Terminal Backend Configuration
 
-Hermes supports seven terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, a Vercel Sandbox, or a Singularity/Apptainer container.
+Hermes supports eight terminal backends. Each determines where the agent's shell commands actually execute — your local machine, a Docker container, a remote server via SSH, a Modal cloud sandbox (direct or via the Nous-managed gateway), a Daytona workspace, a Vercel Sandbox, a Singularity/Apptainer container, or a session pod in a Kubernetes cluster.
 
 ```yaml
 terminal:
-  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | singularity
+  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | singularity | kubernetes
   cwd: "."          # Gateway/cron working directory (CLI always uses launch dir)
   font_family: ""   # Desktop terminal font; e.g. "MesloLGS NF"
   timeout: 180      # Per-command timeout in seconds
@@ -146,6 +146,7 @@ For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persi
 | **daytona** | Daytona workspace | Full (cloud container) | Managed cloud dev environments |
 | **vercel_sandbox** | Vercel Sandbox | Full (cloud microVM) | Cloud execution with snapshot-backed filesystem persistence |
 | **singularity** | Singularity/Apptainer container | Namespaces (--containall) | HPC clusters, shared machines |
+| **kubernetes** | Per-session pod in your cluster | Full (pod, no-perms SA, optional kata runtime) | Running Hermes in-cluster with cluster-managed quotas |
 
 ### Local Backend
 
@@ -424,6 +425,93 @@ OIDC tokens are short-lived and should not be used as the documented deployment 
 **Background commands:** `terminal(background=true)` uses Hermes' generic non-local background process flow. You can spawn, poll, wait, view logs, and kill processes through the normal process tool while the sandbox is alive. Hermes does not provide native Vercel detached-process recovery after cleanup or restart.
 
 **Disk sizing:** Vercel Sandbox does not currently support Hermes' `container_disk` resource knob. Leave `container_disk` unset or at the shared default `51200`; non-default values fail diagnostics and backend creation instead of being silently ignored.
+
+### Kubernetes Backend
+
+Runs agent shell commands in a **stateless session pod** in a Kubernetes cluster instead of inside the Hermes container; the workspace (an emptyDir) dies with the pod. Built for running Hermes itself in-cluster.
+
+**One pod per Hermes process, not per conversation.** `_resolve_container_task_id` deliberately collapses nearly every caller to a single shared environment, so a browser session, scheduled cron jobs, and every chat-platform user served by one gateway all execute in the *same* session pod, sharing one `/workspace`, one shell environment, and one set of installed packages (cwd is the exception — each session keeps its own) — this is the same behaviour as the docker backend, not something specific to Kubernetes. Subagents share the parent's pod by design. A pod per task is created only when an RL/benchmark harness registers an isolation override (`register_task_env_overrides`). See **Session scope** below before exposing a gateway to more than one person.
+
+**Every setting is a `config.yaml` key under `terminal.kubernetes.*`. There are no `TERMINAL_KUBERNETES_*` environment variables**, and none should be added — `.env` is for secrets, and this backend has no credential of its own: in-cluster authentication is the projected ServiceAccount token the kubelet mounts into the Hermes pod.
+
+```yaml
+terminal:
+  backend: kubernetes
+  cwd: /workspace                  # optional; overrides the template's workingDir
+  kubernetes:
+    provisioner: pod               # the only value today (see below)
+    namespace: ""                  # "" -> the in-cluster ServiceAccount namespace
+    exec_container_name: workspace      # the container Hermes execs into
+    ready_timeout_seconds: 120
+    apiVersion: v1                 # kind selects the provisioner
+    kind: Pod
+    metadata:
+      labels:                      # owned_selector labels are added if absent
+        app.kubernetes.io/managed-by: hermes-agent
+    spec:                          # REQUIRED — posted verbatim
+        containers:
+          - name: workspace        # must match exec_container_name above
+            image: ubuntu:26.04
+            command: ["sleep", "infinity"]   # must stay up to be exec'd into
+            workingDir: /workspace           # THIS is the session's cwd
+            volumeMounts:
+              - {name: workspace, mountPath: /workspace}
+              - {name: tmp, mountPath: /tmp} # init_session() writes here
+            resources:
+              requests: {cpu: "500m", memory: "2Gi"}
+              limits:   {cpu: "2",    memory: "4Gi"}
+        volumes:
+          - {name: workspace, emptyDir: {}}
+          - {name: tmp, emptyDir: {}}
+        restartPolicy: Never
+        shareProcessNamespace: true          # background completion detection
+        terminationGracePeriodSeconds: 1
+        activeDeadlineSeconds: 14400         # your leak backstop, not a config key
+```
+
+The above is trimmed; `k8s/session-pod-template.yaml` is the full annotated version and `hermes setup` writes a copy into your `config.yaml`.
+
+**The block is shaped like the object it creates.** `apiVersion`, `kind`, `metadata` and `spec` mean exactly what they mean in any manifest, so a pod you already have is a copy-paste away from being your session pod and `kubectl explain` documents most of this schema. Connection and backend-behaviour keys sit alongside them. The shared `container_cpu` / `container_memory` / `container_disk` / `container_persistent` keys are **not** read by this backend. `cli-config.yaml.example` (OPTION 7) documents the full key set.
+
+**`spec` is required.** It is posted to the API server verbatim: there is no default base underneath it and no merge, so the pod you get is the pod you can read in your own `config.yaml`. Omit it and the backend refuses to start with a pointer to `k8s/session-pod-template.yaml` rather than inventing a pod for you.
+
+**`kind` selects the provisioner.** There was a `provisioner: pod` key; it named the same thing twice, since an operator writing `kind: Pod` has already said which provisioner they want. Dispatch is on `(apiVersion, kind)`, so a second kind — a sandbox CRD, say — needs a dispatch entry and no new config key. An unsupported pair fails in-process naming what *is* supported, because nothing downstream could tell you which kinds your build implements.
+
+**`owned_selector` is what marks an object as this backend's.** It is stamped into `metadata.labels` when absent and matched before a 409 is treated as "resume". It was a hardcoded constant, which meant an operator relabelling their pods for chargeback fell out of the ownership check against their own objects. The ownerReference UID remains the actual proof; this is the cheap filter, and it is what `k8s/networkpolicy.yaml` selects on.
+
+An earlier revision did merge a `PodTemplateSpec` over a hidden default base using RFC 7386 with a containers-by-name exception. The rule was sound, and it still meant that predicting your own pod required knowing a base you could not see and simulating a merge in your head — with the sharpest edge being that adding a sidecar under plain RFC 7386 would have *deleted* the workspace container. Requiring the full spec costs more typing once and removes the whole class of surprise.
+
+**`metadata` is yours as well, with two exceptions.** Annotations, labels, finalizers and anything else you write under `metadata` are posted as written. Only `name` and `namespace` are always Hermes' — the name is computed per process and is how it finds the pod again, so a template-supplied one would be lost. `ownerReferences` and the `app.kubernetes.io/managed-by` / instance labels are **added only when you set none**: name an owner or a label of your own and it is kept, at the cost (for the label) of falling out of the shipped NetworkPolicy and ValidatingAdmissionPolicy, which select on `managed-by`.
+
+**What Hermes needs from your template** is short, and each item fails a specific way if you omit it: a container named `exec_container_name` (else `session pod has no container 'workspace'` on every command); a command that keeps it running such as `sleep infinity` (else the pod reaches phase `Succeeded` and never becomes Ready); a writable volume mounted at the exec container's `workingDir`, which is also where Hermes reads the session's cwd from (else `builtin cd` fails on every command); a writable `/tmp` (else `init_session()` cannot snapshot the environment between commands); and `shareProcessNamespace: true` (else `sleep` as PID 1 never reaps, and background commands are never detected as finished). `activeDeadlineSeconds` is not required but is your only backstop against a leaked pod whose agent died. `k8s/README.md` explains each in full.
+
+**`provisioner` has one legal value, on purpose.** `pod` is the only implementation today. The key ships anyway because it is a seam: adding a provisioner later is a non-breaking addition to the enum, whereas introducing the key later would force a config migration on everyone already running the backend.
+
+**Validation is the cluster's job.** Hermes performs no in-process config validation beyond the `provisioner` enum, which is checked in-process only because that key never reaches the API server; what a session pod may be is decided by SCC, Pod Security Admission, `ValidatingAdmissionPolicy`, NetworkPolicy and RBAC, which the cluster administrator owns, and malformed config is rejected by the API server with the exact JSON path named.
+
+**Strict field validation:** every create this backend issues passes `fieldValidation=Strict`. Without it, an unknown field such as `securityContext.runAsNonroot` is accepted with HTTP 201 and silently dropped, and the Python client discards the API server's `Warning: 299 - unknown field` header, so nothing is logged. `hermes doctor` additionally submits your rendered pod as a `dry_run=All` create, so a typo is named by the API server there rather than at the first session.
+
+**Required install:**
+
+```bash
+pip install 'hermes-agent[kubernetes]'
+```
+
+There is no lazy install for this backend: the terminal tool stays disabled until the client is importable.
+
+**Required RBAC:** apply `k8s/rbac.yaml`, then run `hermes doctor` — it issues `SelfSubjectAccessReview` checks for create/get/delete `pods` and both get and create on `pods/exec`, and dry-runs the pod it would submit. See [`k8s/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/k8s/README.md) for the network policy and admission-policy manifests.
+
+**Authentication:** in-cluster ServiceAccount first, then `terminal.kubernetes.kubeconfig`, then the ambient `KUBECONFIG` / `~/.kube/config` for out-of-cluster development.
+
+**Approval guards:** the dangerous-command prompts are skipped, exactly as for docker, singularity, modal, daytona and vercel_sandbox — commands run in a session pod, not on the host. What a session pod may actually do is decided by SCC, Pod Security Admission, your `ValidatingAdmissionPolicy` and your NetworkPolicy, none of which Hermes can see or attempts to grade.
+
+**Credential files:** the session pod is an execution boundary, not a secrets boundary — registered credential files and skills are synced into it on session start (as with the Modal/Daytona backends). The sync streams over the exec stdin channel, never through exec argv, because exec request URLs land in the API-server audit log.
+
+**Session scope:** a session pod is scoped to the Hermes **process**, not to a conversation. Verified on a live cluster: a browser session, a cron job, and two chat-platform users served by one gateway all executed in the same pod — one user read a file another had just written, and the synced credential files were readable from every session. This is inherited behaviour shared with the docker backend. A separate pod appears only for a separate Hermes process, or when an RL/benchmark harness registers an isolation override. **Do not rely on the session pod as a per-user boundary** — run a process per trust domain, or keep the gateway single-tenant.
+
+**Storage:** there is deliberately no persistence *config key* — storage is plain `PodSpec` and belongs in `spec`, like everything else about the pod. The shipped starter template uses an `emptyDir` that dies with the pod. Use `ephemeral.volumeClaimTemplate` for a dynamically provisioned per-session volume (also the way to bound its size), or `persistentVolumeClaim` to mount a claim you pre-provisioned; see [`k8s/README.md`](https://github.com/NousResearch/hermes-agent/blob/main/k8s/README.md) for both, including the sharing caveats. In the default shape there is nothing to reap; a dead pod is deleted and re-provisioned empty on the next command, the skills/credential sync re-runs automatically, and the first tool result after the reset tells the model so. **The shared idle reaper applies with no persist exemption**: after `terminal.lifetime_seconds` (default 300) of tool-call inactivity the pod is destroyed — raise it (e.g. to match your template's `activeDeadlineSeconds`) for session-length workspaces. The sync into the pod is one-way by design: the synced set (credentials, skills, caches) is host-authored, and nothing is pulled back at teardown.
+
+**OpenShift:** leave `spec.securityContext.runAsUser` unset so the `restricted-v2` SCC assigns a UID from the namespace range — a hard-coded value outside that range is rejected at admission. Set container `resources.limits` when the namespace has a `ResourceQuota` covering `limits.*`.
 
 ### Singularity/Apptainer Backend
 

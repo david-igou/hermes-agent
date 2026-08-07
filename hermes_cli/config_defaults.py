@@ -354,6 +354,68 @@ DEFAULT_CONFIG = {
         # When on, SETUID/SETGID caps are omitted from the container since
         # no privilege drop is needed.
         "docker_run_as_host_user": False,
+        # ── Kubernetes session-pod backend (terminal.backend: kubernetes) ──
+        # EVERY setting for this backend lives here, in config.yaml.  There are
+        # no TERMINAL_KUBERNETES_* env vars: the terminal config bridge
+        # serialises this whole mapping into ONE internal env var
+        # (TERMINAL_KUBERNETES) that only tools/terminal_tool.py reads.  .env is
+        # for secrets, and this backend has no credential surface — in-cluster
+        # auth is the ServiceAccount token the kubelet projects into the pod.
+        #
+        # The schema models only what the BACKEND reasons about; everything
+        # that is merely PodSpec goes in `spec`, which is REQUIRED and is
+        # posted verbatim: no default base, no merge. Validating and
+        # constraining the pod is the cluster's job (fieldValidation=Strict,
+        # SCC / PSA / admission policy).
+        #
+        # `spec`, `metadata` and `owned_selector` are free-form YAML, so they
+        # are not `hermes config set` surface (a PodSpec is not a
+        # dotted-scalar field); edit config.yaml directly. See
+        # cli-config.yaml.example OPTION 7.
+        #
+        # Mirror of tools/environments/kubernetes.py:DEFAULT_KUBERNETES_CONFIG.
+        # A literal is required here so `hermes config set` key validation, the
+        # desktop settings schema, and `hermes config show` can walk it; the two
+        # are pinned together by tests/tools/test_kubernetes_config_schema.py.
+        "kubernetes": {
+            # "" -> the projected ServiceAccount namespace file (in-cluster).
+            # Deliberately not env-var resolvable.
+            "namespace": "",
+            # Out-of-cluster dev only. A PATH to a kubeconfig, not a credential
+            # (same class as terminal.ssh_key). "" -> in-cluster SA, then the
+            # ambient KUBECONFIG / ~/.kube/config.
+            "kubeconfig": "",
+            "context": "",
+            # The object, written as a manifest: apiVersion/kind/metadata/spec
+            # mean what they mean in any manifest. `kind` also selects the
+            # provisioner (it replaced a `provisioner: pod` enum that named the
+            # same thing twice) — see PROVISIONERS_BY_KIND.
+            "apiVersion": "v1",
+            "kind": "Pod",
+            # Labels/annotations for the objects Hermes creates. `name` and
+            # `namespace` are computed per pod and are NOT yours.
+            "metadata": {},
+            # WHICH container in `spec` to exec into. A pointer; it does not
+            # create one.
+            "exec_container_name": "workspace",
+            # What marks an object as this backend's: stamped into
+            # metadata.labels when absent, and matched before a 409 is treated
+            # as "resume". Configurable so a relabelled deployment still
+            # recognises its own pods.
+            # Empty = app.kubernetes.io/managed-by: hermes-agent. Kept empty
+            # so the web settings schema does not flatten a label key
+            # containing "/" into a dotted path the dashboard then corrupts.
+            "owned_selector": {},
+            # REQUIRED. The whole PodSpec, posted verbatim: no merge rule to
+            # reason about and no invisible base supplying fields you did not
+            # write. Empty = unset, which is a startup error pointing at
+            # k8s/session-pod-template.yaml.
+            "spec": {},
+            # No active_deadline_seconds: that is spec.activeDeadlineSeconds
+            # and belongs in `spec` with every other PodSpec field.
+            "ready_timeout_seconds": 120,
+            "owner_reference": "auto",      # auto | off
+        },
         # Persistent shell — keep a long-lived bash shell across execute() calls
         # so cwd/env vars/shell variables survive between commands.
         # Enabled by default for non-local backends (SSH); local is always opt-in

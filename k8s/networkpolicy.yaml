@@ -1,0 +1,112 @@
+# Egress lockdown for Hermes session pods.
+#
+# The RBAC and pod-shape hardening in this directory address the FILESYSTEM and
+# ServiceAccount-token attack surface. They say nothing about the network: by
+# default an agent-controlled shell in a session pod can reach the Kubernetes
+# API endpoint, every ClusterIP Service in the cluster, and any internal admin
+# UI on the pod network.
+#
+# This policy is the network half. It selects session pods by
+# `app.kubernetes.io/managed-by: hermes-agent` — the DEFAULT value of
+# `terminal.kubernetes.owned_selector`.
+#
+# THAT LABEL IS CONFIGURATION, NOT A GUARANTEE. An operator who sets
+# `owned_selector` (or `metadata.labels`) to their own platform convention
+# gets pods this policy does not select, and they then have unrestricted pod
+# -network egress with nothing logging it. An earlier revision of this file
+# If you rebrand the label, change the two podSelectors below to match.
+#
+# (A fully compromised agent talking to the API server directly with its own
+# credentials is still not bound by any of this; the containment boundary
+# there is the RBAC grant, not this label.)
+#
+# Replace <AGENT_NAMESPACE>. Requires a NetworkPolicy-capable CNI (OVN-Kubernetes
+# on OpenShift qualifies).
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hermes-session-default-deny
+  namespace: <AGENT_NAMESPACE>
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: hermes-agent
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    # DNS only. Everything else is denied by the empty-ish egress list above.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        # 5353 as well, and it is NOT optional on OpenShift. OVN-Kubernetes
+        # applies egress ACLs AFTER service DNAT: a query to the DNS service
+        # on :53 is rewritten to the CoreDNS pod on :5353 before the policy is
+        # evaluated, so a rule naming only 53 never matches and every lookup
+        # from a session pod times out. The symptom is not "DNS is slow" — it
+        # is a session that resolves nothing while raw-IP egress works fine,
+        # which is a confusing thing to debug from inside an agent.
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353
+
+---
+# OPTIONAL: most agents need the public internet (pip, npm, git). Apply this
+# alongside the default-deny to allow egress to everything EXCEPT RFC1918 and
+# link-local space, leaving normal package installs working.
+#
+# NOTE: the except-list below deliberately covers RFC1918, which on most
+# clusters CONTAINS THE SERVICE CIDR — so this policy does not grant DNS, and
+# it must be applied alongside the DNS rule above rather than instead of it.
+# Applying only this one yields a session that can reach raw IPs but cannot
+# resolve a single name.
+#
+# COMPLETE THE except-LIST FOR YOUR CLUSTER. The ranges below only cover a
+# private-address topology. On a cluster whose nodes, API server endpoint or
+# service network sit on PUBLICLY ROUTABLE addresses (managed cloud clusters
+# with public node IPs and a public apiserver endpoint are the common case),
+# none of those are excluded and a session pod can reach the control plane and
+# the nodes. Add your pod, service, node and apiserver CIDRs:
+#
+#   # OpenShift
+#   oc get network.config/cluster -o jsonpath='{.status.clusterNetwork[*].cidr}{"\n"}{.status.serviceNetwork[*]}{"\n"}'
+#   oc get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}{"\n"}'
+#   oc whoami --show-server
+#   # vanilla Kubernetes
+#   kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}{"\n"}'
+#
+# Stronger alternative: deny those ranges with a higher-priority
+# AdminNetworkPolicy (Kubernetes >= 1.30 / OpenShift 4.15+) rather than relying
+# on an except-list the operator has to complete correctly.
+#
+# Delete this document if the session pods should be fully air-gapped.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hermes-session-allow-internet
+  namespace: <AGENT_NAMESPACE>
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: hermes-agent
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16   # link-local / cloud instance metadata
+              - 100.64.0.0/10    # carrier-grade NAT, used by some CNIs

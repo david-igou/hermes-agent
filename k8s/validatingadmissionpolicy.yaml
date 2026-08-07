@@ -1,0 +1,175 @@
+# ValidatingAdmissionPolicy constraining the shape of Hermes session pods.
+#
+# READ THIS BEFORE APPLYING ON OPENSHIFT.
+#
+# OpenShift's `restricted-v2` SCC already enforces a SUPERSET of the pod-shape
+# rules the upstream sample checked: no host namespaces, allowPrivilegeEscalation
+# false, drop ALL, no hostPath, no hostPort, a UID from the namespace range, and
+# seccompProfile RuntimeDefault. On OpenShift 4.21 this policy therefore adds
+# almost nothing for those rules — and a CLUSTER-WIDE binding with
+# failurePolicy: Fail puts a new hard dependency in the admission path of every
+# pod creation in the cluster, including openshift-* control-plane pods.
+#
+# So this version:
+#   * keeps only the rules SCC does NOT give you (ServiceAccount allowlist,
+#     no Secret/projected volumes, no secret-backed env, token unmounted),
+#   * scopes the binding with a namespaceSelector instead of matchResources: {},
+#   * is OPTIONAL on OpenShift and RECOMMENDED on vanilla Kubernetes.
+#
+# Requires Kubernetes >= 1.30 (ValidatingAdmissionPolicy GA) and cluster-admin
+# to create. Label your Hermes namespace first:
+#   kubectl label namespace <AGENT_NAMESPACE> hermes-agent/session-pods=enforce
+#
+# Honest limitation: enforcement hooks on a label the CREATOR chooses, so a
+# fully compromised agent could omit `app.kubernetes.io/managed-by` to dodge the
+# policy. The real containment boundary is the RBAC grant (k8s/rbac.yaml) plus,
+# on OpenShift, SCC. Treat this as defense in depth, not as the thing that makes
+# `pods/create` safe.
+#
+# COUPLED TO config.yaml — keep these in sync or every session pod is DENIED:
+#   * `variables.sa == 'hermes-session-noperms'` requires a config.yaml that
+#     NAMES that SA. Hermes does not default to it — the shipped template (k8s/session-pod-template.yaml) omits
+#     serviceAccountName so a pod gets the namespace `default` SA — so
+#     applying this policy without also setting
+#     `spec.serviceAccountName: hermes-session-noperms` DENIES
+#     every session pod. That is the intended direction: this policy is the
+#     control, not Hermes.
+#   * `automountServiceAccountToken == false` and `runAsNonRoot: true` are also
+#     only DEFAULTS in the shipped template; your `spec` may relax either, and
+#     this policy is what then denies the pod.
+#
+# On the matchCondition label, precisely: `app.kubernetes.io/managed-by` is
+# the DEFAULT value of `terminal.kubernetes.owned_selector`, and it IS
+# configuration. An operator who rebrands it gets session pods this policy
+# skips entirely — matchCondition false means none of the rules below run, so
+# the SA pin, the secret-volume and secret-envFrom denials and the
+# hostNetwork/runAsNonRoot rules all silently do not apply. If you change
+# `owned_selector`, change the matchCondition to match.
+#
+# It is NOT strip-proof in any case: a compromised agent talking to the API
+# server directly is not bound by any of this (see the Honest limitation
+# above). Earlier revisions of this file claimed the matchCondition "cannot be
+# configured away" — that claim was false and is retracted.
+#
+# CONSEQUENCE OF THE SECRET RULES BELOW: they deny secret-backed ENV as well as
+# secret volumes, so a `spec` block that injects provider API
+# keys into the session container (envFrom.secretRef / valueFrom.secretKeyRef)
+# is DENIED wherever this policy is bound. That is deliberate — the session pod
+# is credential-free by design — but it means "reference the Secret by name"
+# is not a way around it. If a session pod genuinely needs a key, drop the
+# corresponding validation here and accept that the pod can then name any Secret
+# in the namespace.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: hermes-session-pod-security
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: created-by-serviceaccount
+      expression: "request.userInfo.username.startsWith('system:serviceaccount:')"
+    - name: is-hermes-session-pod
+      expression: >-
+        has(object.metadata.labels) &&
+        'app.kubernetes.io/managed-by' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/managed-by'] == 'hermes-agent'
+  variables:
+    - name: sa
+      expression: >-
+        has(object.spec.serviceAccountName) ? object.spec.serviceAccountName : 'default'
+  validations:
+    # --- rules SCC does NOT cover -------------------------------------------
+    # Without this, "create pods" lets the agent name ANY ServiceAccount in the
+    # namespace and inherit its permissions. The upstream sample only excluded
+    # `default`, which is not the interesting case.
+    - expression: "variables.sa == 'hermes-session-noperms'"
+      message: "session pods must run as the hermes-session-noperms ServiceAccount (set spec.serviceAccountName in config.yaml — Hermes does not default to it)"
+    - expression: >-
+        has(object.spec.automountServiceAccountToken) &&
+        object.spec.automountServiceAccountToken == false
+      message: "session pods must set automountServiceAccountToken: false"
+    # A pod that can mount Secrets can exfiltrate every credential in the
+    # namespace; a projected volume can re-mount a ServiceAccount token.
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v, !has(v.secret) && !has(v.projected))
+      message: "session pods must not mount secret or projected volumes"
+    # Same exfiltration surface as a secret volume, through a different door:
+    # envFrom.secretRef / valueFrom.secretKeyRef also let the pod name any
+    # Secret in the namespace. Covering only volumes left the documented
+    # "reference the Secret by name" pattern wide open.
+    - expression: >-
+        (object.spec.containers +
+         (has(object.spec.initContainers) ? object.spec.initContainers : [])).all(c,
+          !has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef)))
+      message: "session pods must not pull Secrets in through envFrom.secretRef"
+    - expression: >-
+        (object.spec.containers +
+         (has(object.spec.initContainers) ? object.spec.initContainers : [])).all(c,
+          !has(c.env) || c.env.all(e,
+            !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef)))
+      message: "session pods must not read Secrets through env valueFrom.secretKeyRef"
+    # --- rules SCC also covers (kept for vanilla Kubernetes) -----------------
+    - expression: "!has(object.spec.hostNetwork) || object.spec.hostNetwork == false"
+      message: "hostNetwork is not allowed for session pods"
+    - expression: "!has(object.spec.hostPID) || object.spec.hostPID == false"
+      message: "hostPID is not allowed for session pods"
+    - expression: "!has(object.spec.hostIPC) || object.spec.hostIPC == false"
+      message: "hostIPC is not allowed for session pods"
+    # initContainers are included: one added through
+    # terminal.kubernetes.spec otherwise bypassed every
+    # container-level floor below while still satisfying the policy.
+    - expression: >-
+        (object.spec.containers +
+         (has(object.spec.initContainers) ? object.spec.initContainers : [])).all(c,
+          has(c.securityContext) &&
+          has(c.securityContext.allowPrivilegeEscalation) &&
+          c.securityContext.allowPrivilegeEscalation == false)
+      message: "every container must set allowPrivilegeEscalation=false"
+    - expression: >-
+        (object.spec.containers +
+         (has(object.spec.initContainers) ? object.spec.initContainers : [])).all(c,
+          has(c.securityContext) &&
+          has(c.securityContext.capabilities) &&
+          has(c.securityContext.capabilities.drop) &&
+          c.securityContext.capabilities.drop.exists(d, d == 'ALL'))
+      message: "every container must drop ALL capabilities"
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v, !has(v.hostPath))
+      message: "hostPath volumes are not allowed for session pods"
+    # The backend sets runAsNonRoot at pod AND container level; keep a
+    # regression floor on it. runAsUser is deliberately NOT constrained — on
+    # OpenShift the SCC injects it from the namespace range.
+    - expression: >-
+        (has(object.spec.securityContext) &&
+         has(object.spec.securityContext.runAsNonRoot) &&
+         object.spec.securityContext.runAsNonRoot == true) ||
+        (object.spec.containers +
+         (has(object.spec.initContainers) ? object.spec.initContainers : [])).all(c,
+          has(c.securityContext) &&
+          has(c.securityContext.runAsNonRoot) &&
+          c.securityContext.runAsNonRoot == true)
+      message: "session pods must set runAsNonRoot: true"
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: hermes-session-pod-security
+spec:
+  policyName: hermes-session-pod-security
+  validationActions: ["Deny"]
+  matchResources:
+    # Scoped, NOT cluster-wide: a failurePolicy: Fail policy bound to every
+    # namespace makes this webhook-free policy a dependency of all pod creation.
+    namespaceSelector:
+      matchLabels:
+        hermes-agent/session-pods: enforce

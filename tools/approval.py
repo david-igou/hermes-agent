@@ -358,9 +358,9 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 #
 # Hardline only applies to environments that can actually damage the host
 # (local, ssh, container-host cron).  Containerized backends (docker,
-# singularity, modal, daytona) already bypass the dangerous-command layer
-# because nothing they do can touch the host, so we leave that behavior
-# alone.
+# singularity, modal, daytona, kubernetes) already bypass the
+# dangerous-command layer because nothing they do can touch the host, so we
+# leave that behavior alone.
 #
 # The list is deliberately tiny — only things with no recovery path:
 # filesystem destruction rooted at /, raw block device overwrites, kernel
@@ -3242,7 +3242,8 @@ def _should_skip_container_guards(env_type: str, has_host_access: bool = False) 
     """
     if env_type == "docker":
         return not has_host_access
-    return env_type in ("singularity", "modal", "daytona", "vercel_sandbox")
+    return env_type in ("singularity", "modal", "daytona", "vercel_sandbox",
+                        "kubernetes")
 
 
 def check_dangerous_command(command: str, env_type: str,
