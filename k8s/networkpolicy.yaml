@@ -7,14 +7,23 @@
 # UI on the pod network.
 #
 # This policy is the network half. It selects session pods by
-# `app.kubernetes.io/managed-by: hermes-agent`, which the backend STAMPS onto
-# the rendered pod template AFTER the user's `terminal.kubernetes.pod_template`
-# is merged over the base — so a config that sets, changes or null-deletes the
-# key does not win, and the same rendered template is what the sandbox
-# provisioner assigns to `Sandbox.spec.podTemplate`. (A fully compromised agent
-# talking to the API server directly with its own credentials is still not
-# bound by any of this; the containment boundary there is the RBAC grant, not
-# this label.)
+# `app.kubernetes.io/managed-by: hermes-agent`. Where that label comes from
+# differs per provisioner, and it matters:
+#
+#   provisioner: pod      — the backend STAMPS it onto the rendered pod
+#                           template AFTER the user's pod_template is merged
+#                           over the base, so a config that sets, changes or
+#                           null-deletes the key does not win.
+#   provisioner: sandbox  — Hermes authors no pod metadata at all (the claim
+#                           controller's label allowlist forbids it), so the
+#                           label MUST be present in your SandboxTemplate's
+#                           podTemplate.metadata (the README sample carries
+#                           it) or session pods silently fall outside this
+#                           policy.
+#
+# (A fully compromised agent talking to the API server directly with its own
+# credentials is still not bound by any of this; the containment boundary
+# there is the RBAC grant, not this label.)
 #
 # Replace <AGENT_NAMESPACE>. Requires a NetworkPolicy-capable CNI (OVN-Kubernetes
 # on OpenShift qualifies).

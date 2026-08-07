@@ -106,6 +106,13 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get"]
+  # Read-only, for `hermes doctor`'s pre-flight only (verify the configured
+  # SandboxWarmPool exists and reports ready capacity). Never used at
+  # runtime, and write access stays admin-only — the pool and its template
+  # are the enforcement point on this path.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxwarmpools"]
+    verbs: ["get"]
   # Resolve the bound pod by name (readiness, container list, the
   # ownerReference proof that it belongs to our Sandbox).
   - apiGroups: [""]

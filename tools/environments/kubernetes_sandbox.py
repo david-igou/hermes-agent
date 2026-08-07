@@ -75,6 +75,14 @@ POD_NAME_ANNOTATION = "agents.x-k8s.io/pod-name"
 
 _READY_CONDITION = "Ready"
 _CLAIM_EXPIRED_REASON = "ClaimExpired"
+#: Ready-condition reasons that mean the bound sandbox's pod reached a
+#: terminal phase (deadline, OOMKill, completion) — the controller never
+#: restarts it, so the claim is dead and must be replaced, not waited on.
+_DEAD_REASONS = frozenset({"PodFailed", "PodSucceeded", "SandboxExpired"})
+
+
+class _ClaimDead(RuntimeError):
+    """The claim can never become usable again (finished pod, expiry)."""
 
 
 class SandboxClaimProvisioner(_BaseProvisioner):
@@ -136,12 +144,17 @@ class SandboxClaimProvisioner(_BaseProvisioner):
             "apiVersion": f"{EXTENSIONS_API_GROUP}/{SANDBOX_API_VERSION}",
             "kind": "SandboxClaim",
             "metadata": metadata,
+            # Deliberately NO additionalPodMetadata: the claim controller
+            # runs its labels through a strict domain allowlist that defaults
+            # to sandbox.users.io (no install path ships the ConfigMap that
+            # widens it), so any label Hermes set there — including
+            # app.kubernetes.io/managed-by — made EVERY claim fail with
+            # InvalidMetadata on a stock install. The pod's managed-by label
+            # (what k8s/networkpolicy.yaml selects on) belongs in the admin's
+            # SandboxTemplate, where the README sample already puts it.
             "spec": {
                 "warmPoolRef": {"name": self.warm_pool},
                 "lifecycle": lifecycle,
-                # Selected on by k8s/networkpolicy.yaml; discovery and
-                # ownership run over the claim, not this label.
-                "additionalPodMetadata": {"labels": dict(MANAGED_BY_LABEL)},
             },
         }
 
@@ -225,20 +238,48 @@ class SandboxClaimProvisioner(_BaseProvisioner):
         value = _dig_dict(claim, "status", "sandbox").get("name")
         return value if isinstance(value, str) else ""
 
+    @staticmethod
+    def _finished_condition(claim: dict) -> Optional[dict]:
+        for cond in (claim.get("status") or {}).get("conditions") or []:
+            if (isinstance(cond, dict) and cond.get("type") == "Finished"
+                    and str(cond.get("status")) == "True"):
+                return cond
+        return None
+
     def _wait_claim(self, name: str) -> str:
-        """Poll the claim until it is bound; return the bound Sandbox name."""
+        """Poll the claim until it is bound; return the bound Sandbox name.
+
+        Raises :class:`_ClaimDead` when the claim can never bind again
+        (expired, or its sandbox's pod finished) — the caller replaces the
+        claim, because the controller never restarts a finished pod.
+        """
         import time
+
+        from kubernetes.client.exceptions import ApiException
 
         deadline = time.monotonic() + self.ready_timeout
         last_reason = ""
         while time.monotonic() < deadline:
-            claim = self._get_claim(name)
+            try:
+                claim = self._get_claim(name)
+            except ApiException as exc:
+                if exc.status == 404:
+                    # A claim WE created that vanished mid-wait was deleted by
+                    # an admin or the controller; it is gone for good.
+                    raise RuntimeError(
+                        f"sandboxclaim {name} was deleted while binding; not "
+                        "retrying. If an admin removed it, re-run the command."
+                    ) from exc
+                raise
             cond = self._ready_condition(claim) or {}
             reason = str(cond.get("reason") or "")
-            if reason == _CLAIM_EXPIRED_REASON:
-                raise RuntimeError(
-                    f"sandboxclaim {name} expired before it could be used: "
-                    f"{cond.get('message') or reason}"
+            finished = self._finished_condition(claim)
+            if (reason == _CLAIM_EXPIRED_REASON or reason in _DEAD_REASONS
+                    or finished is not None):
+                detail = (finished or cond)
+                raise _ClaimDead(
+                    f"sandboxclaim {name} is dead "
+                    f"({detail.get('reason')}: {detail.get('message') or ''})"
                 )
             sandbox_name = self._bound_sandbox_name(claim)
             # Both, not either: the condition can flip before the status
@@ -249,13 +290,22 @@ class SandboxClaimProvisioner(_BaseProvisioner):
             if cond:
                 last_reason = f"{reason}: {cond.get('message') or ''}".strip(": ")
             time.sleep(0.5)
-        raise TimeoutError(
-            f"sandboxclaim {name} was not bound within {self.ready_timeout}s"
-            f" ({last_reason or 'no Ready condition reported'}). If the "
-            f"SandboxWarmPool '{self.warm_pool}' is exhausted this is a cold "
-            "start — raise the pool's replicas, or raise "
-            "terminal.kubernetes.ready_timeout_seconds."
+        # Lead with the controller's own reason — it names the actual problem
+        # (InvalidMetadata, quota, ...). Pool advice only when the reason is
+        # pool-shaped, so it cannot bury a real error.
+        message = (
+            f"sandboxclaim {name} was not bound within {self.ready_timeout}s: "
+            f"{last_reason or 'no Ready condition reported'}."
         )
+        if not last_reason or "DependenciesNotReady" in last_reason:
+            message += (
+                f" If the SandboxWarmPool '{self.warm_pool}' is exhausted this "
+                "is a cold start still in progress — the claim is left in "
+                "place and the next attempt resumes it; raise "
+                "terminal.kubernetes.ready_timeout_seconds (kata boots easily "
+                "exceed the default), or raise the pool's replicas."
+            )
+        raise TimeoutError(message)
 
     @staticmethod
     def _pod_name_from_sandbox(sandbox: dict) -> str:
@@ -287,15 +337,52 @@ class SandboxClaimProvisioner(_BaseProvisioner):
             f"(uid {sandbox_uid}); refusing to exec into it."
         )
 
+    def _delete_claim_and_wait(self, name: str, timeout: int = 30) -> None:
+        """Delete a claim and block until the name is free for re-creation."""
+        import time
+
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            self._custom.delete_namespaced_custom_object(
+                group=EXTENSIONS_API_GROUP, version=SANDBOX_API_VERSION,
+                namespace=self.namespace, plural="sandboxclaims", name=name,
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self._get_claim(name)
+            except ApiException as exc:
+                if exc.status == 404:
+                    return
+                raise
+            time.sleep(0.5)
+
     # -- WorkspaceProvisioner ------------------------------------------
     def ensure(self, task_id: str) -> PodRef:
         name = self.workspace_name(task_id)
         existed = self._create_claim(self.claim_manifest(task_id))
         if existed:
             self._assert_ours(name)
-        self._created_names.add(name)
 
-        sandbox_name = self._wait_claim(name)
+        for attempt in (1, 2):
+            try:
+                sandbox_name = self._wait_claim(name)
+            except _ClaimDead as dead:
+                if attempt == 2:
+                    raise RuntimeError(str(dead))
+                # Our claim, but its sandbox finished (deadline, OOMKill) or
+                # it expired — the controller never restarts a finished pod,
+                # so replace the claim and bind fresh.
+                logger.warning("k8s: %s; replacing it.", dead)
+                self._delete_claim_and_wait(name)
+                self._create_claim(self.claim_manifest(task_id))
+                continue
+            break
+
         sandbox = self._get_sandbox(sandbox_name)
         pod_name = self._pod_name_from_sandbox(sandbox)
         if not pod_name:
@@ -305,6 +392,12 @@ class SandboxClaimProvisioner(_BaseProvisioner):
             )
         pod = self.wait_pod_ready(pod_name)
         self._assert_pod_belongs(pod, pod_name, sandbox)
+        # Recorded only after a successful bind, ON PURPOSE: a readiness
+        # timeout raises out of ensure(), the environment's teardown then
+        # calls destroy(), and destroying an unbound claim would delete the
+        # very cold start the pool is refilling with (the retry re-adopts it
+        # through the 409 + _assert_ours path instead, which converges).
+        self._created_names.add(name)
         return PodRef(self.namespace, pod_name, self.exec_container(pod))
 
     def destroy(self, pod_ref: PodRef) -> None:
@@ -317,9 +410,11 @@ class SandboxClaimProvisioner(_BaseProvisioner):
         # foreign, not created, so refusal to reuse stays refusal to delete.
         names = sorted(self._created_names)
         if not names:
-            logger.warning(
-                "k8s: not deleting a sandboxclaim for pod %s: this provisioner "
-                "never created or adopted one.", pod_ref.pod_name,
+            logger.info(
+                "k8s: no bound sandboxclaim to delete for pod %s (binding "
+                "never completed, or the claim was foreign — an unbound claim "
+                "is deliberately left for the next attempt to adopt).",
+                pod_ref.pod_name,
             )
         for name in names:
             try:

@@ -350,16 +350,20 @@ def sanitize_name(raw: str, *, max_len: int = 40) -> str:
 
 
 def _instance_discriminator(owner_pod_uid: str = "") -> str:
-    """Stable per-agent-instance suffix, so two agents never share a pod name.
+    """Per-PROCESS suffix, so two Hermes processes never share a pod name.
 
     ``_resolve_container_task_id`` collapses almost every session to
-    ``"default"``, so without a discriminator two Hermes pods in one namespace
-    both target ``hermes-ws-default``: the second create 409s, gets silently
-    "reused", and each agent then execs into (and later deletes) the other's
-    workspace.  Derived from the agent pod's UID in-cluster and from the
-    hostname otherwise, so it is stable across restarts.
+    ``"default"``, so without a discriminator two Hermes processes both target
+    ``hermes-ws-default``: the second create 409s, gets silently "reused", and
+    each execs into (and later deletes) the other's workspace.  The pod UID
+    alone is NOT enough — two processes in ONE agent pod (the dashboard-chat
+    gateway subprocess, per-profile s6 gateways) share it, and ``_is_ours``
+    cannot tell "my own other process" from "me" — so the pid is mixed in.
+    Process-scoped naming is safe precisely because workspaces are stateless:
+    nothing resumes across a restart, and a restarted process abandons its old
+    pod to ownerReference GC / the deadline backstop.
     """
-    seed = owner_pod_uid or socket.gethostname() or "hermes"
+    seed = f"{owner_pod_uid or socket.gethostname() or 'hermes'}:{os.getpid()}"
     return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
 
 
@@ -578,6 +582,12 @@ def _default_base(kcfg: dict) -> dict:
         "automountServiceAccountToken": False,
         "serviceAccountName": SESSION_SERVICE_ACCOUNT,
         "enableServiceLinks": False,
+        # The exec container's PID 1 is `sleep`, which never reaps children —
+        # a backgrounded command's wrapper would zombify and `kill -0` would
+        # report it alive forever, so background completion detection depends
+        # on this: with a shared PID namespace the sandbox `pause` process is
+        # PID 1 and reaps. Same-pod visibility is a non-issue (one container).
+        "shareProcessNamespace": True,
         "hostNetwork": False,
         "hostPID": False,
         "hostIPC": False,
@@ -841,6 +851,43 @@ class _BaseProvisioner(WorkspaceProvisioner):
             if exc.status != 404:
                 logger.warning("k8s: failed to delete pod %s: %s", pod_name, exc)
 
+    def _pod_is_terminal(self, pod_name: str) -> bool:
+        """True when the pod exists but can never serve exec again.
+
+        activeDeadlineSeconds, node-pressure eviction and an OOMKill under
+        ``restartPolicy: Never`` all leave the pod in phase Failed but still
+        PRESENT — Kubernetes does not delete it.
+        """
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            pod = self._api.read_namespaced_pod(
+                name=pod_name, namespace=self.namespace
+            )
+        except ApiException:
+            return False
+        except Exception:
+            return False
+        return getattr(getattr(pod, "status", None), "phase", "") in (
+            "Failed", "Succeeded",
+        )
+
+    def _wait_pod_gone(self, pod_name: str, timeout: int = 30) -> None:
+        """Block until a deleted pod's name is free for re-creation."""
+        from kubernetes.client.exceptions import ApiException
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self._api.read_namespaced_pod(
+                    name=pod_name, namespace=self.namespace
+                )
+            except ApiException as exc:
+                if exc.status == 404:
+                    return
+                raise
+            time.sleep(0.5)
+
 
 class PodProvisioner(_BaseProvisioner):
     """Creates session pods directly via the Kubernetes core API.
@@ -917,22 +964,36 @@ class PodProvisioner(_BaseProvisioner):
         from kubernetes.client.exceptions import ApiException
 
         pod_name = self.workspace_name(task_id)
-        try:
-            self._api.create_namespaced_pod(
-                namespace=self.namespace,
-                body=self.pod_manifest(task_id),
-                **STRICT_FIELD_VALIDATION,
-            )
-        except ApiException as exc:
-            if exc.status != 409:
-                raise
-            # 409 = the pod already exists (a racing session in this same
-            # agent, or a leftover from a previous run).
-            if not self._is_ours(pod_name):
-                raise self._refuse(pod_name, (
-                    f"session pod {pod_name} already exists and was not created "
-                    "by this Hermes instance; refusing to reuse it."
-                ))
+        for attempt in (1, 2):
+            try:
+                self._api.create_namespaced_pod(
+                    namespace=self.namespace,
+                    body=self.pod_manifest(task_id),
+                    **STRICT_FIELD_VALIDATION,
+                )
+            except ApiException as exc:
+                if exc.status != 409:
+                    raise
+                # 409 = the pod already exists (a racing session in this same
+                # agent, or a leftover from a previous run).
+                if not self._is_ours(pod_name):
+                    raise self._refuse(pod_name, (
+                        f"session pod {pod_name} already exists and was not "
+                        "created by this Hermes instance; refusing to reuse it."
+                    ))
+                # Our own pod, but dead (deadline, eviction, OOMKill under
+                # restartPolicy: Never leave it in phase Failed, PRESENT).
+                # Handing it to wait_pod_ready would raise immediately, so
+                # delete the corpse and recreate under the same name.
+                if attempt == 1 and self._pod_is_terminal(pod_name):
+                    logger.warning(
+                        "k8s: session pod %s is in a terminal phase; deleting "
+                        "and re-provisioning.", pod_name,
+                    )
+                    self._delete_pod(self.namespace, pod_name)
+                    self._wait_pod_gone(pod_name)
+                    continue
+            break
 
         pod = self.wait_pod_ready(pod_name)
         return PodRef(self.namespace, pod_name, self.exec_container(pod))
@@ -1010,6 +1071,16 @@ class KubernetesEnvironment(BaseEnvironment):
         # Captured once: the agent may `cd` away, but the synced ~/.hermes tree
         # must stay where the first sync put it.
         self._hermes_base = posixpath.join(cwd or "/workspace", ".hermes")
+        # Where a re-provisioned session restarts (the workspace is stateless,
+        # so a tracked cwd inside the old pod cannot survive it).
+        self._initial_cwd = cwd or "/workspace"
+        # Set by _ensure_pod after a re-provision; the next execute() result
+        # carries a one-line note so the MODEL learns the workspace reset —
+        # a logger.warning is invisible to it.
+        self._reset_note_pending = False
+        # cleanup() is final: a background poller must not resurrect the
+        # environment into an untracked pod after teardown.
+        self._torn_down = False
 
         try:
             self._pod_ref = provisioner.ensure(task_id=task_id)
@@ -1023,6 +1094,10 @@ class KubernetesEnvironment(BaseEnvironment):
         if sync_files:
             # Session pods are not bind-mounted, so skills, ~/.hermes
             # credential files and the agent cache have to be pushed in.
+            # Deliberately one-way: no bulk_download_fn and no sync_back() on
+            # cleanup. The synced set is host-authored (credentials, skills,
+            # caches), so there is nothing of value to pull back, and the
+            # workspace itself is a stateless emptyDir by design.
             self._sync_manager = FileSyncManager(
                 get_files_fn=lambda: iter_sync_files(self._hermes_base),
                 upload_fn=self._upload_file,
@@ -1054,12 +1129,17 @@ class KubernetesEnvironment(BaseEnvironment):
         """Re-provision after the session pod went away.
 
         ``cancel()`` no longer destroys the pod, so this is now reached only
-        when the pod genuinely disappeared (activeDeadlineSeconds, an operator
-        TTL, an eviction).  Without it a single vanished pod bricks the
-        session: every later exec 404s and the agent sees empty output with
+        when the pod genuinely died (activeDeadlineSeconds, an operator TTL,
+        an eviction, an OOMKill).  Without it a single dead pod bricks the
+        session: every later exec fails and the agent sees empty output with
         rc=1 until the idle reaper evicts the environment.
         """
         with self._lock:
+            if self._torn_down:
+                raise RuntimeError(
+                    "kubernetes environment has been cleaned up; refusing to "
+                    "provision a new session pod for it"
+                )
             if self._pod_ref is not None:
                 return self._pod_ref
         logger.warning(
@@ -1069,6 +1149,10 @@ class KubernetesEnvironment(BaseEnvironment):
         pod_ref = self._provisioner.ensure(task_id=self._task_id)
         with self._lock:
             self._pod_ref = pod_ref
+        # The tracked cwd pointed inside the old pod's workspace; a fresh
+        # emptyDir has only the mount root.
+        self.cwd = self._initial_cwd
+        self._reset_note_pending = True
         # A fresh pod has none of the synced files or the env snapshot.
         if self._sync_manager is not None:
             try:
@@ -1081,6 +1165,21 @@ class KubernetesEnvironment(BaseEnvironment):
         except Exception as exc:
             logger.debug("k8s: init_session after re-provision failed: %s", exc)
         return pod_ref
+
+    def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
+        result = super().execute(command, cwd, **kwargs)
+        if self._reset_note_pending:
+            # Once, on the first result after a re-provision: the model (not
+            # the operator log) is who has to react to a vanished workspace.
+            self._reset_note_pending = False
+            note = (
+                "[note: the session workspace was re-provisioned and starts "
+                "empty — files, installed packages and previously saved tool "
+                f"outputs are gone; cwd reset to {self._initial_cwd}]\n"
+            )
+            result = dict(result)
+            result["output"] = note + (result.get("output") or "")
+        return result
 
     def _before_execute(self) -> None:
         self._ensure_pod()
@@ -1219,14 +1318,37 @@ class KubernetesEnvironment(BaseEnvironment):
             )
         return "".join(chunks), self._safe_returncode(resp)
 
-    def _forget_pod_if_gone(self, exc: Exception) -> None:
-        """Drop the pod ref when the API server says the pod is gone.
+    def _forget_pod_if_dead(self, exc: Exception) -> None:
+        """Drop the pod ref when the pod is gone OR terminal-but-present.
 
-        activeDeadlineSeconds, an operator TTL or a node eviction can delete
-        the session pod underneath us; clearing the ref makes the next command
-        re-provision instead of 404-ing forever.
+        404 is the easy case (the pod was deleted underneath us). The
+        insidious one: activeDeadlineSeconds, node-pressure eviction or an
+        OOMKill under ``restartPolicy: Never`` moves the pod to phase Failed
+        and Kubernetes does NOT delete it — exec then returns 400, not 404,
+        forever.  So on any other exec error, ask the API server whether the
+        pod can still serve exec at all; a terminal phase clears the ref, and
+        the provisioner's 409 path deletes the corpse on re-provision.
         """
-        if getattr(exc, "status", None) != 404 and "not found" not in str(exc).lower():
+        dead = (
+            getattr(exc, "status", None) == 404
+            or "not found" in str(exc).lower()
+        )
+        if not dead:
+            with self._lock:
+                ref = self._pod_ref
+            api = self._exec_api or getattr(self._provisioner, "_api", None)
+            if ref is None or api is None:
+                return
+            try:
+                pod = api.read_namespaced_pod(
+                    name=ref.pod_name, namespace=ref.namespace
+                )
+                dead = getattr(getattr(pod, "status", None), "phase", "") in (
+                    "Failed", "Succeeded",
+                )
+            except Exception as read_exc:
+                dead = getattr(read_exc, "status", None) == 404
+        if not dead:
             return
         with self._lock:
             self._pod_ref = None
@@ -1278,7 +1400,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 if not cancelled:
                     logger.warning("k8s: exec stream error: %s", exc)
                     chunks.append(f"\n[kubernetes exec error: {exc}]")
-                    self._forget_pod_if_gone(exc)
+                    self._forget_pod_if_dead(exc)
                 return "".join(chunks), (130 if cancelled else 1)
             finally:
                 with self._lock:
@@ -1448,6 +1570,10 @@ class KubernetesEnvironment(BaseEnvironment):
         with self._lock:
             ref = getattr(self, "_pod_ref", None)
             self._pod_ref = None
+            # Final: an orphaned background poller calling _ensure_pod after
+            # this must fail, not resurrect the environment into an untracked
+            # pod/claim.
+            self._torn_down = True
         if ref is None:
             return
         try:

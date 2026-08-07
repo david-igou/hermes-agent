@@ -310,7 +310,19 @@ def _process_single_prompt(
         if prompt_data.get("cwd"):
             overrides["cwd"] = prompt_data["cwd"]
         register_task_env_overrides(task_id, overrides)
-        if config.get("verbose"):
+        if os.getenv("TERMINAL_ENV") == "kubernetes":
+            # Per-prompt images are docker/modal/singularity/daytona-only. The
+            # kubernetes backend's image is authored in
+            # terminal.kubernetes.pod_template (or the cluster's
+            # SandboxTemplate) — saying nothing here would let a sweep run
+            # every rollout against the wrong image, silently.
+            print(
+                f"   Prompt {prompt_index}: WARNING — kubernetes backend "
+                f"ignores per-prompt container images; {container_image} will "
+                "NOT be used (the session image comes from "
+                "terminal.kubernetes.pod_template / the SandboxTemplate)."
+            )
+        elif config.get("verbose"):
             print(f"   Prompt {prompt_index}: Using container image {container_image}")
     
     try:

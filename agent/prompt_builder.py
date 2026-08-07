@@ -1025,6 +1025,13 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 # disk) because the probe captures live backend state that may change
 # across Hermes restarts.
 _BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
+# One worker per cache key; a prompt build waits at most this long for it.
+# 10s covers a warm pod/exec handshake comfortably; a cold kata boot blows
+# straight through it and lands as a cache hit on the NEXT build instead of
+# stalling this one.
+_BACKEND_PROBE_WAIT_SECONDS = 10.0
+_BACKEND_PROBE_LOCK = threading.Lock()
+_BACKEND_PROBE_THREADS: dict[tuple[str, str], threading.Thread] = {}
 
 
 _WINDOWS_BASH_SHELL_HINT = (
@@ -1045,6 +1052,14 @@ def _probe_remote_backend(env_type: str) -> str | None:
     $HOME, cwd, and user — or None if the probe failed. Result is cached
     per process. Used only for non-local backends where the agent's tools
     operate on a different machine than the host Hermes runs on.
+
+    Bounded: the probe includes ENVIRONMENT CREATION, which for backends that
+    provision real infrastructure (a kubernetes session pod, a kata boot) can
+    take up to ready_timeout_seconds — far past this call's 4s execute budget
+    and squarely inside the user's first prompt build. So the work runs in a
+    worker thread with a hard wait ceiling (same shape as tools/env_probe.py);
+    on expiry the prompt falls back to the static backend description and the
+    worker keeps warming the cache for the next build.
     """
     cwd_hint = os.getenv("TERMINAL_CWD", "")
     cache_key = (env_type, cwd_hint)
@@ -1052,6 +1067,31 @@ def _probe_remote_backend(env_type: str) -> str | None:
     if cached is not None:
         return cached or None
 
+    with _BACKEND_PROBE_LOCK:
+        worker = _BACKEND_PROBE_THREADS.get(cache_key)
+        if worker is None or not worker.is_alive():
+            worker = threading.Thread(
+                target=_probe_remote_backend_sync,
+                args=(env_type, cache_key),
+                name=f"backend-probe-{env_type}",
+                daemon=True,
+            )
+            _BACKEND_PROBE_THREADS[cache_key] = worker
+            worker.start()
+    worker.join(_BACKEND_PROBE_WAIT_SECONDS)
+    result = _BACKEND_PROBE_CACHE.get(cache_key)
+    if result is None:
+        logger.debug(
+            "Backend probe for %s still running after %.0fs; using the static "
+            "description for this prompt build.",
+            env_type, _BACKEND_PROBE_WAIT_SECONDS,
+        )
+        return None
+    return result or None
+
+
+def _probe_remote_backend_sync(env_type: str, cache_key: tuple) -> None:
+    """The actual probe; always publishes a cache entry ("" = nothing to say)."""
     try:
         # Import locally: tools/ imports are heavy and only relevant when a
         # non-local backend is actually configured.

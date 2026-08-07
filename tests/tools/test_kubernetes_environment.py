@@ -303,6 +303,10 @@ def test_the_default_base_is_a_sane_starting_point():
     # The shared terminal.container_* knobs are NOT read: resources live in
     # pod_template only, so the base declares none.
     assert "resources" not in spec["containers"][0]
+    # PID 1 is `sleep`, which never reaps — the shared PID namespace makes
+    # the sandbox `pause` process the reaper, so background completion
+    # detection works.
+    assert spec["shareProcessNamespace"] is True
 
 
 def test_pod_template_reaches_the_manifest():
@@ -591,6 +595,11 @@ def test_claim_manifest_shape():
     assert "podTemplate" not in spec
     assert "env" not in spec
     assert "volumeClaimTemplates" not in spec
+    # And NO additionalPodMetadata: the claim controller's strict label-domain
+    # allowlist (default: sandbox.users.io only) rejects any label Hermes
+    # could set there, which made every claim fail InvalidMetadata on a stock
+    # install. The pod's managed-by label is the SandboxTemplate's job.
+    assert "additionalPodMetadata" not in spec
 
 
 def test_claim_carries_the_shutdown_time_backstop():
@@ -610,14 +619,13 @@ def test_claim_manifest_requires_a_warm_pool():
         _sandbox_provisioner(warm_pool="").claim_manifest("abc")
 
 
-def test_claim_stamps_the_managed_by_label_on_claim_and_pod():
+def test_claim_carries_the_managed_by_label_on_the_claim_only():
+    """The CLAIM object is labelled (harmless — claim metadata is not run
+    through the controller's allowlist); the POD's label comes from the
+    admin's SandboxTemplate, never from the claim."""
     manifest = _sandbox_provisioner().claim_manifest("abc")
     assert manifest["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
-    # additionalPodMetadata propagates to the bound pod, which is what the
-    # shipped NetworkPolicy selects on.
-    assert manifest["spec"]["additionalPodMetadata"]["labels"][MANAGED_BY] == (
-        "hermes-agent"
-    )
+    assert "additionalPodMetadata" not in manifest["spec"]
 
 
 def test_claim_ensure_binds_and_resolves_the_pod():
@@ -2084,6 +2092,9 @@ def test_doctor_probes_the_exec_verb_the_client_actually_issues():
     assert ("", "pods/exec", "get") in reviews
     assert ("", "pods/exec", "create") not in reviews
     assert ("", "pods", "create") in reviews
+    # `get pods` backs readiness polling, 409 ownership and the ownerRef
+    # lookup — omitting it green-lit a Role that 403s at the first session.
+    assert ("", "pods", "get") in reviews
     readme = (K8S_DIR / "README.md").read_text(encoding="utf-8")
     assert "get    pods/exec" in readme
 
@@ -2105,6 +2116,8 @@ def test_doctor_probes_the_claim_surface_the_backend_posts_to():
               sandbox={"warm_pool": "pool"})
     )
     assert ("extensions.agents.x-k8s.io", "sandboxclaims", "create") in reviews
+    # `get` is polled on every binding wait.
+    assert ("extensions.agents.x-k8s.io", "sandboxclaims", "get") in reviews
     assert ("extensions.agents.x-k8s.io", "sandboxclaims", "delete") in reviews
     # Read-only sandboxes: never created — Hermes has no pod-authoring surface.
     assert ("agents.x-k8s.io", "sandboxes", "get") in reviews
@@ -2354,3 +2367,247 @@ def test_refusing_to_adopt_a_foreign_claim_does_not_delete_it():
     p.destroy(PodRef("hermes", p.workspace_name("abc"), "workspace"))
     custom.delete_namespaced_custom_object.assert_not_called()
 
+
+
+# ---------------------------------------------------------------------------
+# Recovery from a pod that is dead but still PRESENT (B2): deadline,
+# eviction and OOMKill under restartPolicy: Never leave the pod in phase
+# Failed — exec returns 400, not 404, and 404-only recovery wedged the
+# session permanently.
+# ---------------------------------------------------------------------------
+
+
+def _failed_pod(name="hermes-ws-abc"):
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name, labels={MANAGED_BY: "hermes-agent"},
+                                 owner_references=[SimpleNamespace(uid=OWNER_REF["uid"])]),
+        spec=SimpleNamespace(containers=[SimpleNamespace(name="workspace")]),
+        status=SimpleNamespace(phase="Failed", conditions=[], container_statuses=[]),
+    )
+
+
+def test_exec_400_against_a_failed_pod_clears_the_ref(monkeypatch):
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _failed_pod()
+    completed = _FakeWSClient(
+        raise_on_update=ApiException(status=400, reason="Bad Request")
+    )
+    env = _make_k8s_env(monkeypatch, [("", 0), completed], api=api)
+    env.execute("ls")
+    assert env._pod_ref is None, (
+        "a 400 against a phase-Failed pod must clear the ref so the next "
+        "command re-provisions"
+    )
+
+
+def test_exec_400_against_a_live_pod_keeps_the_ref(monkeypatch):
+    """A transient 400 with the pod Running is NOT death — clearing the ref
+    there would re-provision (and wipe) a healthy workspace."""
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _running_pod()
+    hiccup = _FakeWSClient(
+        raise_on_update=ApiException(status=400, reason="Bad Request")
+    )
+    env = _make_k8s_env(monkeypatch, [("", 0), hiccup], api=api)
+    env.execute("ls")
+    assert env._pod_ref is not None
+
+
+def test_ensure_deletes_and_recreates_its_own_terminal_pod():
+    """409 on create + the existing pod is ours but phase Failed: handing the
+    corpse to wait_pod_ready raised immediately, with no recreate branch."""
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    # First create 409s; after the delete, the second create succeeds.
+    api.create_namespaced_pod.side_effect = [ApiException(status=409), None]
+    reads = {"n": 0}
+
+    def _read(**kwargs):
+        reads["n"] += 1
+        # _is_ours + _pod_is_terminal see the corpse; after deletion the
+        # name is free (404) and the recreated pod comes up Running.
+        if reads["n"] <= 2:
+            return _failed_pod()
+        if reads["n"] == 3:
+            raise ApiException(status=404)
+        return _running_pod()
+
+    api.read_namespaced_pod.side_effect = _read
+    p = _provisioner_with_api(api)
+    ref = p.ensure("abc")
+    api.delete_namespaced_pod.assert_called_once()
+    assert api.create_namespaced_pod.call_count == 2
+    assert ref.pod_name == p.workspace_name("abc")
+
+
+def test_execute_surfaces_the_workspace_reset_to_the_model(monkeypatch):
+    """A logger.warning is invisible to the model; the first result after a
+    re-provision must say the workspace is empty (and where cwd went)."""
+    from kubernetes.client.exceptions import ApiException
+
+    gone = _FakeWSClient(raise_on_update=ApiException(status=404, reason="gone"))
+    env = _make_k8s_env(monkeypatch, [("", 0), gone, ("", 0), ("ok\n", 0)])
+    env.execute("ls")                       # kills the ref
+    result = env.execute("echo ok")          # re-provisions
+    assert "re-provisioned" in result["output"]
+    assert "/workspace" in result["output"]
+    # Once, not forever.
+    follow_up = env.execute("echo again")
+    assert "re-provisioned" not in follow_up["output"]
+
+
+def test_cleanup_is_final_for_background_pollers(monkeypatch):
+    """An orphaned poller thread calling into a cleaned-up environment must
+    not resurrect it into an untracked pod/claim."""
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    env.cleanup()
+    with pytest.raises(RuntimeError, match="cleaned up"):
+        env._ensure_pod()
+
+
+# ---------------------------------------------------------------------------
+# Claim-path death and convergence (B2/D3)
+# ---------------------------------------------------------------------------
+
+
+def test_dead_claim_is_replaced_not_waited_on():
+    """A claim whose sandbox finished (deadline, OOMKill) never binds again —
+    the controller does not restart finished pods — so it is deleted and a
+    fresh claim is issued."""
+    from kubernetes.client.exceptions import ApiException
+
+    state = {"phase": "dead", "gets": 0}
+    sandbox = _sandbox_cr()
+
+    def _get(**kwargs):
+        if kwargs["plural"] == "sandboxes":
+            return sandbox
+        state["gets"] += 1
+        if state["phase"] == "dead":
+            return {"status": {"conditions": [
+                {"type": "Ready", "status": "False", "reason": "PodFailed",
+                 "message": "deadline exceeded"}]}}
+        return _bound_claim()
+
+    custom = MagicMock()
+    custom.get_namespaced_custom_object.side_effect = _get
+
+    def _delete(**kwargs):
+        state["phase"] = "deleted"
+        return None
+
+    custom.delete_namespaced_custom_object.side_effect = _delete
+
+    def _get_after_delete(**kwargs):
+        # After deletion the name 404s once, then the fresh claim binds.
+        if state["phase"] == "deleted":
+            state["phase"] = "fresh"
+            raise ApiException(status=404)
+        return _get(**kwargs)
+
+    custom.get_namespaced_custom_object.side_effect = _get_after_delete
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _pod_owned_by_sandbox()
+
+    p = _sandbox_provisioner(api=api, custom=custom)
+    ref = p.ensure("abc")
+    assert ref.pod_name == "sb-1"
+    assert custom.create_namespaced_custom_object.call_count == 2
+    custom.delete_namespaced_custom_object.assert_called_once()
+
+
+def test_readiness_timeout_leaves_the_claim_for_the_next_attempt():
+    """Destroying an unbound claim deleted the very cold start the pool was
+    refilling with, so exhaustion + kata never converged. A readiness timeout
+    now leaves the claim; teardown deletes only BOUND claims."""
+    custom = MagicMock()
+    custom.get_namespaced_custom_object.return_value = {
+        "status": {"conditions": [{"type": "Ready", "status": "False",
+                                   "reason": "DependenciesNotReady",
+                                   "message": "cold starting"}]}
+    }
+    p = _sandbox_provisioner(api=MagicMock(), custom=custom,
+                             ready_timeout_seconds=1)
+    with pytest.raises(TimeoutError) as excinfo:
+        p.ensure("abc")
+    # The message leads with the controller's reason and says the claim is
+    # left in place.
+    assert "DependenciesNotReady" in str(excinfo.value)
+    assert "left in place" in str(excinfo.value)
+
+    p.destroy(PodRef("hermes", p.workspace_name("abc"), "workspace"))
+    custom.delete_namespaced_custom_object.assert_not_called()
+
+
+def test_claim_timeout_leads_with_a_non_pool_reason():
+    """A controller rejection (e.g. InvalidMetadata) must not be buried under
+    warm-pool sizing advice that has nothing to do with it."""
+    custom = MagicMock()
+    custom.get_namespaced_custom_object.return_value = {
+        "status": {"conditions": [{"type": "Ready", "status": "False",
+                                   "reason": "InvalidMetadata",
+                                   "message": "label domain rejected"}]}
+    }
+    p = _sandbox_provisioner(api=MagicMock(), custom=custom,
+                             ready_timeout_seconds=1)
+    with pytest.raises(TimeoutError) as excinfo:
+        p.ensure("abc")
+    message = str(excinfo.value)
+    assert message.index("InvalidMetadata") < len(message)
+    assert "exhausted" not in message, (
+        "pool advice attached to a non-pool failure buries the real cause"
+    )
+
+
+def test_claim_deleted_mid_wait_is_a_clear_error():
+    from kubernetes.client.exceptions import ApiException
+
+    custom = MagicMock()
+    custom.get_namespaced_custom_object.side_effect = ApiException(status=404)
+    p = _sandbox_provisioner(api=MagicMock(), custom=custom,
+                             ready_timeout_seconds=1)
+    with pytest.raises(RuntimeError, match="deleted while binding"):
+        p.ensure("abc")
+
+
+# ---------------------------------------------------------------------------
+# Same-pod multi-process isolation (D9) and the removed image override (D11)
+# ---------------------------------------------------------------------------
+
+
+def test_instance_discriminator_is_process_scoped(monkeypatch):
+    """Two Hermes processes in ONE agent pod share the pod UID; seeded from it
+    alone they adopted and deleted each other's workspace."""
+    import tools.environments.kubernetes as k8s_mod
+
+    monkeypatch.setattr(k8s_mod.os, "getpid", lambda: 1111)
+    a = k8s_mod._instance_discriminator("pod-uid")
+    monkeypatch.setattr(k8s_mod.os, "getpid", lambda: 2222)
+    b = k8s_mod._instance_discriminator("pod-uid")
+    assert a != b
+
+
+def test_registering_a_kubernetes_image_override_fails_loudly():
+    """Silently dropping the per-task image made an RL sweep evaluate every
+    rollout against the wrong image with no warning."""
+    import tools.terminal_tool as tt
+
+    with pytest.raises(ValueError, match="pod_template"):
+        tt.register_task_env_overrides("rollout-1", {"kubernetes_image": "x:1"})
+    assert "rollout-1" not in tt._task_env_overrides
+
+
+def test_cd_guard_126_hint_names_the_stateless_workspace():
+    """The cwd guard exits 126 BEFORE the command runs (empty output); the
+    generic 'chmod +x' hint sent the model the wrong way after a reset."""
+    from tools.terminal_hints import annotate_failure
+
+    guard = annotate_failure("make build", 126, "")
+    assert guard and "re-provisioned" in guard
+    real_126 = annotate_failure("./script.sh", 126, "permission denied")
+    assert real_126 and "chmod" in real_126

@@ -44,12 +44,20 @@
 # above). An earlier revision of this file claimed the matchCondition "cannot be
 # configured away" — that claim was false and is retracted.
 #
-# NOT COVERED (by design): `provisioner: sandbox`. On that path the pod is
-# created by the agent-sandbox controllers from YOUR SandboxTemplate — Hermes
-# submits no pod spec at all, so there is nothing of Hermes' to police here.
-# Harden the SandboxTemplate itself (it IS the enforcement point) and keep
-# write access to sandboxtemplates/sandboxwarmpools away from the agent's
-# ServiceAccount (see k8s/rbac.yaml).
+# `provisioner: sandbox` — THIS POLICY IS NOT INERT THERE. The pod is created
+# by the agent-sandbox controllers from YOUR SandboxTemplate (Hermes submits
+# no pod spec), but the matchConditions are only (created by a ServiceAccount)
+# + (carries the managed-by label) — and your template carries that label for
+# NetworkPolicy selection. So in a labeled namespace this policy ADJUDICATES
+# warm-pool fills and cold starts too, and a SandboxTemplate that misses any
+# floor below shows up as a pool that never fills and claim timeouts blaming
+# replicas. Either make the template satisfy the same floors, or don't label
+# the namespace and rely on the template + RBAC as the enforcement point
+# (keep sandboxtemplates/sandboxwarmpools write access away from the agent's
+# ServiceAccount — see k8s/rbac.yaml). NOTE in particular the ServiceAccount
+# pin below (`variables.sa == 'hermes-session-noperms'`): it is a sample
+# value — if your SandboxTemplate uses a different session SA, change it here
+# or every warm-pool pod is denied.
 #
 # CONSEQUENCE OF THE SECRET RULES BELOW: they deny secret-backed ENV as well as
 # secret volumes, so a `pod_template` block that injects provider API

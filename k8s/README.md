@@ -53,10 +53,13 @@ Manual equivalent:
 SA=system:serviceaccount:<AGENT_NAMESPACE>:<AGENT_SA>
 # provisioner: pod
 kubectl auth can-i create pods        --as=$SA -n <AGENT_NAMESPACE>   # yes
+kubectl auth can-i get    pods        --as=$SA -n <AGENT_NAMESPACE>   # yes  <- readiness, 409 ownership, ownerRef lookup
 kubectl auth can-i get    pods/exec   --as=$SA -n <AGENT_NAMESPACE>   # yes  <- the one that matters
 # provisioner: sandbox — `create pods` must be NO; the claim controller owns the pod
 kubectl auth can-i create sandboxclaims.extensions.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes
+kubectl auth can-i get    sandboxclaims.extensions.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes
 kubectl auth can-i get    sandboxes.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes
+kubectl auth can-i get    sandboxwarmpools.extensions.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes (doctor pre-flight only)
 kubectl auth can-i create sandboxes.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # no
 kubectl auth can-i create pods        --as=$SA -n <AGENT_NAMESPACE>   # no
 kubectl auth can-i get    pods        --as=$SA -n <AGENT_NAMESPACE>   # yes
@@ -91,7 +94,7 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
 ## OpenShift 4.21 notes
 
 * **Do not pin `runAsUser`.** `restricted-v2` uses `runAsUser: MustRunAsRange` with the range from the namespace's `openshift.io/sa.scc.uid-range` annotation, so a hard-coded `1000` is rejected outright (`must be in the ranges: [1000700000, 1000709999]`). The default base leaves `runAsUser`/`fsGroup` unset so SCC assigns both. Set `pod_template.spec.securityContext.runAsUser` only on vanilla Kubernetes, where `runAsNonRoot` needs a concrete UID to schedule a root-default image.
-* **Set resource limits.** A namespace `ResourceQuota` covering `limits.cpu`/`limits.memory` rejects a requests-only pod. Set them on the `workspace` container in `terminal.kubernetes.pod_template` (it merges onto the base by `name`).
+* **Set resource limits.** A namespace `ResourceQuota` covering `limits.cpu`/`limits.memory` rejects a requests-only pod. Set them on the `workspace` container in `terminal.kubernetes.pod_template` (it merges onto the base by `name`) — and include `ephemeral-storage` there too, since the workspace emptyDir is otherwise unbounded.
 * **Sandboxed containers (kata).** On `provisioner: pod`, set `terminal.kubernetes.pod_template.spec.runtimeClassName: kata` and raise `ready_timeout_seconds` — kata cold starts routinely exceed the 120s default. On `provisioner: sandbox`, put `runtimeClassName: kata` in the `SandboxTemplate` instead: the warm pool eats the cold start and claims bind in milliseconds.
 * **SCC RBAC is usually unnecessary.** With the shipped defaults the session SA satisfies `restricted-v2`, which every authenticated SA already has. The commented block at the bottom of `rbac.yaml` covers the case where you pin a UID or need a custom SCC.
 
@@ -117,6 +120,10 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
   spec:
     podTemplate:
       metadata:
+        # YOUR responsibility on this path: Hermes sets no pod metadata at
+        # all (the claim controller's label allowlist would reject it), so
+        # this is the only place the label networkpolicy.yaml selects on can
+        # come from.
         labels: {app.kubernetes.io/managed-by: hermes-agent}
       spec:
         # runtimeClassName: kata          # per-session kernel isolation
@@ -124,6 +131,9 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
         automountServiceAccountToken: false
         restartPolicy: Never
         terminationGracePeriodSeconds: 1
+        # PID 1 must REAP: `sleep` never does, so without this a backgrounded
+        # command's wrapper zombifies and completion is never detected.
+        shareProcessNamespace: true
         containers:
           - name: workspace               # = terminal.kubernetes.container_name
             image: nikolaik/python-nodejs:python3.11-nodejs20
@@ -150,7 +160,19 @@ Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely 
     sandboxTemplateRef: {name: hermes-session}
   ```
 
-  **The exec contract** — what the template must satisfy for Hermes to be able to use the pod: a container named `terminal.kubernetes.container_name` running something long-lived (`sleep infinity`), with a writable `terminal.kubernetes.mount_path` (the session cwd) and a writable `/tmp`. `hermes doctor` verifies the pool exists and dry-runs the claim; a template that breaks the contract fails visibly at the first session with the container/cwd named.
+  **The exec contract** — what the template must satisfy for Hermes to be able to use the pod: a container named `terminal.kubernetes.container_name` running something long-lived (`sleep infinity`), with a writable `terminal.kubernetes.mount_path` (the session cwd), a writable `/tmp`, **a PID 1 that reaps orphans** (`shareProcessNamespace: true`, or an init as the container command — otherwise background commands zombify and completion is never detected), and the `app.kubernetes.io/managed-by: hermes-agent` label in `podTemplate.metadata` if you use `networkpolicy.yaml`. `hermes doctor` verifies the pool exists and reports ready capacity, and dry-runs the claim; a template that breaks the contract fails visibly at the first session with the container/cwd named.
+
+### Choosing a provisioner
+
+**Use `provisioner: pod` when:** you are on OpenShift with `restricted-v2` (or any cluster without an agent-sandbox install), you want the pod shape and resource limits to live in your Hermes config, and a normal image pull's worth of session-start latency is acceptable. This is the default and the better-tested path.
+
+**Use `provisioner: sandbox` when:** you run a slow-boot runtime (kata) and want the warm pool to absorb the cold start, you have a cluster admin who owns the `SandboxTemplate` and keeps it in sync with the exec contract above, and you want the agent ServiceAccount to have no pod-authoring surface at all.
+
+Sandbox-path sizing and policy facts the manifests cannot check for you:
+
+1. **Pool sizing is a ceiling on creations, not concurrent sessions.** A checked-out sandbox is never returned to the pool, and Hermes creates a claim on every environment (re-)creation — including after `terminal.lifetime_seconds` (default **300 s**) of tool inactivity. Size `spec.replicas` for creation rate × provisioning time, and raise `lifetime_seconds` (e.g. to match `active_deadline_seconds`) so an idle user does not burn a slot every five minutes.
+2. **Exhausted pool = cold start.** The claim then boots a fresh sandbox from the template; under kata that easily exceeds the 120 s `ready_timeout_seconds` default, so raise it. A binding that times out leaves the claim in place on purpose — the next attempt adopts it and resumes the same boot rather than restarting it.
+3. **The ValidatingAdmissionPolicy is not inert on this path.** If the namespace is labeled for enforcement, the policy adjudicates warm-pool and cold-start pods too (they carry the same `managed-by` label from your template). Your `SandboxTemplate` must satisfy the same floors, or the pool never fills and claims time out blaming `replicas` — see the policy header.
 
 ## Pod shape
 
@@ -185,7 +207,14 @@ Hermes validates **nothing** about the config in-process, on purpose — the onl
 
 ## Workspaces are stateless
 
-The workspace is an `emptyDir` that dies with the session pod — there is deliberately no persistence surface (no PVCs, no `persistentvolumeclaims` RBAC, nothing for a reaper to reap). A vanished pod (deadline, eviction, operator TTL) is re-provisioned empty and Hermes re-syncs skills and credential files into it automatically.
+The workspace is an `emptyDir` that dies with the session pod — there is deliberately no persistence surface (no PVCs, no `persistentvolumeclaims` RBAC, nothing for a reaper to reap). A dead pod (deadline, eviction, OOMKill) is deleted and re-provisioned empty on the next command, Hermes re-syncs skills and credential files into it automatically, and the first tool result after the reset says so to the model.
+
+Two lifetime knobs bound every session pod, and both are worth setting deliberately:
+
+* **`terminal.lifetime_seconds` (default 300)** — the shared idle reaper destroys the environment (pod or claim) after this much tool-call inactivity. This backend has no persist exemption, so 300 s of idleness costs the workspace; raise it (e.g. to match `active_deadline_seconds`) if you want session-length workspaces, and size warm pools with it in mind.
+* **`terminal.kubernetes.active_deadline_seconds` (default 14400)** — the hard per-pod ceiling (`activeDeadlineSeconds` / the claim's `shutdownTime`).
+
+The emptyDir is unbounded by default: set an `ephemeral-storage` request/limit on the `workspace` container (three lines via the containers-merge-by-name rule, or in the SandboxTemplate) so a runaway download hits a clean limit instead of node-pressure eviction.
 
 ## The approval-prompt skip is declared, not inferred
 

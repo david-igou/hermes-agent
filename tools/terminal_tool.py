@@ -1268,10 +1268,24 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         - docker_image: str -- Docker image name
         - cwd: str -- Working directory inside the sandbox
 
+    NOT supported: ``kubernetes_image``. The kubernetes backend's image is
+    authored in terminal.kubernetes.pod_template (provisioner: pod) or the
+    cluster's SandboxTemplate (provisioner: sandbox); accepting the key and
+    ignoring it would make an RL/benchmark sweep silently evaluate every
+    rollout against the wrong image, so it fails loudly here instead.
+
     Args:
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
+    if "kubernetes_image" in overrides:
+        raise ValueError(
+            "kubernetes backend: per-task images are not supported — the "
+            "session image is authored in terminal.kubernetes.pod_template "
+            "(provisioner: pod) or the cluster's SandboxTemplate "
+            "(provisioner: sandbox). Remove kubernetes_image from the task "
+            "env overrides."
+        )
     _task_env_overrides[task_id] = overrides
 
     # If a live environment already exists for this task, a freshly registered

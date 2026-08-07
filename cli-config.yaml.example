@@ -382,7 +382,15 @@ terminal:
 #   backend: "kubernetes"
 #   cwd: "/workspace"              # should match kubernetes.mount_path
 #   timeout: 180
-#   lifetime_seconds: 300
+#   lifetime_seconds: 14400        # IDLE REAPER: the session pod/claim is
+#                                  # destroyed after this much tool-call
+#                                  # inactivity, and this backend has NO
+#                                  # persist exemption — at the shared default
+#                                  # (300) an idle user loses the workspace
+#                                  # every five minutes (and, on sandbox,
+#                                  # burns a warm-pool slot each time). Match
+#                                  # it to active_deadline_seconds for
+#                                  # session-length workspaces.
 #   kubernetes:
 #     provisioner: "pod"           # pod | sandbox (see above)
 #     namespace: ""                # "" -> the in-cluster ServiceAccount namespace
@@ -449,7 +457,10 @@ terminal:
 #             image: "nikolaik/python-nodejs:python3.11-nodejs20"
 #             resources:
 #               requests: {cpu: "500m", memory: "2Gi"}
-#               limits:   {cpu: "2",    memory: "4Gi"}
+#               limits:   {cpu: "2",    memory: "4Gi",
+#                          ephemeral-storage: "8Gi"}   # bound the emptyDir
+#                                                      # workspace — unbounded
+#                                                      # by default
 #
 # Same isolation via an admin-owned warm pool (provisioner: sandbox):
 # terminal:

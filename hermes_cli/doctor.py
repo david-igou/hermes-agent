@@ -308,6 +308,8 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
 
         checks = [
             (EXTENSIONS_API_GROUP, "sandboxclaims", "create"),
+            # `get` is polled on every binding wait; `delete` is teardown.
+            (EXTENSIONS_API_GROUP, "sandboxclaims", "get"),
             (EXTENSIONS_API_GROUP, "sandboxclaims", "delete"),
             (SANDBOX_API_GROUP, "sandboxes", "get"),
             ("", "pods", "get"),
@@ -316,6 +318,9 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
     else:
         checks = [
             ("", "pods", "create"),
+            # `get` backs readiness polling, ownership proof on 409 and the
+            # agent's own-pod lookup for the ownerReference.
+            ("", "pods", "get"),
             ("", "pods", "delete"),
             exec_check,
         ]
@@ -450,8 +455,23 @@ def _check_warm_pool(kcfg, namespace, core_api, issues) -> None:
         check_warn("kubernetes warm pool check skipped", f"({exc})")
         return
     replicas = (pool.get("spec") or {}).get("replicas")
-    check_ok("kubernetes warm pool",
-             f"({warm_pool}, replicas: {replicas if replicas is not None else '?'})")
+    # STATUS, not just spec: a pool whose template is rejected at admission
+    # (or whose runtime cannot schedule) shows replicas N / ready 0 forever,
+    # and "the pool exists" would be a false green for that.
+    ready = (pool.get("status") or {}).get("readyReplicas")
+    detail = (
+        f"({warm_pool}, replicas: {replicas if replicas is not None else '?'}, "
+        f"ready: {ready if ready is not None else '?'})"
+    )
+    if replicas and not ready:
+        check_warn(
+            "kubernetes warm pool has no ready sandboxes", detail + " — "
+            "cold start on first claim; if this persists, the SandboxTemplate "
+            "is likely being rejected at admission (check the namespace's "
+            "policies) or its runtime cannot schedule",
+        )
+    else:
+        check_ok("kubernetes warm pool", detail)
 
 
 def _dry_run_sandbox_claim(kcfg, namespace, core_api, issues) -> None:
