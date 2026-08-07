@@ -79,9 +79,21 @@ def _stub_kubernetes(monkeypatch):
         api.api_client = api_client if api_client is not None else _StubApiClient()
         return api
 
+    class _V1Preconditions:
+        def __init__(self, uid=None, resource_version=None):
+            self.uid = uid
+            self.resource_version = resource_version
+
+    class _V1DeleteOptions:
+        def __init__(self, preconditions=None, grace_period_seconds=None, **kw):
+            self.preconditions = preconditions
+            self.grace_period_seconds = grace_period_seconds
+
     k.client.ApiClient = _StubApiClient
     k.client.CoreV1Api = _stub_core_v1_api
     k.client.CustomObjectsApi = MagicMock
+    k.client.V1Preconditions = _V1Preconditions
+    k.client.V1DeleteOptions = _V1DeleteOptions
     k.config.load_incluster_config = lambda: None
     k.config.load_kube_config = lambda **kw: None
     k.stream.stream = MagicMock()
@@ -2275,12 +2287,26 @@ def test_refusing_to_adopt_a_foreign_claim_does_not_delete_it():
 # ---------------------------------------------------------------------------
 
 
-def _failed_pod(name="hermes-ws-abc"):
+def _pod_with(phase="Running", deletion=None, terminated_container=None):
+    statuses = []
+    if terminated_container:
+        statuses.append(SimpleNamespace(
+            name=terminated_container,
+            state=SimpleNamespace(terminated=SimpleNamespace(reason="OOMKilled"),
+                                  waiting=None),
+        ))
     return SimpleNamespace(
-        metadata=SimpleNamespace(name=name, labels={MANAGED_BY: "hermes-agent"},
-                                 owner_references=[SimpleNamespace(uid=OWNER_REF["uid"])]),
+        metadata=SimpleNamespace(
+            name="p", uid="pod-uid",
+            # Ours, so _is_ours passes and the terminal-phase branch is what
+            # decides — the point of these tests.
+            labels={MANAGED_BY: "hermes-agent"},
+            owner_references=[SimpleNamespace(uid=OWNER_REF["uid"])],
+            deletion_timestamp=deletion,
+        ),
         spec=SimpleNamespace(containers=[SimpleNamespace(name="workspace")]),
-        status=SimpleNamespace(phase="Failed", conditions=[], container_statuses=[]),
+        status=SimpleNamespace(phase=phase, conditions=[],
+                               container_statuses=statuses),
     )
 
 
@@ -2288,7 +2314,7 @@ def test_exec_400_against_a_failed_pod_clears_the_ref(monkeypatch):
     from kubernetes.client.exceptions import ApiException
 
     api = MagicMock()
-    api.read_namespaced_pod.return_value = _failed_pod()
+    api.read_namespaced_pod.return_value = _pod_with(phase="Failed")
     completed = _FakeWSClient(
         raise_on_update=ApiException(status=400, reason="Bad Request")
     )
@@ -2330,7 +2356,7 @@ def test_ensure_deletes_and_recreates_its_own_terminal_pod():
         # _is_ours + _pod_is_terminal see the corpse; after deletion the
         # name is free (404) and the recreated pod comes up Running.
         if reads["n"] <= 2:
-            return _failed_pod()
+            return _pod_with(phase="Failed")
         if reads["n"] == 3:
             raise ApiException(status=404)
         return _running_pod()
@@ -2344,19 +2370,37 @@ def test_ensure_deletes_and_recreates_its_own_terminal_pod():
 
 
 def test_execute_surfaces_the_workspace_reset_to_the_model(monkeypatch):
-    """A logger.warning is invisible to the model; the first result after a
-    re-provision must say the workspace is empty (and where cwd went)."""
+    """A logger.warning is invisible to the model; the first MODEL-FACING
+    result after a re-provision must say the workspace is empty (and where
+    cwd went)."""
     from kubernetes.client.exceptions import ApiException
 
     gone = _FakeWSClient(raise_on_update=ApiException(status=404, reason="gone"))
     env = _make_k8s_env(monkeypatch, [("", 0), gone, ("", 0), ("ok\n", 0)])
-    env.execute("ls")                       # kills the ref
-    result = env.execute("echo ok")          # re-provisions
+    env.execute("ls", bounded_capture=True)              # kills the ref
+    result = env.execute("echo ok", bounded_capture=True)  # re-provisions
     assert "re-provisioned" in result["output"]
     assert "/workspace" in result["output"]
     # Once, not forever.
-    follow_up = env.execute("echo again")
+    follow_up = env.execute("echo again", bounded_capture=True)
     assert "re-provisioned" not in follow_up["output"]
+
+
+def test_the_reset_note_never_reaches_internal_readers(monkeypatch):
+    """`execute()` is also the full-fidelity path for `cat` reads feeding the
+    patch engine, `stat` output parsed with int(), `command -v` probes and
+    the code-exec JSON-RPC loop — all of which leave bounded_capture False.
+    Prefixing prose there corrupts data instead of informing anyone."""
+    from kubernetes.client.exceptions import ApiException
+
+    gone = _FakeWSClient(raise_on_update=ApiException(status=404, reason="gone"))
+    env = _make_k8s_env(monkeypatch, [("", 0), gone, ("", 0), ("4096\n", 0)])
+    env.execute("ls", bounded_capture=True)
+    internal = env.execute("stat -c %s /workspace/f")  # bounded_capture unset
+    assert internal["output"] == "4096\n"
+    assert int(internal["output"].strip()) == 4096
+    # The note is still owed to the model, and arrives on its next turn.
+    assert "re-provisioned" in env.execute("echo hi", bounded_capture=True)["output"]
 
 
 def test_cleanup_is_final_for_background_pollers(monkeypatch):
@@ -2515,3 +2559,217 @@ def test_cd_guard_126_hint_names_the_vanished_cwd():
     # redirected away (the common `>/dev/null 2>&1` shape).
     assert "chmod" in (annotate_failure("./script.sh", 126, "permission denied") or "")
     assert "chmod" in (annotate_failure("./script.sh >/dev/null 2>&1", 126, "") or "")
+
+
+# ---------------------------------------------------------------------------
+# Deadness detection covers every shape that leaves the pod PRESENT
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pod, dead", [
+    (_pod_with(), False),
+    (_pod_with(phase="Failed"), True),
+    (_pod_with(phase="Succeeded"), True),
+    # Phase only turns terminal once EVERY container exits, so a sidecar keeps
+    # a pod Running while the container we exec into is gone.
+    (_pod_with(terminated_container="workspace"), True),
+    # A sidecar dying is not our problem.
+    (_pod_with(terminated_container="istio-proxy"), False),
+    # Stuck Terminating (node loss / finalizer): phase stays Running forever.
+    (_pod_with(deletion="2026-08-07T00:00:00Z"), True),
+])
+def test_pod_cannot_exec_covers_present_but_dead_shapes(pod, dead):
+    from tools.environments.kubernetes import pod_cannot_exec
+
+    assert pod_cannot_exec(pod, "workspace") is dead
+
+
+def test_exec_error_on_a_dead_exec_container_clears_the_ref(monkeypatch):
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _pod_with(
+        terminated_container="workspace")
+    broken = _FakeWSClient(
+        raise_on_update=ApiException(status=400, reason="Bad Request"))
+    env = _make_k8s_env(monkeypatch, [("", 0), broken], api=api)
+    env.execute("ls", bounded_capture=True)
+    assert env._pod_ref is None
+
+
+def test_terminal_pod_delete_carries_a_uid_precondition():
+    """Session pod names are deterministic, so a delete racing a concurrent
+    re-provision would otherwise remove the REPLACEMENT."""
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    api.create_namespaced_pod.side_effect = [ApiException(status=409), None]
+    reads = {"n": 0}
+
+    def _read(**kwargs):
+        reads["n"] += 1
+        if reads["n"] <= 2:
+            return _pod_with(phase="Failed")
+        if reads["n"] == 3:
+            raise ApiException(status=404)
+        return _running_pod()
+
+    api.read_namespaced_pod.side_effect = _read
+    p = _provisioner_with_api(api)
+    p.ensure("abc")
+    body = api.delete_namespaced_pod.call_args.kwargs.get("body")
+    assert body is not None, "delete must carry preconditions"
+    assert getattr(body.preconditions, "uid", None) == "pod-uid"
+
+
+def test_a_replaced_pod_is_not_deleted_out_from_under_the_replacement(caplog):
+    """409 on delete = the name now belongs to a different object. That is the
+    precondition doing its job, not an error."""
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    api.delete_namespaced_pod.side_effect = ApiException(status=409)
+    p = _provisioner_with_api(api)
+    with caplog.at_level("WARNING"):
+        p._delete_pod("hermes", "hermes-ws-abc", uid="stale-uid")
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_concurrent_re_provision_creates_one_pod(monkeypatch):
+    """Up to 8 tool workers share one environment; with the ref check and the
+    (now destructive) create unlocked, two workers each deleted the dead pod
+    and then the other's fresh replacement."""
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    with env._lock:
+        env._pod_ref = None
+
+    calls = {"n": 0}
+
+    def _slow_ensure(task_id):
+        calls["n"] += 1
+        time.sleep(0.2)
+        return PodRef("hermes", "hermes-ws-abc", "workspace")
+
+    env._provisioner.ensure.side_effect = _slow_ensure
+    threads = [threading.Thread(target=env._ensure_pod) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert calls["n"] == 1, "each worker provisioned its own session pod"
+
+
+def test_cleanup_during_provisioning_destroys_the_new_pod(monkeypatch):
+    """cleanup() returns early when _pod_ref is None — exactly the state a
+    re-provision is in — so the in-flight object must be destroyed by the
+    provisioner itself or nothing ever will."""
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+    with env._lock:
+        env._pod_ref = None
+
+    def _ensure_then_teardown(task_id):
+        env.cleanup()  # races in while we "provision"
+        return PodRef("hermes", "hermes-ws-abc", "workspace")
+
+    env._provisioner.ensure.side_effect = _ensure_then_teardown
+    env._provisioner.destroy.reset_mock()
+    with pytest.raises(RuntimeError, match="cleaned up while provisioning"):
+        env._ensure_pod()
+    env._provisioner.destroy.assert_called_once()
+
+
+def test_claim_delete_carries_a_uid_precondition():
+    custom = _claim_custom_api(
+        claim={"metadata": {"uid": "claim-uid"}, **_bound_claim()})
+    p = _sandbox_provisioner(api=MagicMock(), custom=custom)
+    p._delete_claim_and_wait("hermes-ws-abc", timeout=0)
+    body = custom.delete_namespaced_custom_object.call_args.kwargs.get("body")
+    assert body == {"preconditions": {"uid": "claim-uid"}}
+
+
+# ---------------------------------------------------------------------------
+# Client resilience: timeouts, transient retries, 401 refresh
+# ---------------------------------------------------------------------------
+
+
+def test_api_calls_carry_a_request_timeout():
+    """Unset, urllib3 builds no Timeout at all, so a blackholed apiserver
+    pins the calling thread forever and ready_timeout_seconds — checked only
+    BETWEEN polls — can never expire."""
+    from tools.environments.kubernetes import API_TIMEOUT, api_call
+
+    seen = {}
+    api_call(lambda **kw: seen.update(kw), namespace="hermes")
+    assert seen["_request_timeout"] == API_TIMEOUT
+
+
+@pytest.mark.parametrize("status, attempts", [
+    (503, 2),   # control-plane rollout: retried
+    (429, 2),   # priority-and-fairness shedding: retried
+    (403, 1),   # RBAC: our request is wrong, retrying repeats the mistake
+    (404, 1),
+])
+def test_transient_statuses_retry_and_terminal_ones_do_not(monkeypatch, status,
+                                                           attempts):
+    from kubernetes.client.exceptions import ApiException
+    from tools.environments.kubernetes import api_call
+
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def _flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise ApiException(status=status)
+        return "ok"
+
+    if attempts == 1:
+        with pytest.raises(ApiException):
+            api_call(_flaky)
+    else:
+        assert api_call(_flaky) == "ok"
+    assert calls["n"] == attempts
+
+
+def test_a_401_reloads_credentials_once_then_surfaces(monkeypatch):
+    """A long-lived agent outlives its projected token; nothing retried the
+    call that raced the rotation."""
+    from kubernetes.client.exceptions import ApiException
+    import tools.environments.kubernetes as k8s_mod
+
+    reloads = {"n": 0}
+    monkeypatch.setattr(k8s_mod, "_reload_kubernetes_auth",
+                        lambda: reloads.__setitem__("n", reloads["n"] + 1))
+    calls = {"n": 0}
+
+    def _expired(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ApiException(status=401)
+        return "ok"
+
+    assert k8s_mod.api_call(_expired) == "ok"
+    assert reloads["n"] == 1
+
+    # A persistent 401 is surfaced, not retried forever.
+    def _always(**kwargs):
+        raise ApiException(status=401)
+
+    with pytest.raises(ApiException):
+        k8s_mod.api_call(_always)
+
+
+def test_stdin_upload_bounds_the_write_phase(monkeypatch, tmp_path):
+    """The deadline used to be established AFTER the write loop, so the phase
+    most likely to block (a remote tar that stopped draining) was unbounded."""
+    monkeypatch.setattr("tools.environments.base.is_interrupted", lambda: False)
+    env = _make_k8s_env(monkeypatch, [("", 0)])
+
+    class _WedgedStdin(_FakeWSClient):
+        def write_stdin(self, data):
+            time.sleep(0.2)   # never drains
+
+    monkeypatch.setattr("kubernetes.stream.stream",
+                        lambda *a, **kw: _WedgedStdin(open_cycles=10_000))
+    with pytest.raises(TimeoutError):
+        env._stdin_upload("x" * (64 * 1024 * 6), timeout=1)

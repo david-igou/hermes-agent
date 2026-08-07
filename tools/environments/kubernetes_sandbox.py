@@ -58,6 +58,7 @@ from tools.environments.kubernetes import (
     _BaseProvisioner,
     _dig_dict,
     _mapping,
+    api_call,
 )
 
 logger = logging.getLogger(__name__)
@@ -160,13 +161,15 @@ class SandboxClaimProvisioner(_BaseProvisioner):
 
     # -- API helpers ----------------------------------------------------
     def _get_claim(self, name: str) -> dict:
-        return self._custom.get_namespaced_custom_object(
+        return api_call(
+            self._custom.get_namespaced_custom_object,
             group=EXTENSIONS_API_GROUP, version=SANDBOX_API_VERSION,
             namespace=self.namespace, plural="sandboxclaims", name=name,
         )
 
     def _get_sandbox(self, name: str) -> dict:
-        return self._custom.get_namespaced_custom_object(
+        return api_call(
+            self._custom.get_namespaced_custom_object,
             group=SANDBOX_API_GROUP, version=SANDBOX_API_VERSION,
             namespace=self.namespace, plural="sandboxes", name=name,
         )
@@ -176,7 +179,8 @@ class SandboxClaimProvisioner(_BaseProvisioner):
         from kubernetes.client.exceptions import ApiException
 
         try:
-            self._custom.create_namespaced_custom_object(
+            api_call(
+                self._custom.create_namespaced_custom_object,
                 group=EXTENSIONS_API_GROUP, version=SANDBOX_API_VERSION,
                 namespace=self.namespace, plural="sandboxclaims", body=body,
                 **STRICT_FIELD_VALIDATION,
@@ -338,17 +342,35 @@ class SandboxClaimProvisioner(_BaseProvisioner):
         )
 
     def _delete_claim_and_wait(self, name: str, timeout: int = 30) -> None:
-        """Delete a claim and block until the name is free for re-creation."""
+        """Delete a claim and block until the name is free for re-creation.
+
+        Guarded by a uid precondition: claim names are deterministic, so a
+        delete racing a concurrent re-provision would otherwise remove the
+        REPLACEMENT claim (and burn a second warm-pool checkout).
+        """
         import time
 
         from kubernetes.client.exceptions import ApiException
 
         try:
-            self._custom.delete_namespaced_custom_object(
+            uid = _dig_dict(self._get_claim(name), "metadata").get("uid")
+        except Exception:
+            uid = None
+        body = {"preconditions": {"uid": uid}} if uid else None
+        try:
+            api_call(
+                self._custom.delete_namespaced_custom_object,
                 group=EXTENSIONS_API_GROUP, version=SANDBOX_API_VERSION,
                 namespace=self.namespace, plural="sandboxclaims", name=name,
+                **({"body": body} if body else {}),
             )
         except ApiException as exc:
+            if exc.status == 409:
+                logger.info(
+                    "k8s: sandboxclaim %s was replaced before our delete "
+                    "landed; leaving the new one alone.", name,
+                )
+                return
             if exc.status != 404:
                 raise
         deadline = time.monotonic() + timeout
@@ -360,6 +382,12 @@ class SandboxClaimProvisioner(_BaseProvisioner):
                     return
                 raise
             time.sleep(0.5)
+        # Not fatal — the create below will 409 and be handled — but silence
+        # here reappears later as a confusing "already exists" or "is dead".
+        logger.warning(
+            "k8s: sandboxclaim %s still present %ss after delete; proceeding.",
+            name, timeout,
+        )
 
     # -- WorkspaceProvisioner ------------------------------------------
     def ensure(self, task_id: str) -> PodRef:
@@ -418,7 +446,8 @@ class SandboxClaimProvisioner(_BaseProvisioner):
             )
         for name in names:
             try:
-                self._custom.delete_namespaced_custom_object(
+                api_call(
+                    self._custom.delete_namespaced_custom_object,
                     group=EXTENSIONS_API_GROUP, version=SANDBOX_API_VERSION,
                     namespace=self.namespace, plural="sandboxclaims", name=name,
                 )

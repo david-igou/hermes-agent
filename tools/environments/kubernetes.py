@@ -184,6 +184,113 @@ SESSION_SERVICE_ACCOUNT = "hermes-session-noperms"
 # schema — reports the exact JSON path Hermes could only have guessed at.
 STRICT_FIELD_VALIDATION: dict[str, str] = {"field_validation": "Strict"}
 
+# Socket-level ceiling on every API call this backend issues. The python
+# client leaves `_request_timeout` unset by default, which means urllib3
+# builds no Timeout at all and a blackholed apiserver (dropped SYN/ACK on a
+# rolling control plane, a wedged LB) pins the calling thread forever —
+# `ready_timeout_seconds` cannot expire, because the deadline is only checked
+# BETWEEN polls. Tuple is (connect, read).
+API_TIMEOUT: tuple[float, float] = (5.0, 30.0)
+# Transient statuses worth retrying, mirroring the taxonomy the repo already
+# uses for HTTP APIs (tools/microsoft_graph_client.py). 429 = apiserver
+# priority-and-fairness shedding load; 5xx = an apiserver/etcd hiccup or a
+# rolling control plane. Never 4xx-other: those are our request being wrong,
+# and retrying them just repeats the mistake.
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_RETRY_ATTEMPTS = 4
+
+
+def _retry_after_seconds(exc: Any, attempt: int) -> float:
+    """Honour the apiserver's Retry-After, else exponential backoff."""
+    headers = getattr(exc, "headers", None)
+    if headers is not None:
+        try:
+            raw = headers.get("Retry-After")
+            if raw is not None:
+                return max(0.0, min(30.0, float(raw)))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return min(8.0, 0.5 * (2 ** attempt))
+
+
+def _reload_kubernetes_auth() -> None:
+    """Re-read in-cluster credentials after a 401.
+
+    Only meaningful in-cluster, where the kubelet rotates the projected
+    ServiceAccount token on disk; out-of-cluster the kubeconfig's own exec/
+    refresh plugins already handle expiry, and reloading would clobber an
+    explicitly selected context.
+    """
+    if not in_cluster():
+        return
+    from kubernetes import config as k8s_config
+
+    k8s_config.load_incluster_config()
+
+
+def api_call(fn, *args, **kwargs):
+    """Invoke a kubernetes client method with a timeout and transient retries.
+
+    Every non-exec call this backend makes goes through here. Two things the
+    client does not do for you:
+
+    * ``_request_timeout`` — unset by default (see :data:`API_TIMEOUT`);
+    * retries — ``Configuration.retries`` is None, so urllib3 does not retry
+      either, and a single 503 during a control-plane rollout would abort a
+      session start (and, worse, trip the cleanup path that deletes the pod
+      it had just created).
+
+    Exec is deliberately NOT routed through here: it owns its own deadline
+    and cancellation semantics, and a retried exec would re-run a command.
+    """
+    import time as _time
+
+    from kubernetes.client.exceptions import ApiException
+
+    kwargs.setdefault("_request_timeout", API_TIMEOUT)
+    last: Exception
+    refreshed = False
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            return fn(*args, **kwargs)
+        except ApiException as exc:
+            if exc.status == 401 and not refreshed:
+                # The in-cluster loader installs a hook that re-reads the
+                # projected token, but nothing RETRIES the call that raced
+                # its rotation — and a long-lived agent outlives any token.
+                # One reload, one retry, then surface it. 403 is deliberately
+                # NOT retried: that is RBAC, and the message we already raise
+                # names the missing verb better than a retry ever could.
+                refreshed = True
+                logger.info("k8s: got 401; reloading credentials and retrying")
+                try:
+                    _reload_kubernetes_auth()
+                except Exception as reload_exc:
+                    logger.debug("k8s: credential reload failed: %s", reload_exc)
+                    raise
+                continue
+            if exc.status not in _RETRY_STATUSES:
+                raise
+            last = exc
+        except TypeError:
+            # Mocked/older client without _request_timeout: call it plainly
+            # rather than failing, but do not silently drop the timeout for
+            # real clients — only this one call loses it.
+            kwargs.pop("_request_timeout", None)
+            return fn(*args, **kwargs)
+        except (OSError, ConnectionError) as exc:
+            # Connection reset / DNS blip / apiserver LB failover.
+            last = exc
+        if attempt < _RETRY_ATTEMPTS - 1:
+            delay = _retry_after_seconds(last, attempt)
+            logger.info(
+                "k8s: retrying %s after transient error (%s); attempt %d/%d "
+                "in %.1fs", getattr(fn, "__name__", fn), last, attempt + 2,
+                _RETRY_ATTEMPTS, delay,
+            )
+            _time.sleep(delay)
+    raise last
+
 
 def _deep_merge(base: dict, overlay: Any) -> dict:
     """Recursively merge *overlay* onto a copy of *base* (lists replace)."""
@@ -273,6 +380,37 @@ def merge_pod_template(base: dict, overlay: Any, _path: tuple = ()) -> dict:
         else:
             out[key] = deepcopy(value)
     return out
+
+
+def pod_cannot_exec(pod: Any, exec_container: str) -> bool:
+    """True when *pod* exists but can never serve another exec.
+
+    Three shapes, all of which leave the object PRESENT (so a 404-only or
+    phase-only check misses them) while `connect_get_namespaced_pod_exec`
+    starts returning 400/500 forever:
+
+    * **phase Failed/Succeeded** — activeDeadlineSeconds, eviction, or the
+      last container exiting under ``restartPolicy: Never``;
+    * **the exec container terminated inside a still-Running pod** — the
+      phase only turns terminal once EVERY regular container has exited, so
+      a pod with a sidecar (operator-merged, or from a SandboxTemplate)
+      stays Running while the container we exec into is gone;
+    * **deletionTimestamp set** — a pod stuck Terminating (node loss, a
+      finalizer) reports phase Running indefinitely.
+    """
+    status = getattr(pod, "status", None)
+    if getattr(status, "phase", "") in ("Failed", "Succeeded"):
+        return True
+    metadata = getattr(pod, "metadata", None)
+    if getattr(metadata, "deletion_timestamp", None) is not None:
+        return True
+    for entry in (getattr(status, "container_statuses", None) or []):
+        if getattr(entry, "name", None) != exec_container:
+            continue
+        state = getattr(entry, "state", None)
+        if getattr(state, "terminated", None) is not None:
+            return True
+    return False
 
 
 def _dig_dict(obj: Any, *path: str) -> dict:
@@ -473,8 +611,9 @@ def resolve_owner_reference(core_api, namespace: str, kcfg: dict) -> Optional[di
         if not in_cluster() or core_api is None:
             return None
         try:
-            pod = core_api.read_namespaced_pod(
-                name=socket.gethostname(), namespace=namespace
+            pod = api_call(
+                core_api.read_namespaced_pod,
+                name=socket.gethostname(), namespace=namespace,
             )
             name = getattr(pod.metadata, "name", "") or ""
             uid = getattr(pod.metadata, "uid", "") or ""
@@ -796,8 +935,9 @@ class _BaseProvisioner(WorkspaceProvisioner):
         last_detail = ""
         while time.monotonic() < deadline:
             try:
-                pod = self._api.read_namespaced_pod(
-                    name=pod_name, namespace=self.namespace
+                pod = api_call(
+                    self._api.read_namespaced_pod,
+                    name=pod_name, namespace=self.namespace,
                 )
             except ApiException as exc:
                 if exc.status != 404:
@@ -833,44 +973,66 @@ class _BaseProvisioner(WorkspaceProvisioner):
             "image pull or a kata/sandboxed runtime."
         )
 
-    def _delete_pod(self, namespace: str, pod_name: str) -> None:
+    def _delete_pod(self, namespace: str, pod_name: str, uid: str = "") -> None:
+        """Delete a session pod, optionally only if it is still the same object.
+
+        *uid* becomes a delete precondition: session pod names are
+        deterministic, so without it a delete racing a re-provision can
+        remove the REPLACEMENT pod that now holds the same name.
+        """
         from kubernetes.client.exceptions import ApiException
 
+        kwargs: dict[str, Any] = {"grace_period_seconds": 0}
+        if uid:
+            from kubernetes import client as k8s_client
+
+            kwargs["body"] = k8s_client.V1DeleteOptions(
+                preconditions=k8s_client.V1Preconditions(uid=uid),
+                grace_period_seconds=0,
+            )
         try:
-            self._api.delete_namespaced_pod(
-                name=pod_name, namespace=namespace, grace_period_seconds=0
+            api_call(
+                self._api.delete_namespaced_pod,
+                name=pod_name, namespace=namespace, **kwargs
             )
         except TypeError:
-            # Older/mocked clients without the kwarg.
+            # Older/mocked clients without the kwargs.
             try:
                 self._api.delete_namespaced_pod(name=pod_name, namespace=namespace)
             except ApiException as exc:
                 if exc.status != 404:
                     logger.warning("k8s: failed to delete pod %s: %s", pod_name, exc)
         except ApiException as exc:
-            if exc.status != 404:
+            if exc.status == 409:
+                # Precondition failed: the name now belongs to a different
+                # object. Not ours to delete — that is the point.
+                logger.info(
+                    "k8s: pod %s was replaced before our delete landed; "
+                    "leaving the new one alone.", pod_name,
+                )
+            elif exc.status != 404:
                 logger.warning("k8s: failed to delete pod %s: %s", pod_name, exc)
 
-    def _pod_is_terminal(self, pod_name: str) -> bool:
-        """True when the pod exists but can never serve exec again.
+    def _terminal_pod_uid(self, pod_name: str) -> str:
+        """The uid of *pod_name* when it exists but can never serve exec again.
 
-        activeDeadlineSeconds, node-pressure eviction and an OOMKill under
-        ``restartPolicy: Never`` all leave the pod in phase Failed but still
-        PRESENT — Kubernetes does not delete it.
+        Returns "" when the pod is usable, missing or unreadable. The uid is
+        what makes the follow-up delete precise (see :meth:`_delete_pod`).
         """
         from kubernetes.client.exceptions import ApiException
 
         try:
-            pod = self._api.read_namespaced_pod(
-                name=pod_name, namespace=self.namespace
+            pod = api_call(
+                self._api.read_namespaced_pod,
+                name=pod_name, namespace=self.namespace,
             )
         except ApiException:
-            return False
+            return ""
         except Exception:
-            return False
-        return getattr(getattr(pod, "status", None), "phase", "") in (
-            "Failed", "Succeeded",
-        )
+            return ""
+        if not pod_cannot_exec(pod, self.container_name()):
+            return ""
+        return str(getattr(getattr(pod, "metadata", None), "uid", "") or "")
 
     def _wait_pod_gone(self, pod_name: str, timeout: int = 30) -> None:
         """Block until a deleted pod's name is free for re-creation."""
@@ -879,8 +1041,9 @@ class _BaseProvisioner(WorkspaceProvisioner):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                self._api.read_namespaced_pod(
-                    name=pod_name, namespace=self.namespace
+                api_call(
+                    self._api.read_namespaced_pod,
+                    name=pod_name, namespace=self.namespace,
                 )
             except ApiException as exc:
                 if exc.status == 404:
@@ -932,8 +1095,9 @@ class PodProvisioner(_BaseProvisioner):
         from kubernetes.client.exceptions import ApiException
 
         try:
-            pod = self._api.read_namespaced_pod(
-                name=pod_name, namespace=self.namespace
+            pod = api_call(
+                self._api.read_namespaced_pod,
+                name=pod_name, namespace=self.namespace,
             )
         except ApiException as exc:
             if getattr(exc, "status", None) == 404:
@@ -966,7 +1130,8 @@ class PodProvisioner(_BaseProvisioner):
         pod_name = self.workspace_name(task_id)
         for attempt in (1, 2):
             try:
-                self._api.create_namespaced_pod(
+                api_call(
+                    self._api.create_namespaced_pod,
                     namespace=self.namespace,
                     body=self.pod_manifest(task_id),
                     **STRICT_FIELD_VALIDATION,
@@ -985,12 +1150,13 @@ class PodProvisioner(_BaseProvisioner):
                 # restartPolicy: Never leave it in phase Failed, PRESENT).
                 # Handing it to wait_pod_ready would raise immediately, so
                 # delete the corpse and recreate under the same name.
-                if attempt == 1 and self._pod_is_terminal(pod_name):
+                dead_uid = self._terminal_pod_uid(pod_name) if attempt == 1 else ""
+                if dead_uid:
                     logger.warning(
-                        "k8s: session pod %s is in a terminal phase; deleting "
-                        "and re-provisioning.", pod_name,
+                        "k8s: session pod %s can no longer serve exec; "
+                        "deleting and re-provisioning.", pod_name,
                     )
-                    self._delete_pod(self.namespace, pod_name)
+                    self._delete_pod(self.namespace, pod_name, uid=dead_uid)
                     self._wait_pod_gone(pod_name)
                     continue
             break
@@ -1067,6 +1233,10 @@ class KubernetesEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._exec_api = api  # configured CoreV1Api; falls back to a fresh one
         self._lock = threading.Lock()
+        # Held across a whole re-provision (see _ensure_pod). Distinct from
+        # _lock, which guards field access only and must never be held over
+        # an API call.
+        self._provision_lock = threading.Lock()
         self._sync_manager = None
         # Captured once: the agent may `cd` away, but the synced ~/.hermes tree
         # must stay where the first sync put it.
@@ -1134,21 +1304,44 @@ class KubernetesEnvironment(BaseEnvironment):
         session: every later exec fails and the agent sees empty output with
         rc=1 until the idle reaper evicts the environment.
         """
-        with self._lock:
-            if self._torn_down:
-                raise RuntimeError(
-                    "kubernetes environment has been cleaned up; refusing to "
-                    "provision a new session pod for it"
+        # Serialise the whole re-provision, not just the ref check. Up to 8
+        # tool workers share one environment; with the check and the create
+        # unlocked, two of them each delete the dead pod (the recovery path
+        # is destructive now) and then delete the OTHER's fresh replacement.
+        # On the claim path that also burns a second warm-pool checkout.
+        with self._provision_lock:
+            with self._lock:
+                if self._torn_down:
+                    raise RuntimeError(
+                        "kubernetes environment has been cleaned up; refusing "
+                        "to provision a new session pod for it"
+                    )
+                if self._pod_ref is not None:
+                    return self._pod_ref
+            logger.warning(
+                "k8s: session pod for task %s is gone; provisioning a new one "
+                "— the workspace starts empty again.", self._task_id,
+            )
+            pod_ref = self._provisioner.ensure(task_id=self._task_id)
+            with self._lock:
+                torn_down = self._torn_down
+                if not torn_down:
+                    self._pod_ref = pod_ref
+            if torn_down:
+                # cleanup() ran while we were provisioning. It saw _pod_ref
+                # None and returned early, so this object is ours to destroy
+                # here or nothing ever will.
+                logger.warning(
+                    "k8s: environment was cleaned up mid-provision; "
+                    "destroying the session pod it created.",
                 )
-            if self._pod_ref is not None:
-                return self._pod_ref
-        logger.warning(
-            "k8s: session pod for task %s is gone; provisioning a new one — "
-            "the workspace starts empty again.", self._task_id,
-        )
-        pod_ref = self._provisioner.ensure(task_id=self._task_id)
-        with self._lock:
-            self._pod_ref = pod_ref
+                try:
+                    self._provisioner.destroy(pod_ref)
+                except Exception as exc:
+                    logger.warning("k8s: mid-provision cleanup failed: %s", exc)
+                raise RuntimeError(
+                    "kubernetes environment was cleaned up while provisioning"
+                )
         # The tracked cwd pointed inside the old pod's workspace; a fresh
         # emptyDir has only the mount root.
         self.cwd = self._initial_cwd
@@ -1168,9 +1361,18 @@ class KubernetesEnvironment(BaseEnvironment):
 
     def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
         result = super().execute(command, cwd, **kwargs)
-        if self._reset_note_pending:
-            # Once, on the first result after a re-provision: the model (not
-            # the operator log) is who has to react to a vanished workspace.
+        # ONLY on the model-facing foreground path. `bounded_capture` is set
+        # by exactly one caller (tools/terminal_tool.py) and left False by
+        # every internal full-fidelity consumer — `cat` reads that feed the
+        # patch engine, `stat` output parsed with int(), `command -v` probes,
+        # the code-execution JSON-RPC loop. Prefixing prose onto those
+        # corrupts data rather than informing anyone: it made file_size parse
+        # as 0, cached _has_command False for the process, and broke
+        # json.loads. The note is for the model, so it rides the model's path.
+        if self._reset_note_pending and kwargs.get("bounded_capture"):
+            # Once, on the first model-visible result after a re-provision:
+            # the model (not the operator log) is who has to react to a
+            # vanished workspace.
             self._reset_note_pending = False
             note = (
                 "[note: the session workspace was re-provisioned and starts "
@@ -1340,12 +1542,11 @@ class KubernetesEnvironment(BaseEnvironment):
             if ref is None or api is None:
                 return
             try:
-                pod = api.read_namespaced_pod(
-                    name=ref.pod_name, namespace=ref.namespace
+                pod = api_call(
+                    api.read_namespaced_pod,
+                    name=ref.pod_name, namespace=ref.namespace,
                 )
-                dead = getattr(getattr(pod, "status", None), "phase", "") in (
-                    "Failed", "Succeeded",
-                )
+                dead = pod_cannot_exec(pod, ref.container)
             except Exception as read_exc:
                 dead = getattr(read_exc, "status", None) == 404
         if not dead:
@@ -1509,20 +1710,31 @@ class KubernetesEnvironment(BaseEnvironment):
         resp = self._open_stream(["sh", "-c", remote], stdin=True)
         chunks: list[str] = []
         timed_out = False
+        # Established BEFORE the write loop, not after it: writes are the
+        # phase most likely to block (the remote `tar` stops draining, so the
+        # websocket send buffer fills), and a deadline set afterwards cannot
+        # bound the thing that already hung.
+        deadline = time.monotonic() + max(1, timeout)
         try:
             if not encoded.endswith("\n"):
                 encoded += "\n"
             for offset in range(0, len(encoded), _STDIN_CHUNK_BYTES):
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
                 resp.write_stdin(encoded[offset:offset + _STDIN_CHUNK_BYTES])
-            resp.write_stdin(f"{_SYNC_SENTINEL}\n")
+                # Pump the read side so the remote's output cannot backpressure
+                # us into a deadlock while we are still writing.
+                self._drain(resp, chunks)
+            if not timed_out:
+                resp.write_stdin(f"{_SYNC_SENTINEL}\n")
             if getattr(resp, "subprotocol", None) == V5_CHANNEL_PROTOCOL:
                 try:
                     resp.close_channel(STDIN_CHANNEL)
                 except Exception as exc:  # pragma: no cover - defensive
                     logger.debug("k8s: stdin half-close unavailable: %s", exc)
 
-            deadline = time.monotonic() + max(1, timeout)
-            while True:
+            while not timed_out:
                 if not resp.is_open():
                     break
                 if time.monotonic() >= deadline:
