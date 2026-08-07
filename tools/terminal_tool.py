@@ -1127,6 +1127,11 @@ _cleanup_running = False
 _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
 
+# Same shape for the kubernetes backend: sweep once per interpreter, not on
+# every subagent / rollout / parallel terminal() call.
+_k8s_orphan_sweep_ran = False
+_k8s_orphan_sweep_lock = threading.Lock()
+
 
 def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     """Run the docker orphan reaper once per process, if enabled.
@@ -1871,6 +1876,20 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             provisioner = _k8s.PodProvisioner(
                 kcfg, namespace, api=core_api, owner_reference=owner_ref,
             )
+
+        # Once per process, before the first session: reclaim workspaces a
+        # PREVIOUS process of this agent pod left behind (session object
+        # names are process-scoped, so an unclean exit orphans them past any
+        # ownerReference GC). Best effort — never blocks session start.
+        global _k8s_orphan_sweep_ran
+        if not _k8s_orphan_sweep_ran:
+            with _k8s_orphan_sweep_lock:
+                if not _k8s_orphan_sweep_ran:
+                    _k8s_orphan_sweep_ran = True
+                    try:
+                        provisioner.reap_orphans()
+                    except Exception as exc:
+                        logger.debug("k8s orphan sweep failed: %s", exc)
 
         return _k8s.KubernetesEnvironment(
             provisioner=provisioner,

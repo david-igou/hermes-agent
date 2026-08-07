@@ -110,6 +110,13 @@ _EXEC_GRACE_SECONDS = 15
 _SYNC_SENTINEL = "__HERMES_TAR_EOF__"
 _STDIN_CHUNK_BYTES = 64 * 1024
 MANAGED_BY_LABEL = {"app.kubernetes.io/managed-by": "hermes-agent"}
+#: Stamped with :func:`_instance_discriminator` so the startup sweep can tell
+#: THIS process's session objects from a previous process's leftovers. The
+#: discriminator is process-scoped (see that function), which is what makes
+#: two Hermes processes in one agent pod safe — and what makes the sweep
+#: necessary, since an unclean exit leaves objects under a name no future
+#: process will ever compute.
+INSTANCE_LABEL = "hermes.nousresearch.com/instance"
 # Default base image for `provisioner: pod`. Not a config key: override it in
 # pod_template (spec.containers[] merged by name), where every other pod field
 # already lives. `provisioner: sandbox` gets its image from the cluster's
@@ -748,7 +755,7 @@ def _default_base(kcfg: dict) -> dict:
     return {"metadata": {"labels": dict(MANAGED_BY_LABEL)}, "spec": spec}
 
 
-def render_pod_template(kcfg: dict) -> dict:
+def render_pod_template(kcfg: dict, instance: str = "") -> dict:
     """Render THE pod template — the artifact that reaches the API server.
 
     A default base is built from backend state (the workspace volume, the exec
@@ -783,6 +790,8 @@ def render_pod_template(kcfg: dict) -> dict:
         labels = {}
         metadata["labels"] = labels
     labels.update(MANAGED_BY_LABEL)
+    if instance:
+        labels[INSTANCE_LABEL] = instance
     return template
 
 
@@ -845,6 +854,54 @@ class _BaseProvisioner(WorkspaceProvisioner):
         # the same conventional name — so the guard that protected the read side
         # was handing the write side to the same foreign object.
         self._foreign_names: set[str] = set()
+
+    def reap_orphans(self) -> int:
+        """Delete session objects left by a PREVIOUS process of this agent pod.
+
+        The instance discriminator is process-scoped, so an unclean exit
+        (SIGKILL, OOM, crash-loop, watchdog ``os._exit``) leaves a running
+        session pod — possibly a kata VM — under a name no future process
+        computes. The ownerReference does not help: it targets the AGENT
+        POD, which survives an in-pod process restart, so GC never fires and
+        the object lingers until ``active_deadline_seconds``.
+
+        Selects on the managed-by label and skips anything carrying OUR
+        instance label, so a sibling process's live workspace is never
+        touched. Best effort by design: a missing ``list`` grant logs and
+        returns rather than blocking session start.
+        """
+        managed_by = ",".join(f"{k}={v}" for k, v in MANAGED_BY_LABEL.items())
+        try:
+            stale = [
+                name for name, instance in self._list_session_objects(managed_by)
+                # No instance label at all = pre-dates this scheme, or was
+                # created by something else wearing our managed-by label.
+                # Either way it is not ours to reap.
+                if instance and instance != self._instance
+            ]
+        except Exception as exc:
+            logger.info(
+                "k8s: orphan sweep skipped (%s). Grant 'list' on session "
+                "objects to reclaim workspaces left by an unclean restart.",
+                exc,
+            )
+            return 0
+        for name in stale:
+            logger.warning(
+                "k8s: reaping %s left by a previous Hermes process", name,
+            )
+            try:
+                self._reap_session_object(name)
+            except Exception as exc:
+                logger.warning("k8s: could not reap %s: %s", name, exc)
+        return len(stale)
+
+    def _list_session_objects(self, selector: str) -> "list[tuple[str, str]]":
+        """(name, instance-label) for every session object we manage."""
+        raise NotImplementedError
+
+    def _reap_session_object(self, name: str) -> None:
+        raise NotImplementedError
 
     def _refuse(self, name: str, message: str) -> "RuntimeError":
         """Record *name* as not-ours and build the error to raise."""
@@ -1063,7 +1120,7 @@ class PodProvisioner(_BaseProvisioner):
     """
 
     def pod_manifest(self, task_id: str) -> dict:
-        template = render_pod_template(self.kcfg)
+        template = render_pod_template(self.kcfg, self._instance)
         metadata = dict(template["metadata"])
         metadata["name"] = self.workspace_name(task_id)
         metadata["namespace"] = self.namespace
@@ -1079,6 +1136,21 @@ class PodProvisioner(_BaseProvisioner):
             # required") names it better than a KeyError from here would.
             "spec": template.get("spec"),
         }
+
+    def _list_session_objects(self, selector: str) -> "list[tuple[str, str]]":
+        pods = api_call(
+            self._api.list_namespaced_pod,
+            namespace=self.namespace, label_selector=selector,
+        )
+        out = []
+        for pod in (getattr(pods, "items", None) or []):
+            meta = getattr(pod, "metadata", None)
+            labels = getattr(meta, "labels", None) or {}
+            out.append((getattr(meta, "name", ""), labels.get(INSTANCE_LABEL, "")))
+        return [(n, i) for n, i in out if n]
+
+    def _reap_session_object(self, name: str) -> None:
+        self._delete_pod(self.namespace, name)
 
     def _is_ours(self, pod_name: str) -> bool:
         """True when an existing pod was created by THIS agent instance.

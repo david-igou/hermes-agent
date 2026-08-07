@@ -47,13 +47,18 @@ rules:
   # ownerReference that garbage-collects session pods when the agent dies, and
   # reads pod status for readiness diagnostics (ImagePullBackOff,
   # CreateContainerConfigError, SCC denial) and the container list.
-  # No `list`: the pod provisioner only ever addresses pods BY NAME, and
-  # `list pods` would let a compromised agent enumerate every pod in the
-  # namespace (the Hermes pod itself, any co-tenant) — which get-by-name does
-  # not.
+  #
+  # `list` is used ONCE per process, at startup, to reclaim session pods left
+  # by a PREVIOUS Hermes process of this agent pod: their names are
+  # process-scoped, and the ownerReference targets the agent pod — which
+  # survives an in-pod process restart — so nothing else ever collects them.
+  # It is a real widening (a compromised agent can enumerate every pod in the
+  # namespace, including co-tenants), and it is the one grant here you might
+  # reasonably refuse: drop it if you would rather leak a workspace until
+  # active_deadline_seconds. The sweep logs the denial and continues.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "get", "delete"]
+    verbs: ["create", "get", "list", "delete"]
   # Streaming exec into the session pod. `get` is the verb that is actually
   # exercised: the python client upgrades via connect_get_namespaced_pod_exec,
   # a websocket GET, which kube-apiserver authorizes as `get`. `create` is kept
@@ -95,11 +100,14 @@ metadata:
   name: hermes-session-sandbox
   namespace: <AGENT_NAMESPACE>
 rules:
-  # The claim lifecycle. No `watch`/`list`: readiness is polled with
-  # get_namespaced_custom_object, always by name.
+  # The claim lifecycle. No `watch`: readiness is polled with
+  # get_namespaced_custom_object, always by name. `list` is used ONCE per
+  # process, at startup, to reclaim claims left by a previous Hermes process
+  # (see the note in the pod Role above) — and it is far narrower here, since
+  # it enumerates only Hermes' own claims, not every pod in the namespace.
   - apiGroups: ["extensions.agents.x-k8s.io"]
     resources: ["sandboxclaims"]
-    verbs: ["create", "get", "delete"]
+    verbs: ["create", "get", "list", "delete"]
   # Read-only: resolve the bound Sandbox (claim.status.sandbox.name) to its
   # uid and pod name. Never created, never deleted — deleting the claim
   # cascades.

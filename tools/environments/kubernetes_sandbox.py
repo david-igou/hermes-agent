@@ -52,6 +52,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from tools.environments.kubernetes import (
+    INSTANCE_LABEL,
     MANAGED_BY_LABEL,
     STRICT_FIELD_VALIDATION,
     PodRef,
@@ -124,19 +125,21 @@ class SandboxClaimProvisioner(_BaseProvisioner):
             # behind on expiry. A session workspace is disposable.
             "shutdownPolicy": "Delete",
         }
-        deadline = int(self.kcfg.get("active_deadline_seconds") or 0)
-        if deadline > 0:
-            # The claim-path leak backstop, enforced by the claim controller
-            # (activeDeadlineSeconds belongs to the admin's template, not us).
-            expires = datetime.now(timezone.utc) + timedelta(seconds=deadline)
-            lifecycle["shutdownTime"] = (
-                expires.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-            )
+        # ALWAYS emitted, even at active_deadline_seconds: 0. On the pod path
+        # 0 means "no activeDeadlineSeconds", which merely declines a ceiling;
+        # here it would remove the claim's ONLY reaper (nothing else expires a
+        # bound claim), so a crashed process would hold a warm-pool checkout
+        # forever. 0 falls back to the schema default rather than to "never".
+        deadline = int(self.kcfg.get("active_deadline_seconds") or 0) or 14400
+        expires = datetime.now(timezone.utc) + timedelta(seconds=deadline)
+        lifecycle["shutdownTime"] = (
+            expires.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
 
         metadata: dict[str, Any] = {
             "name": self.workspace_name(task_id),
             "namespace": self.namespace,
-            "labels": dict(MANAGED_BY_LABEL),
+            "labels": {**MANAGED_BY_LABEL, INSTANCE_LABEL: self._instance},
         }
         if self._owner_reference is not None:
             # GC chain: agent pod -> claim -> (controller-owned) Sandbox -> pod.
@@ -341,6 +344,25 @@ class SandboxClaimProvisioner(_BaseProvisioner):
             f"(uid {sandbox_uid}); refusing to exec into it."
         )
 
+    def _list_session_objects(self, selector: str) -> "list[tuple[str, str]]":
+        listing = api_call(
+            self._custom.list_namespaced_custom_object,
+            group=EXTENSIONS_API_GROUP, version=SANDBOX_API_VERSION,
+            namespace=self.namespace, plural="sandboxclaims",
+            label_selector=selector,
+        )
+        out = []
+        for item in (listing or {}).get("items", []):
+            meta = _dig_dict(item, "metadata")
+            name = meta.get("name")
+            if name:
+                out.append((name, (meta.get("labels") or {}).get(INSTANCE_LABEL, "")))
+        return out
+
+    def _reap_session_object(self, name: str) -> None:
+        # Deleting the claim cascades to the Sandbox and its pod.
+        self._delete_claim_and_wait(name, timeout=5)
+
     def _delete_claim_and_wait(self, name: str, timeout: int = 30) -> None:
         """Delete a claim and block until the name is free for re-creation.
 
@@ -411,6 +433,11 @@ class SandboxClaimProvisioner(_BaseProvisioner):
                 continue
             break
 
+        # Recorded the moment the claim BINDS: from here on a bound sandbox
+        # is checked out of the pool, so teardown must delete it even if the
+        # pod checks below fail. (Before binding it is deliberately NOT
+        # recorded — see the readiness-timeout note in _wait_claim.)
+        self._created_names.add(name)
         sandbox = self._get_sandbox(sandbox_name)
         pod_name = self._pod_name_from_sandbox(sandbox)
         if not pod_name:
@@ -420,12 +447,6 @@ class SandboxClaimProvisioner(_BaseProvisioner):
             )
         pod = self.wait_pod_ready(pod_name)
         self._assert_pod_belongs(pod, pod_name, sandbox)
-        # Recorded only after a successful bind, ON PURPOSE: a readiness
-        # timeout raises out of ensure(), the environment's teardown then
-        # calls destroy(), and destroying an unbound claim would delete the
-        # very cold start the pool is refilling with (the retry re-adopts it
-        # through the 409 + _assert_ours path instead, which converges).
-        self._created_names.add(name)
         return PodRef(self.namespace, pod_name, self.exec_container(pod))
 
     def destroy(self, pod_ref: PodRef) -> None:

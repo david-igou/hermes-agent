@@ -1169,7 +1169,18 @@ def _probe_remote_backend_sync(env_type: str, cache_key: tuple) -> None:
             "\"$(uname -r 2>/dev/null || echo unknown)\" "
             "\"$HOME\" \"$(pwd)\" \"$(whoami 2>/dev/null || id -un 2>/dev/null || echo unknown)\""
         )
-        result = env.execute(probe_cmd, timeout=4)
+        try:
+            result = env.execute(probe_cmd, timeout=4)
+        finally:
+            # The probe env is never registered in _active_environments, so
+            # cleanup_all_environments() cannot see it. For backends that
+            # provision real infrastructure (a kubernetes session pod, a kata
+            # VM) leaving it to __del__ means a short `hermes -p`/cron run
+            # that exits inside this window orphans it to the deadline.
+            try:
+                env.cleanup()
+            except Exception as cleanup_exc:
+                logger.debug("Backend probe cleanup failed: %s", cleanup_exc)
         if result.get("returncode") != 0:
             logger.debug("Backend probe returned non-zero: %r", result)
             _BACKEND_PROBE_CACHE[cache_key] = ""

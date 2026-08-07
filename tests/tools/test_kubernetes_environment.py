@@ -28,6 +28,7 @@ import pytest
 from tools.environments.kubernetes import (
     DEFAULT_KUBERNETES_CONFIG,
     DEFAULT_SESSION_IMAGE,
+    INSTANCE_LABEL,
     KubernetesEnvironment,
     PodProvisioner,
     PodRef,
@@ -584,13 +585,16 @@ def test_claim_manifest_shape():
     assert "additionalPodMetadata" not in spec
 
 
-def test_claim_carries_the_shutdown_time_backstop():
-    manifest = _sandbox_provisioner(active_deadline_seconds=3600).claim_manifest("abc")
-    shutdown = manifest["spec"]["lifecycle"]["shutdownTime"]
-    assert shutdown.endswith("Z")
-    # 0 omits it, matching activeDeadlineSeconds on the pod path.
-    off = _sandbox_provisioner(active_deadline_seconds=0).claim_manifest("abc")
-    assert "shutdownTime" not in off["spec"]["lifecycle"]
+def test_claim_always_carries_a_shutdown_time_backstop():
+    """Unlike activeDeadlineSeconds on the pod path — where 0 merely declines
+    a ceiling — 0 here would remove the claim's ONLY expiry, so a crashed
+    process would hold a warm-pool checkout forever."""
+    assert _sandbox_provisioner(
+        active_deadline_seconds=3600
+    ).claim_manifest("abc")["spec"]["lifecycle"]["shutdownTime"].endswith("Z")
+    assert _sandbox_provisioner(
+        active_deadline_seconds=0
+    ).claim_manifest("abc")["spec"]["lifecycle"]["shutdownTime"].endswith("Z")
 
 
 def test_claim_manifest_requires_a_warm_pool():
@@ -2773,3 +2777,55 @@ def test_stdin_upload_bounds_the_write_phase(monkeypatch, tmp_path):
                         lambda *a, **kw: _WedgedStdin(open_cycles=10_000))
     with pytest.raises(TimeoutError):
         env._stdin_upload("x" * (64 * 1024 * 6), timeout=1)
+
+
+# ---------------------------------------------------------------------------
+# Startup orphan sweep: process-scoped names have no other reaper
+# ---------------------------------------------------------------------------
+
+
+def _listed_pod(name, instance):
+    return SimpleNamespace(metadata=SimpleNamespace(
+        name=name, labels={MANAGED_BY: "hermes-agent", INSTANCE_LABEL: instance}))
+
+
+def test_sweep_reaps_a_previous_process_but_never_a_sibling():
+    """The ownerReference targets the AGENT POD, which survives an in-pod
+    process restart — so nothing else ever collects these."""
+    api = MagicMock()
+    p = _provisioner_with_api(api)
+    api.list_namespaced_pod.return_value = SimpleNamespace(items=[
+        _listed_pod("hermes-ws-dead-default", "deadbeef"),   # previous process
+        _listed_pod("hermes-ws-mine-default", p._instance),  # ours, live
+        SimpleNamespace(metadata=SimpleNamespace(              # unlabelled
+            name="hermes-ws-legacy", labels={MANAGED_BY: "hermes-agent"})),
+    ])
+    assert p.reap_orphans() == 1
+    deleted = [c.kwargs["name"] for c in api.delete_namespaced_pod.call_args_list]
+    assert deleted == ["hermes-ws-dead-default"]
+
+
+def test_sweep_is_best_effort_when_list_is_denied(caplog):
+    """`list` is the one grant an operator may reasonably refuse; a denial
+    must not block session start."""
+    from kubernetes.client.exceptions import ApiException
+
+    api = MagicMock()
+    api.list_namespaced_pod.side_effect = ApiException(status=403)
+    p = _provisioner_with_api(api)
+    with caplog.at_level("INFO"):
+        assert p.reap_orphans() == 0
+    api.delete_namespaced_pod.assert_not_called()
+
+
+def test_a_bound_claim_is_torn_down_even_if_the_pod_checks_fail():
+    """Once the claim binds, a sandbox is checked out of the pool — teardown
+    must delete it whether or not we got as far as exec-ing."""
+    custom = _claim_custom_api()
+    api = MagicMock()
+    api.read_namespaced_pod.return_value = _running_pod(owners=[])  # not ours
+    p = _sandbox_provisioner(api=api, custom=custom)
+    with pytest.raises(RuntimeError, match="ownerReference"):
+        p.ensure("abc")
+    p.destroy(PodRef("hermes", "sb-1", "workspace"))
+    custom.delete_namespaced_custom_object.assert_called()

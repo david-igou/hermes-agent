@@ -315,6 +315,7 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
             ("", "pods", "get"),
             exec_check,
         ]
+        optional_checks = [(EXTENSIONS_API_GROUP, "sandboxclaims", "list")]
     else:
         checks = [
             ("", "pods", "create"),
@@ -324,6 +325,9 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
             ("", "pods", "delete"),
             exec_check,
         ]
+        # Optional: only the startup orphan sweep needs it, and a denial is
+        # logged rather than fatal — so report it as a warning, not a failure.
+        optional_checks = [("", "pods", "list")]
 
     # Declared, not inferred: Hermes does not grade the pod it renders. What a
     # session pod may be is decided by SCC / Pod Security Admission /
@@ -367,6 +371,28 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
                     label, "(denied)",
                     f"Grant '{verb}' on '{resource}' in {namespace} — see k8s/rbac.yaml",
                     issues,
+                )
+
+        for group, resource, verb in optional_checks:
+            review = k8s_client.V1SelfSubjectAccessReview(
+                spec=k8s_client.V1SelfSubjectAccessReviewSpec(
+                    resource_attributes=k8s_client.V1ResourceAttributes(
+                        namespace=namespace, group=group,
+                        resource=resource, verb=verb,
+                    )
+                )
+            )
+            label = f"RBAC {verb} {resource}" + (f".{group}" if group else "")
+            if getattr(
+                auth.create_self_subject_access_review(
+                    review, **STRICT_FIELD_VALIDATION
+                ).status, "allowed", False,
+            ):
+                check_ok(label, "(startup orphan sweep enabled)")
+            else:
+                check_warn(
+                    label, "(denied — workspaces left by an unclean restart "
+                    "will linger until active_deadline_seconds)",
                 )
 
         if sandbox_mode:
