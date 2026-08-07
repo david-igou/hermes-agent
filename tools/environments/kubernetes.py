@@ -1,67 +1,38 @@
 """Kubernetes session-pod execution environment.
 
-Runs each agent command by exec-ing into a per-session pod in a Kubernetes
-cluster.  Session pods are STATELESS: the workspace is an emptyDir that dies
-with the pod.  Provisioning sits behind :class:`WorkspaceProvisioner` so the
-raw-API :class:`PodProvisioner` (``provisioner: pod``) can be swapped for the
-:class:`~tools.environments.kubernetes_sandbox.SandboxClaimProvisioner`
-(``provisioner: sandbox``), which checks a pre-warmed sandbox out of a
-`kubernetes-sigs/agent-sandbox <https://github.com/kubernetes-sigs/agent-sandbox>`_
-``SandboxWarmPool`` via a ``SandboxClaim``, without touching the exec loop.
+Runs each agent command by exec-ing into a per-session pod.  Session pods are
+STATELESS: the workspace is an emptyDir that dies with the pod.
 
-Configuration policy
---------------------
-Every user-facing setting for this backend lives in ``config.yaml`` under
-``terminal.kubernetes.*`` (see :data:`DEFAULT_KUBERNETES_CONFIG`).  There are no
-``TERMINAL_KUBERNETES_*`` env vars: the existing terminal config bridge
-serialises the whole block into ONE internal env var (``TERMINAL_KUBERNETES``)
-that only ``tools.terminal_tool`` reads.  ``.env`` is for secrets, and this
-backend has no credential surface at all — in-cluster auth is the projected
-ServiceAccount token the kubelet mounts, which Hermes never reads or stores.
+Two provisioners behind :class:`WorkspaceProvisioner`, differing in who
+authors the pod:
 
-Pod shape policy — who authors the pod depends on the provisioner
------------------------------------------------------------------
-``provisioner: pod``: the operator authors the pod in Hermes config.
-Everything that is merely ``PodSpec`` is expressed as
-``terminal.kubernetes.pod_template``, a single PodTemplateSpec merged over a
-DEFAULT base by :func:`merge_pod_template`.  The base is a set of defaults that
-make the out-of-box config produce a working pod; it is not a constraint.
-Nothing here is reserved: a ``pod_template`` may override any field, including
-the exec container's ``image``, ``command``, ``args``, ``restartPolicy``,
-``volumeMounts`` and ``securityContext``.
+``pod``
+    :class:`PodProvisioner` creates a raw ``Pod``.  The operator authors it in
+    ``terminal.kubernetes.pod_template`` — a PodTemplateSpec merged over a
+    default base by :func:`merge_pod_template` (RFC 7386, plus a
+    containers-by-name exception).  Nothing is reserved.
+``sandbox``
+    :class:`~tools.environments.kubernetes_sandbox.SandboxClaimProvisioner`
+    checks a pre-warmed sandbox out of an admin-owned ``SandboxWarmPool`` via
+    a ``SandboxClaim``; the cluster's ``SandboxTemplate`` authors the pod and
+    ``pod_template`` is not consulted.
 
-``provisioner: sandbox``: the CLUSTER authors the pod.  The admin owns a
-``SandboxTemplate`` and a ``SandboxWarmPool``; Hermes only creates a
-``SandboxClaim`` naming the pool and execs into the pod it is bound to.
-``pod_template`` is not consulted on that path.
+Validating the pod is the CLUSTER's job.  SCC, Pod Security Admission,
+ValidatingAdmissionPolicy, NetworkPolicy and RBAC decide what a session pod
+may be; every create passes ``field_validation="Strict"`` so a malformed field
+is a ``400`` naming the exact JSON path.  There is deliberately no in-process
+config validation — an approximation of admission control is redundant where
+it agrees and wrong where it does not.
 
-Validation of the pod's CONTENT is the cluster's job, not Hermes'.  SCC, Pod
-Security Admission, ValidatingAdmissionPolicy, NetworkPolicy and RBAC decide
-authoritatively what a session pod may be, and every create this backend
-issues passes ``field_validation="Strict"`` so a malformed or unknown field
-comes back as a ``400`` naming the exact JSON path.  There is deliberately NO
-in-process config validation: an in-process approximation of admission control
-would be redundant and, being an approximation, wrong.  A pod that cannot
-serve exec fails visibly at the first command; that is the operator's error to
-see.
+Every setting lives in ``config.yaml`` under ``terminal.kubernetes.*`` (see
+:data:`DEFAULT_KUBERNETES_CONFIG`), bridged as ONE internal
+``TERMINAL_KUBERNETES`` var: ``.env`` is for secrets, and this backend has no
+credential of its own.  Auth resolution: in-cluster ServiceAccount →
+``terminal.kubernetes.kubeconfig`` → ambient ``KUBECONFIG``.
 
-Merge rule for ``pod_template``
--------------------------------
-JSON merge patch, RFC 7386: mappings merge recursively, a ``null`` REMOVES the
-key it names (so any base default can be dropped), and lists — volumes, env,
-tolerations, imagePullSecrets, ports, volumeMounts, all of them — REPLACE
-wholesale.  The ONE exception is ``spec.containers`` and ``spec.initContainers``,
-which merge element-wise on ``name``: without it the most common override
-(setting ``resources`` on the workspace container) would force the user to
-restate image, command and volumeMounts.  A container whose ``name`` is not in
-the base is appended.
-
-Auth resolution order: in-cluster ServiceAccount →
-``terminal.kubernetes.kubeconfig`` → ambient ``KUBECONFIG`` / ``~/.kube/config``.
-
-All ``kubernetes`` SDK imports are function-local so this module imports
-cleanly (and its manifest builders stay unit-testable) without the client
-installed.
+``kubernetes`` SDK imports are function-local so this module (and its manifest
+builders) load without the client installed.  See ``k8s/README.md`` for the
+deployment manifests and the sandbox path's admin-side objects.
 """
 
 import base64
@@ -269,11 +240,11 @@ def api_call(fn, *args, **kwargs):
                 # NOT retried: that is RBAC, and the message we already raise
                 # names the missing verb better than a retry ever could.
                 refreshed = True
-                logger.info("k8s: got 401; reloading credentials and retrying")
+                logger.info("got 401; reloading credentials and retrying")
                 try:
                     _reload_kubernetes_auth()
                 except Exception as reload_exc:
-                    logger.debug("k8s: credential reload failed: %s", reload_exc)
+                    logger.debug("credential reload failed: %s", reload_exc)
                     raise
                 continue
             if exc.status not in _RETRY_STATUSES:
@@ -291,7 +262,7 @@ def api_call(fn, *args, **kwargs):
         if attempt < _RETRY_ATTEMPTS - 1:
             delay = _retry_after_seconds(last, attempt)
             logger.info(
-                "k8s: retrying %s after transient error (%s); attempt %d/%d "
+                "retrying %s after transient error (%s); attempt %d/%d "
                 "in %.1fs", getattr(fn, "__name__", fn), last, attempt + 2,
                 _RETRY_ATTEMPTS, delay,
             )
@@ -628,7 +599,7 @@ def resolve_owner_reference(core_api, namespace: str, kcfg: dict) -> Optional[di
             # Not cosmetic: with no ownerReference the session pod loses its
             # only garbage-collection path, so say so out loud.
             logger.warning(
-                "k8s: could not resolve the agent pod identity (%s: %s); session "
+                "could not resolve the agent pod identity (%s: %s); session "
                 "pods will carry no ownerReference and will NOT be garbage "
                 "collected when this agent dies. Set HERMES_POD_NAME/"
                 "HERMES_POD_UID from the downward API, or grant 'get pods'.",
@@ -637,7 +608,7 @@ def resolve_owner_reference(core_api, namespace: str, kcfg: dict) -> Optional[di
             return None
     if not (name and uid):
         logger.warning(
-            "k8s: agent pod identity incomplete (name=%r uid=%r); session pods "
+            "agent pod identity incomplete (name=%r uid=%r); session pods "
             "will carry no ownerReference.", name, uid,
         )
         return None
@@ -747,9 +718,11 @@ def _default_base(kcfg: dict) -> dict:
 
     deadline = int(kcfg.get("active_deadline_seconds") or 0)
     if deadline > 0:
-        # Hard lifetime ceiling (leak backstop): a session pod that outlives
-        # its ownerReference GC path — StatefulSet restart, out-of-cluster
-        # dev — is reaped by the kubelet instead of leaking forever.
+        # Hard lifetime ceiling. NOTE what the kubelet actually does: it
+        # STOPS the pod (phase Failed) and leaves the object in place — this
+        # is not garbage collection. Hermes deletes the stopped pod when it
+        # next tries to use it (see pod_cannot_exec), and the startup sweep
+        # collects ones left by a previous process.
         spec["activeDeadlineSeconds"] = deadline
 
     return {"metadata": {"labels": dict(MANAGED_BY_LABEL)}, "spec": spec}
@@ -881,19 +854,19 @@ class _BaseProvisioner(WorkspaceProvisioner):
             ]
         except Exception as exc:
             logger.info(
-                "k8s: orphan sweep skipped (%s). Grant 'list' on session "
+                "orphan sweep skipped (%s). Grant 'list' on session "
                 "objects to reclaim workspaces left by an unclean restart.",
                 exc,
             )
             return 0
         for name in stale:
             logger.warning(
-                "k8s: reaping %s left by a previous Hermes process", name,
+                "reaping %s left by a previous Hermes process", name,
             )
             try:
                 self._reap_session_object(name)
             except Exception as exc:
-                logger.warning("k8s: could not reap %s: %s", name, exc)
+                logger.warning("could not reap %s: %s", name, exc)
         return len(stale)
 
     def _list_session_objects(self, selector: str) -> "list[tuple[str, str]]":
@@ -911,7 +884,7 @@ class _BaseProvisioner(WorkspaceProvisioner):
     def _may_delete(self, name: str) -> bool:
         if name in self._foreign_names:
             logger.warning(
-                "k8s: refusing to delete %s: this Hermes instance declined to "
+                "refusing to delete %s: this Hermes instance declined to "
                 "adopt it (it is not ours, or ownership could not be read), so "
                 "deleting it would destroy another agent's workspace.", name,
             )
@@ -928,13 +901,12 @@ class _BaseProvisioner(WorkspaceProvisioner):
     def exec_container(self, pod: Any) -> str:
         """Assert the RECONCILED pod carries the container we exec into.
 
-        The old behaviour was to fall back to the pod's FIRST container when
-        the configured name was absent.  ``container_name`` is the exec target
-        SELECTOR, so a pod without it means the running pod is not the one this
-        backend rendered (or the operator renamed the container in
-        ``pod_template`` without updating ``container_name``).  Exec-ing into
-        whatever else is there would be that drift, silently — and the very
-        next thing that happens is a credential-file upload into it.
+        ``container_name`` is the exec target SELECTOR, so a pod without it
+        means the running pod is not the one this backend expects — the
+        operator renamed the container in ``pod_template`` (or the admin's
+        SandboxTemplate) without updating ``container_name``.  Falling back to
+        whatever else is there would hide that drift, and the very next thing
+        that happens is a credential-file upload into it.
         """
         expected = self.container_name()
         names: list[str] = []
@@ -1058,17 +1030,17 @@ class _BaseProvisioner(WorkspaceProvisioner):
                 self._api.delete_namespaced_pod(name=pod_name, namespace=namespace)
             except ApiException as exc:
                 if exc.status != 404:
-                    logger.warning("k8s: failed to delete pod %s: %s", pod_name, exc)
+                    logger.warning("failed to delete pod %s: %s", pod_name, exc)
         except ApiException as exc:
             if exc.status == 409:
                 # Precondition failed: the name now belongs to a different
                 # object. Not ours to delete — that is the point.
                 logger.info(
-                    "k8s: pod %s was replaced before our delete landed; "
+                    "pod %s was replaced before our delete landed; "
                     "leaving the new one alone.", pod_name,
                 )
             elif exc.status != 404:
-                logger.warning("k8s: failed to delete pod %s: %s", pod_name, exc)
+                logger.warning("failed to delete pod %s: %s", pod_name, exc)
 
     def _terminal_pod_uid(self, pod_name: str) -> str:
         """The uid of *pod_name* when it exists but can never serve exec again.
@@ -1225,7 +1197,7 @@ class PodProvisioner(_BaseProvisioner):
                 dead_uid = self._terminal_pod_uid(pod_name) if attempt == 1 else ""
                 if dead_uid:
                     logger.warning(
-                        "k8s: session pod %s can no longer serve exec; "
+                        "session pod %s can no longer serve exec; "
                         "deleting and re-provisioning.", pod_name,
                     )
                     self._delete_pod(self.namespace, pod_name, uid=dead_uid)
@@ -1349,7 +1321,7 @@ class KubernetesEnvironment(BaseEnvironment):
             try:
                 self._sync_manager.sync(force=True)
             except Exception as exc:
-                logger.warning("k8s: initial file sync failed: %s", exc)
+                logger.warning("initial file sync failed: %s", exc)
 
         self.init_session()
 
@@ -1370,11 +1342,12 @@ class KubernetesEnvironment(BaseEnvironment):
     def _ensure_pod(self) -> PodRef:
         """Re-provision after the session pod went away.
 
-        ``cancel()`` no longer destroys the pod, so this is now reached only
-        when the pod genuinely died (activeDeadlineSeconds, an operator TTL,
-        an eviction, an OOMKill).  Without it a single dead pod bricks the
-        session: every later exec fails and the agent sees empty output with
-        rc=1 until the idle reaper evicts the environment.
+        Reached when the pod genuinely died — activeDeadlineSeconds, an
+        operator TTL, an eviction, an OOMKill.  Without it a single dead pod
+        bricks the session: every later exec fails and the agent sees empty
+        output with rc=1 until the idle reaper evicts the environment.
+        (Cancellation deliberately does NOT destroy the pod, so it never
+        lands here — see :meth:`_run_bash`.)
         """
         # Serialise the whole re-provision, not just the ref check. Up to 8
         # tool workers share one environment; with the check and the create
@@ -1391,7 +1364,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 if self._pod_ref is not None:
                     return self._pod_ref
             logger.warning(
-                "k8s: session pod for task %s is gone; provisioning a new one "
+                "session pod for task %s is gone; provisioning a new one "
                 "— the workspace starts empty again.", self._task_id,
             )
             pod_ref = self._provisioner.ensure(task_id=self._task_id)
@@ -1404,13 +1377,13 @@ class KubernetesEnvironment(BaseEnvironment):
                 # None and returned early, so this object is ours to destroy
                 # here or nothing ever will.
                 logger.warning(
-                    "k8s: environment was cleaned up mid-provision; "
+                    "environment was cleaned up mid-provision; "
                     "destroying the session pod it created.",
                 )
                 try:
                     self._provisioner.destroy(pod_ref)
                 except Exception as exc:
-                    logger.warning("k8s: mid-provision cleanup failed: %s", exc)
+                    logger.warning("mid-provision cleanup failed: %s", exc)
                 raise RuntimeError(
                     "kubernetes environment was cleaned up while provisioning"
                 )
@@ -1423,12 +1396,12 @@ class KubernetesEnvironment(BaseEnvironment):
             try:
                 self._sync_manager.sync(force=True)
             except Exception as exc:
-                logger.warning("k8s: file re-sync failed: %s", exc)
+                logger.warning("file re-sync failed: %s", exc)
         self._snapshot_ready = False
         try:
             self.init_session()
         except Exception as exc:
-            logger.debug("k8s: init_session after re-provision failed: %s", exc)
+            logger.debug("init_session after re-provision failed: %s", exc)
         return pod_ref
 
     def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
@@ -1461,7 +1434,7 @@ class KubernetesEnvironment(BaseEnvironment):
             try:
                 self._sync_manager.sync()
             except Exception as exc:
-                logger.debug("k8s: file sync skipped: %s", exc)
+                logger.debug("file sync skipped: %s", exc)
 
     # -- raw exec -------------------------------------------------------
     def _exec_client(self):
@@ -1671,7 +1644,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 with self._lock:
                     cancelled = state.cancelled
                 if not cancelled:
-                    logger.warning("k8s: exec stream error: %s", exc)
+                    logger.warning("exec stream error: %s", exc)
                     chunks.append(f"\n[kubernetes exec error: {exc}]")
                     self._forget_pod_if_dead(exc)
                 return "".join(chunks), (130 if cancelled else 1)
@@ -1738,7 +1711,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 try:
                     tar.add(host_path, arcname=remote_path.lstrip("/"))
                 except OSError as exc:
-                    logger.debug("k8s: skipping %s: %s", host_path, exc)
+                    logger.debug("skipping %s: %s", host_path, exc)
         payload = buf.getvalue()
         if not payload:
             return
@@ -1804,7 +1777,7 @@ class KubernetesEnvironment(BaseEnvironment):
                 try:
                     resp.close_channel(STDIN_CHANNEL)
                 except Exception as exc:  # pragma: no cover - defensive
-                    logger.debug("k8s: stdin half-close unavailable: %s", exc)
+                    logger.debug("stdin half-close unavailable: %s", exc)
 
             while not timed_out:
                 if not resp.is_open():
@@ -1863,29 +1836,4 @@ class KubernetesEnvironment(BaseEnvironment):
         try:
             self._provisioner.destroy(ref)
         except Exception as exc:
-            logger.warning("k8s: cleanup failed: %s", exc)
-
-
-__all__ = [
-    "DEFAULT_KUBERNETES_CONFIG",
-    "DEFAULT_SESSION_IMAGE",
-    "VALID_PROVISIONERS",
-    "SESSION_SERVICE_ACCOUNT",
-    "STRICT_FIELD_VALIDATION",
-    "MANAGED_BY_LABEL",
-    "PodRef",
-    "WorkspaceProvisioner",
-    "PodProvisioner",
-    "KubernetesEnvironment",
-    "render_pod_template",
-    "merge_pod_template",
-    "effective_image",
-    "container_name",
-    "mount_path",
-    "merge_kubernetes_config",
-    "load_kubernetes_apis",
-    "resolve_namespace",
-    "resolve_owner_reference",
-    "sanitize_name",
-    "in_cluster",
-]
+            logger.warning("cleanup failed: %s", exc)

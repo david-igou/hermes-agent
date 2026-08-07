@@ -389,7 +389,7 @@ class SandboxClaimProvisioner(_BaseProvisioner):
         except ApiException as exc:
             if exc.status == 409:
                 logger.info(
-                    "k8s: sandboxclaim %s was replaced before our delete "
+                    "sandboxclaim %s was replaced before our delete "
                     "landed; leaving the new one alone.", name,
                 )
                 return
@@ -407,7 +407,7 @@ class SandboxClaimProvisioner(_BaseProvisioner):
         # Not fatal — the create below will 409 and be handled — but silence
         # here reappears later as a confusing "already exists" or "is dead".
         logger.warning(
-            "k8s: sandboxclaim %s still present %ss after delete; proceeding.",
+            "sandboxclaim %s still present %ss after delete; proceeding.",
             name, timeout,
         )
 
@@ -427,7 +427,7 @@ class SandboxClaimProvisioner(_BaseProvisioner):
                 # Our claim, but its sandbox finished (deadline, OOMKill) or
                 # it expired — the controller never restarts a finished pod,
                 # so replace the claim and bind fresh.
-                logger.warning("k8s: %s; replacing it.", dead)
+                logger.warning("%s; replacing it.", dead)
                 self._delete_claim_and_wait(name)
                 self._create_claim(self.claim_manifest(task_id))
                 continue
@@ -460,7 +460,7 @@ class SandboxClaimProvisioner(_BaseProvisioner):
         names = sorted(self._created_names)
         if not names:
             logger.info(
-                "k8s: no bound sandboxclaim to delete for pod %s (binding "
+                "no bound sandboxclaim to delete for pod %s (binding "
                 "never completed, or the claim was foreign — an unbound claim "
                 "is deliberately left for the next attempt to adopt).",
                 pod_ref.pod_name,
@@ -475,19 +475,10 @@ class SandboxClaimProvisioner(_BaseProvisioner):
             except ApiException as exc:
                 if exc.status != 404:
                     logger.warning(
-                        "k8s: failed to delete sandboxclaim %s: %s", name, exc
+                        "failed to delete sandboxclaim %s: %s", name, exc
                     )
             except Exception as exc:
                 logger.warning(
-                    "k8s: failed to delete sandboxclaim %s: %s", name, exc
+                    "failed to delete sandboxclaim %s: %s", name, exc
                 )
         self._created_names.clear()
-
-
-__all__ = [
-    "SandboxClaimProvisioner",
-    "SANDBOX_API_GROUP",
-    "EXTENSIONS_API_GROUP",
-    "SANDBOX_API_VERSION",
-    "POD_NAME_ANNOTATION",
-]

@@ -806,8 +806,8 @@ class ShellFileOperations(FileOperations):
     File operations implemented via shell commands.
     
     Works with ANY terminal backend that has execute(command, cwd) method.
-    This includes local, docker, singularity, ssh, modal, daytona, vercel_sandbox
-    and kubernetes environments.
+    This includes local, docker, singularity, ssh, modal, daytona,
+    vercel_sandbox and kubernetes environments.
     """
     
     def __init__(self, terminal_env, cwd: str = None):

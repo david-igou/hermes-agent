@@ -30,10 +30,14 @@ See `cli-config.yaml.example` (OPTION 7) for the full annotated block, or run `h
 
 ```bash
 # 1. Edit rbac.yaml: replace <AGENT_NAMESPACE> and <AGENT_SA>.
-#    Apply the Role matching terminal.kubernetes.provisioner:
-#      pod     -> hermes-session-exec
-#      sandbox -> hermes-session-sandbox
+#    It contains BOTH Role variants — apply it, then delete the one your
+#    provisioner does not use. (Keeping both would hand a sandbox deployment
+#    the pod-authoring surface that provisioner exists to remove.)
 kubectl apply -f rbac.yaml
+#      provisioner: pod
+kubectl delete role,rolebinding hermes-session-sandbox -n <AGENT_NAMESPACE> --ignore-not-found
+#      provisioner: sandbox
+# kubectl delete role,rolebinding hermes-session-exec -n <AGENT_NAMESPACE> --ignore-not-found
 
 # 2. Network isolation for session pods (edit <AGENT_NAMESPACE> first).
 kubectl apply -f networkpolicy.yaml
@@ -54,21 +58,25 @@ SA=system:serviceaccount:<AGENT_NAMESPACE>:<AGENT_SA>
 # provisioner: pod
 kubectl auth can-i create pods        --as=$SA -n <AGENT_NAMESPACE>   # yes
 kubectl auth can-i get    pods        --as=$SA -n <AGENT_NAMESPACE>   # yes  <- readiness, 409 ownership, ownerRef lookup
+kubectl auth can-i delete pods        --as=$SA -n <AGENT_NAMESPACE>   # yes
 kubectl auth can-i get    pods/exec   --as=$SA -n <AGENT_NAMESPACE>   # yes  <- the one that matters
+kubectl auth can-i list   pods        --as=$SA -n <AGENT_NAMESPACE>   # optional (startup orphan sweep)
 # provisioner: sandbox — `create pods` must be NO; the claim controller owns the pod
 kubectl auth can-i create sandboxclaims.extensions.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes
 kubectl auth can-i get    sandboxclaims.extensions.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes
+kubectl auth can-i delete sandboxclaims.extensions.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes
+kubectl auth can-i list   sandboxclaims.extensions.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # optional (sweep)
 kubectl auth can-i get    sandboxes.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes
-kubectl auth can-i get    sandboxwarmpools.extensions.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # yes (doctor pre-flight only)
+kubectl auth can-i get    pods        --as=$SA -n <AGENT_NAMESPACE>   # yes
+kubectl auth can-i get    pods/exec   --as=$SA -n <AGENT_NAMESPACE>   # yes
 kubectl auth can-i create sandboxes.agents.x-k8s.io --as=$SA -n <AGENT_NAMESPACE>  # no
 kubectl auth can-i create pods        --as=$SA -n <AGENT_NAMESPACE>   # no
-kubectl auth can-i get    pods        --as=$SA -n <AGENT_NAMESPACE>   # yes
 # both
 kubectl auth can-i create deployments --as=$SA -n <AGENT_NAMESPACE>   # no
 kubectl auth can-i create secrets     --as=$SA -n <AGENT_NAMESPACE>   # no
 ```
 
-`hermes doctor` runs exactly these checks per provisioner (and flags `create pods` being *allowed* under `provisioner: sandbox` as broader than needed).
+`hermes doctor` runs these same checks per provisioner — the `# optional` ones as warnings, not failures — plus a `SandboxWarmPool` read on the sandbox path, and it flags `create pods` being *allowed* under `provisioner: sandbox` as broader than needed. The two `deployments`/`secrets` probes below are yours, not doctor's.
 
 ## Agent Deployment requirements
 
@@ -89,7 +97,7 @@ env:
 
 (The namespace is never taken from the environment: in-cluster the kubelet already projects it, and out-of-cluster `terminal.kubernetes.namespace` covers it.) When identity cannot be resolved, Hermes logs a WARNING — session pods then carry no `ownerReference` and are not garbage-collected until the `active_deadline_seconds` backstop fires.
 
-Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely (out-of-cluster dev, or a topology where the agent is not a pod). Session pods are still bounded by `terminal.kubernetes.active_deadline_seconds` (as `spec.activeDeadlineSeconds` on the pod path, as the claim's `lifecycle.shutdownTime` on the sandbox path).
+Set `terminal.kubernetes.owner_reference: off` to skip ownerReferences entirely (out-of-cluster dev, or a topology where the agent is not a pod). Session pods are still bounded by `terminal.kubernetes.active_deadline_seconds` — but note what that bound does on each path: `spec.activeDeadlineSeconds` **stops** the pod (phase `Failed`) and leaves the object present for you or Hermes to delete, whereas the claim's `lifecycle.shutdownTime` **deletes** the claim and cascades. Hermes deletes a stopped pod when it next tries to use it, and the startup sweep collects ones left by a previous process; neither is Kubernetes GC.
 
 ## OpenShift 4.21 notes
 
@@ -212,7 +220,7 @@ The workspace is an `emptyDir` that dies with the session pod — there is delib
 Two lifetime knobs bound every session pod, and both are worth setting deliberately:
 
 * **`terminal.lifetime_seconds` (default 300)** — the shared idle reaper destroys the environment (pod or claim) after this much tool-call inactivity. This backend has no persist exemption, so 300 s of idleness costs the workspace; raise it (e.g. to match `active_deadline_seconds`) if you want session-length workspaces, and size warm pools with it in mind.
-* **`terminal.kubernetes.active_deadline_seconds` (default 14400)** — the hard per-pod ceiling (`activeDeadlineSeconds` / the claim's `shutdownTime`).
+* **`terminal.kubernetes.active_deadline_seconds` (default 14400)** — the hard per-session ceiling. On the pod path it is `spec.activeDeadlineSeconds`, which stops the pod but does **not** delete it; on the claim path it is `lifecycle.shutdownTime`, which deletes the claim and cascades. Unlike the pod path, `0` is not honoured on the claim path — it would leave a checked-out warm-pool sandbox with no reaper at all, so it falls back to the default.
 
 The emptyDir is unbounded by default: set an `ephemeral-storage` request/limit on the `workspace` container (three lines via the containers-merge-by-name rule, or in the SandboxTemplate) so a runaway download hits a clean limit instead of node-pressure eviction.
 

@@ -1652,7 +1652,8 @@ def _get_env_config() -> Dict[str, Any]:
         ).lower() in {"true", "1", "yes"},
         "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
-        # daytona, and vercel_sandbox -- ignored for local/ssh)
+        # daytona, and vercel_sandbox -- ignored for local/ssh, and for
+        # kubernetes, which takes resources from its pod_template instead)
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
