@@ -158,21 +158,22 @@ def annotate_failure(command: str, exit_code: int, output: str) -> Optional[str]
     """
     if exit_code == 0:
         return None
+    window = (output or "")[:_SCAN_CHARS]
     # The cwd guard every command is wrapped in (`builtin cd -- <cwd> ||
     # exit 126`, base.py) shares its exit code with "found but not
-    # executable". The guard firing is distinguishable: it exits before the
-    # command runs, so the output is EMPTY — a real 126 from running a file
-    # prints a shell diagnostic. On a stateless backend the guard means the
-    # recorded working directory did not survive a workspace re-provision,
-    # where the generic chmod hint sends the model the wrong way.
-    if exit_code == 126 and not (output or "").strip():
+    # executable". The guard firing is distinguishable by the shell's own
+    # diagnostic on the merged stream (`cd: <path>: No such file or
+    # directory`) — where the generic chmod hint would send the model the
+    # wrong way, since the real problem is that the recorded working
+    # directory is gone (e.g. a sandbox workspace that was re-provisioned).
+    if exit_code == 126 and re.search(
+        r"\bcd: .*(No such file or directory|[Nn]ot a directory)", window
+    ):
         return (
-            "Exit 126 with no output: the session working directory no longer "
-            "exists — the sandbox was likely re-provisioned (stateless "
-            "workspace). `cd` to an existing directory (e.g. the workspace "
-            "root) and re-create anything you need."
+            "Exit 126: the session's recorded working directory no longer "
+            "exists (the sandbox may have been recreated). `cd` to an "
+            "existing directory and re-create anything you need."
         )
-    window = (output or "")[:_SCAN_CHARS]
     if window:
         for fn in _OUTPUT_HINTS:
             try:

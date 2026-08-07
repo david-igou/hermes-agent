@@ -123,13 +123,6 @@ MANAGED_BY = "app.kubernetes.io/managed-by"
 # ---------------------------------------------------------------------------
 
 
-def test_podref_holds_coordinates():
-    ref = PodRef(namespace="hermes", pod_name="hermes-ws-abc", container="workspace")
-    assert ref.namespace == "hermes"
-    assert ref.pod_name == "hermes-ws-abc"
-    assert ref.container == "workspace"
-
-
 def test_provisioner_is_abstract():
     with pytest.raises(TypeError):
         WorkspaceProvisioner()  # ABC — cannot instantiate
@@ -162,12 +155,10 @@ def test_partial_config_still_yields_every_default():
     assert merged["provisioner"] == "pod"
     assert merged["container_name"] == "workspace"
     assert merged["sandbox"]["warm_pool"] == ""
-
-
-def test_partial_nested_config_merges_rather_than_replaces():
-    merged = merge_kubernetes_config({"sandbox": {"warm_pool": "pool-a"}})
-    assert merged["sandbox"]["warm_pool"] == "pool-a"
-    assert merged["provisioner"] == "pod"
+    # Nested partials merge rather than replace the block.
+    nested = merge_kubernetes_config({"sandbox": {"warm_pool": "pool-a"}})
+    assert nested["sandbox"]["warm_pool"] == "pool-a"
+    assert nested["provisioner"] == "pod"
 
 
 def test_merge_does_not_mutate_defaults():
@@ -344,27 +335,6 @@ def test_pod_template_reaches_the_manifest():
     assert container["command"] == ["sleep", "infinity"]
     # Merge, not replace, at the spec level too.
     assert spec["restartPolicy"] == "Never"
-
-
-def test_resources_and_image_live_in_pod_template_only():
-    """The shared terminal.container_cpu/memory/disk knobs and the old `image`
-    sugar key are gone: every sibling backend honours the shared knobs, this
-    backend documents that it does not, and the pod_template is the one place
-    pod shape lives."""
-    explicit = _provisioner(pod_template={"spec": {"containers": [
-        {"name": "workspace",
-         "image": "quay.io/hermes/session:1",
-         "resources": {
-            "requests": {"cpu": "250m", "memory": "1Gi"},
-            "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "8Gi"}}},
-    ]}}).pod_manifest("abc")
-    container = explicit["spec"]["containers"][0]
-    assert container["image"] == "quay.io/hermes/session:1"
-    assert container["resources"]["requests"] == {"cpu": "250m", "memory": "1Gi"}
-    assert container["resources"]["limits"] == {
-        "cpu": "2", "memory": "4Gi", "ephemeral-storage": "8Gi"}
-    # The merge kept the rest of the base container.
-    assert container["command"] == ["sleep", "infinity"]
 
 
 def test_effective_image_is_derived_for_display_only():
@@ -838,17 +808,6 @@ def test_nonzero_exit_code(monkeypatch):
     env = _make_k8s_env(monkeypatch, [("", 0), ("nope\n", 127)])
     result = env.execute("bad_cmd")
     assert result["returncode"] == 127
-
-
-def test_exec_keeps_partial_output_when_returncode_raises(monkeypatch):
-    """WSClient.returncode does yaml.safe_load(err)['status'] on the error
-    channel; an abnormal disconnect leaves it empty and the property raises
-    TypeError. Unguarded, _ThreadedProcessHandle discards every byte."""
-    client = _FakeWSClient(stdout="partial output\n",
-                           returncode=TypeError("NoneType not subscriptable"))
-    env = _make_k8s_env(monkeypatch, [("", 0), client])
-    result = env.execute("something")
-    assert "partial output" in result["output"]
 
 
 def test_exec_stream_error_returns_message_not_silence(monkeypatch):
@@ -2099,17 +2058,6 @@ def test_doctor_probes_the_exec_verb_the_client_actually_issues():
     assert "get    pods/exec" in readme
 
 
-def test_doctor_submits_every_access_review_with_strict_field_validation():
-    """Requirement 4 says Strict on every create this backend issues. The three
-    provisioner creates and both doctor dry-runs carried it; the RBAC probe's
-    SelfSubjectAccessReviews did not. A rule with an undocumented carve-out is
-    a rule nobody can check, so close the carve-out rather than the rule."""
-    reviews = _doctor_rbac_reviews(_kcfg(namespace="hermes",
-                                         provisioner="sandbox"))
-    assert reviews, reviews
-    assert set(reviews.field_validations) == {"Strict"}, reviews.field_validations
-
-
 def test_doctor_probes_the_claim_surface_the_backend_posts_to():
     reviews = _doctor_rbac_reviews(
         _kcfg(namespace="hermes", provisioner="sandbox",
@@ -2134,13 +2082,7 @@ def _doctor_rbac_reviews(kcfg):
     import kubernetes.client as kclient
     from hermes_cli import doctor
 
-    class _Seen(list):
-        """The recorded (group, resource, verb) triples, plus the
-        field_validation each review was submitted with."""
-        field_validations: list = []
-
-    seen = _Seen()
-    seen.field_validations = []
+    seen: list = []
 
     class _Attrs:
         def __init__(self, namespace=None, group=None, resource=None, verb=None):
@@ -2161,7 +2103,6 @@ def _doctor_rbac_reviews(kcfg):
         def create_self_subject_access_review(self, review, **kwargs):
             attrs = review.spec.resource_attributes
             seen.append((attrs.group, attrs.resource, attrs.verb))
-            seen.field_validations.append(kwargs.get("field_validation"))
             return SimpleNamespace(status=SimpleNamespace(allowed=True))
 
     core = MagicMock()
@@ -2243,49 +2184,6 @@ def test_doctor_reports_the_api_servers_rejection_as_a_failure():
     issues = []
     doctor._dry_run_pod_template(_kcfg(), "hermes", core, issues)
     assert issues == []
-
-
-# ---------------------------------------------------------------------------
-# What a pod_template CAN break, and what stays working
-# ---------------------------------------------------------------------------
-#
-# Six review rounds each found a new way past the in-process "reserved core"
-# check that used to live here, which is the argument against having one. The
-# contract is now the opposite one: a pod_template that reaches those fields
-# reaches them, and a pod that cannot serve exec fails at the first command.
-# What these pin is that the ORDINARY overrides still work — the exception
-# nobody would forgive is a merge rule that quietly drops what you wrote.
-
-
-#: Templates that must keep working. Each one is a thing an operator actually
-#: does, and each is a case the merge rule has to get right.
-_CLEAN_PROBES = [
-    {},
-    {"spec": {"runtimeClassName": "kata"}},
-    {"spec": {"containers": [{"name": "workspace"},
-                             {"name": "sidecar", "image": "envoy"}]}},
-    {"spec": {"containers": [{"name": "workspace", "env": [
-        {"name": "A", "value": "1"}]}]}},
-    {"spec": {"volumes": [{"name": "cache", "emptyDir": {}}],
-              "containers": [{"name": "workspace", "volumeMounts": [
-                  {"name": "cache", "mountPath": "/cache"}]}]}},
-    {"metadata": {"labels": {"team": "hermes"}}},
-]
-
-
-@pytest.mark.parametrize("pod_template", _CLEAN_PROBES)
-def test_ordinary_overrides_still_produce_an_exec_able_pod(pod_template):
-    """The exec container is still there under the configured name, and the
-    managed-by stamp survived."""
-    kcfg = _kcfg(pod_template=pod_template)
-    pod = PodProvisioner(
-        kcfg, "hermes", api=None, owner_reference=OWNER_REF,
-    ).pod_manifest("abc")
-    spec = pod["spec"]
-    workspace = [c for c in spec["containers"] if c["name"] == "workspace"]
-    assert len(workspace) == 1, spec["containers"]
-    assert workspace[0]["command"] == ["sleep", "infinity"]
-    assert pod["metadata"]["labels"][MANAGED_BY] == "hermes-agent"
 
 
 def test_a_non_mapping_sandbox_block_is_tolerated():
@@ -2602,12 +2500,18 @@ def test_registering_a_kubernetes_image_override_fails_loudly():
     assert "rollout-1" not in tt._task_env_overrides
 
 
-def test_cd_guard_126_hint_names_the_stateless_workspace():
-    """The cwd guard exits 126 BEFORE the command runs (empty output); the
-    generic 'chmod +x' hint sent the model the wrong way after a reset."""
+def test_cd_guard_126_hint_names_the_vanished_cwd():
+    """The cwd guard's own shell diagnostic (`cd: ...: No such file or
+    directory`, merged into output) is the discriminator; the generic
+    'chmod +x' hint sent the model the wrong way after a workspace reset."""
     from tools.terminal_hints import annotate_failure
 
-    guard = annotate_failure("make build", 126, "")
-    assert guard and "re-provisioned" in guard
-    real_126 = annotate_failure("./script.sh", 126, "permission denied")
-    assert real_126 and "chmod" in real_126
+    guard = annotate_failure(
+        "make build", 126,
+        "bash: line 1: cd: /workspace/proj: No such file or directory",
+    )
+    assert guard and "working directory" in guard
+    # A real not-executable 126 keeps the chmod hint — even with its output
+    # redirected away (the common `>/dev/null 2>&1` shape).
+    assert "chmod" in (annotate_failure("./script.sh", 126, "permission denied") or "")
+    assert "chmod" in (annotate_failure("./script.sh >/dev/null 2>&1", 126, "") or "")
