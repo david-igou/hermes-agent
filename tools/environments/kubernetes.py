@@ -219,6 +219,7 @@ DEFAULT_KUBERNETES_CONFIG: dict[str, Any] = {
 #: was going to write anyway.
 PROVISIONERS_BY_KIND: dict[tuple, str] = {
     ("v1", "Pod"): "pod",
+    ("extensions.agents.x-k8s.io/v1beta1", "SandboxClaim"): "sandbox",
 }
 
 # The token is what actually matters, and it is off in the SHIPPED TEMPLATE —
@@ -720,6 +721,51 @@ def owned_selector(kcfg: dict) -> dict:
     return {str(k): str(v) for k, v in selector.items()}
 
 
+def _preflight_claim(kcfg: dict) -> tuple:
+    """Preflight for a SandboxClaim. Short, because most of the pod is not ours.
+
+    The pool's SandboxTemplate owns the pod, so ``exec_container_name``,
+    ``workingDir`` and the volumes are the cluster admin's to get right and
+    Hermes cannot see them from config. What IS ours: the claim must name a
+    pool, and it must be disposable — a claim that outlives its agent holds a
+    warm-pool checkout that nothing returns.
+    """
+    errors: list = []
+    warnings: list = []
+    spec = kcfg.get("spec")
+    if not isinstance(spec, dict) or not spec:
+        return ([
+            "terminal.kubernetes.spec is required. For kind: SandboxClaim it "
+            "needs at least a warmPoolRef — see \"The other kind: "
+            "SandboxClaim\" in k8s/README.md."
+        ], warnings)
+
+    pool = (spec.get("warmPoolRef") or {}).get("name")
+    if not pool:
+        errors.append(
+            "spec.warmPoolRef.name is required: a SandboxClaim checks a "
+            "workspace out of a SandboxWarmPool, and the pool (with the "
+            "SandboxTemplate it instantiates) is the cluster admin's object."
+        )
+    lifecycle = spec.get("lifecycle") or {}
+    if lifecycle.get("shutdownPolicy") != "Delete":
+        warnings.append(
+            "spec.lifecycle.shutdownPolicy is not Delete. The controller "
+            "default is Retain, which leaves the claim — and the warm-pool "
+            "sandbox it checked out — in place after the session ends. "
+            "Nothing else returns it to the pool."
+        )
+    if not lifecycle.get("shutdownTime"):
+        warnings.append(
+            "spec.lifecycle.shutdownTime is unset, so nothing expires a BOUND "
+            "claim. An agent that dies without deleting its claim holds that "
+            "pool slot until an operator notices. It is an absolute "
+            "timestamp, so a static config cannot express a rolling bound — "
+            "size the pool for it, or accept manual cleanup."
+        )
+    return errors, warnings
+
+
 def preflight_spec(kcfg: dict) -> tuple:
     """Check the invariants only HERMES can check. Returns ``(errors, warnings)``.
 
@@ -743,6 +789,12 @@ def preflight_spec(kcfg: dict) -> tuple:
     errors: list = []
     warnings: list = []
     spec = kcfg.get("spec")
+    if resolve_provisioner_kind(kcfg) != "pod":
+        # A SandboxClaim's spec is {warmPoolRef, lifecycle, env, ...}, not a
+        # PodSpec: the POD comes from the admin's SandboxTemplate, which
+        # Hermes does not author and cannot inspect from config. The checks
+        # that still belong to us live in _preflight_claim().
+        return _preflight_claim(kcfg)
     if not isinstance(spec, dict) or not spec:
         # Same pointer render_session_object gives: whichever surface an
         # operator hits first should name the file to copy.

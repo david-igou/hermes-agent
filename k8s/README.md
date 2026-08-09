@@ -224,6 +224,42 @@ Two lifetime knobs bound every session pod, and both are worth setting deliberat
 
 The emptyDir is unbounded by default: set an `ephemeral-storage` request/limit on the `workspace` container in your `spec` so a runaway download hits a clean limit instead of node-pressure eviction.
 
+## The other kind: `SandboxClaim`
+
+`kind` selects the provisioner, so the second one is a config edit and not a new key:
+
+```yaml
+terminal:
+  backend: kubernetes
+  kubernetes:
+    namespace: hermes-agents
+    apiVersion: extensions.agents.x-k8s.io/v1beta1
+    kind: SandboxClaim
+    exec_container_name: workspace     # must match the admin's SandboxTemplate
+    ready_timeout_seconds: 300         # cold starts are slow
+    spec:
+      warmPoolRef:
+        name: hermes-session-pool
+      lifecycle:
+        shutdownPolicy: Delete         # Retain leaves the pool slot checked out
+```
+
+Instead of creating a pod, Hermes checks one out of a [`SandboxWarmPool`](https://github.com/kubernetes-sigs/agent-sandbox) the cluster admin defined. **That is the security case for this provisioner**: the agent's ServiceAccount needs `sandboxclaims` create/get/delete, `sandboxes` get, and `pods` get + `pods/exec` — and notably **not** `pods create`. The agent can take a workspace from a pool someone else specified; it cannot specify a pod. `hermes doctor` probes exactly that set when `kind: SandboxClaim`, and does *not* ask for `pods create`.
+
+What changes for you:
+
+| | `kind: Pod` | `kind: SandboxClaim` |
+|---|---|---|
+| Who authors the pod | you, in `spec` | the admin, in the `SandboxTemplate` |
+| `spec` contains | a PodSpec | `warmPoolRef`, `lifecycle`, `env` |
+| `exec_container_name` | must match your `spec` | must match the **template's** container |
+| Session cwd | read from your `workingDir` | Hermes cannot derive it — it verifies the bound pod's `workingDir` matches and **refuses to start** if not, so set `terminal.cwd` to the template's value |
+| The `managed-by` label | Hermes stamps it on the pod | the admin's template must set it, or the shipped NetworkPolicy does not select session pods |
+| Teardown | delete the pod | delete the claim (the controller owns the Sandbox, which owns the pod) |
+| Startup | image pull | warm: under a second; cold: a pool scale-up |
+
+Two things Hermes deliberately does **not** do here. It never sets `additionalPodMetadata`: the claim controller runs those labels through a domain allowlist defaulting to `sandbox.users.io`, and no stock install ships the ConfigMap that widens it, so any label Hermes set there made every claim fail with `InvalidMetadata`. And it never computes `lifecycle.shutdownTime` — that is an absolute timestamp, so a static config cannot express a rolling bound. Without one, nothing expires a *bound* claim: an agent that dies holding a claim holds that pool slot until an operator notices. `preflight_spec` warns about both.
+
 ## Session scope
 
 **A "session pod" is one pod per Hermes PROCESS, not one per conversation.** The name is a

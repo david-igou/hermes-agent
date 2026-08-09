@@ -296,7 +296,23 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
         return
     check_ok("kubernetes namespace", f"({namespace})")
 
-    checks = [
+    # The claim path deliberately does NOT create pods — that is its security
+    # case (the agent checks a workspace out of a pool the admin defined
+    # instead of defining a pod). Probing pods create/delete there told
+    # operators to grant exactly the verbs the provisioner exists to avoid,
+    # and failed three checks on a ServiceAccount that ran a full session.
+    if provisioner == "sandbox":
+        checks = [
+            ("extensions.agents.x-k8s.io", "sandboxclaims", "create"),
+            ("extensions.agents.x-k8s.io", "sandboxclaims", "get"),
+            ("extensions.agents.x-k8s.io", "sandboxclaims", "delete"),
+            ("agents.x-k8s.io", "sandboxes", "get"),
+            ("", "pods", "get"),
+            ("", "pods/exec", "get"),
+            ("", "pods/exec", "create"),
+        ]
+    else:
+        checks = [
         ("", "pods", "create"),
         # `get` backs readiness polling, ownership proof on 409 and the
         # agent's own-pod lookup for the ownerReference.
@@ -314,7 +330,7 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
         # lit a Role on which every command then failed.
         ("", "pods/exec", "get"),
         ("", "pods/exec", "create"),
-    ]
+        ]
 
     # Same as every other containerized backend: commands run in a session
     # pod, not on the host, so the dangerous-command approval layer is skipped.
@@ -360,7 +376,18 @@ def _check_kubernetes_backend(issues: list[str]) -> None:
         check_warn("kubernetes RBAC check skipped", f"({exc})")
 
     _preflight_spec_checks(kcfg, issues)
-    _dry_run_pod_template(kcfg, namespace, core_api, issues)
+    if provisioner == "sandbox":
+        # A SandboxClaim is not a Pod: POSTing it to create_namespaced_pod
+        # returned `400 ... SandboxClaim ... cannot be handled as a Pod` and
+        # told the operator to fix a spec that was correct. The claim's own
+        # schema is validated by the CRD when the claim is created.
+        check_info(
+            "kubernetes spec dry-run skipped for kind: SandboxClaim "
+            "(the CRD validates the claim; the POD comes from the admin's "
+            "SandboxTemplate, which Hermes does not author)"
+        )
+    else:
+        _dry_run_pod_template(kcfg, namespace, core_api, issues)
 
 
 def _preflight_spec_checks(kcfg, issues) -> None:

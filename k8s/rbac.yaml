@@ -121,3 +121,34 @@ roleRef:
 #   apiGroup: rbac.authorization.k8s.io
 #   kind: Role
 #   name: hermes-session-scc
+
+---
+# OPTIONAL — only for `terminal.kubernetes.kind: SandboxClaim`.
+#
+# The point of this Role is what it does NOT contain: no `pods create`, no
+# `pods delete`. The agent checks a workspace out of a SandboxWarmPool the
+# cluster admin defined; it cannot define a pod. `hermes doctor` probes exactly
+# this set when the configured kind is SandboxClaim.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hermes-session-claim
+  namespace: <AGENT_NAMESPACE>
+rules:
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["create", "get", "delete"]
+  # The claim reports its bound Sandbox in status; Hermes reads it to resolve
+  # the pod name and to prove the pod belongs to that Sandbox before it
+  # uploads anything into it.
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get"]
+  # Readiness polling and the exec itself. `get` only — the pod is the
+  # controller's to create and delete.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]

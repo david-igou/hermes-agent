@@ -1816,7 +1816,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         # downstream could tell an operator which kinds this build implements.
         # Everything else is validated by the API server itself
         # (fieldValidation=Strict), not re-derived here.
-        _k8s.resolve_provisioner_kind(kcfg)
+        _provisioner_kind = _k8s.resolve_provisioner_kind(kcfg)
 
         # Hard errors only — things that cannot work, checked before a pod is
         # created and an image pulled. Warnings belong to `hermes doctor`,
@@ -1832,9 +1832,21 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         namespace = _k8s.resolve_namespace(kcfg)
         owner_ref = _k8s.resolve_owner_reference(core_api, namespace, kcfg)
 
-        provisioner = _k8s.PodProvisioner(
-            kcfg, namespace, api=core_api, owner_reference=owner_ref,
-        )
+        if _provisioner_kind == "sandbox":
+            from kubernetes import client as _k8s_client
+
+            from tools.environments.kubernetes_sandbox import (
+                SandboxClaimProvisioner,
+            )
+
+            provisioner = SandboxClaimProvisioner(
+                kcfg, namespace, api=core_api, owner_reference=owner_ref,
+                custom_api=_k8s_client.CustomObjectsApi(core_api.api_client),
+            )
+        else:
+            provisioner = _k8s.PodProvisioner(
+                kcfg, namespace, api=core_api, owner_reference=owner_ref,
+            )
 
         return _k8s.KubernetesEnvironment(
             provisioner=provisioner,

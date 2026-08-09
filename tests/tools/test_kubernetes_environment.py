@@ -306,8 +306,17 @@ def test_kind_is_the_provisioner_seam():
         PROVISIONERS_BY_KIND, resolve_provisioner_kind,
     )
 
-    assert PROVISIONERS_BY_KIND == {("v1", "Pod"): "pod"}
+    assert PROVISIONERS_BY_KIND == {
+        ("v1", "Pod"): "pod",
+        ("extensions.agents.x-k8s.io/v1beta1", "SandboxClaim"): "sandbox",
+    }
     assert resolve_provisioner_kind({"apiVersion": "v1", "kind": "Pod"}) == "pod"
+    # The seam paid for itself: adding the sandbox provisioner cost one entry
+    # here and NO new config key. Selecting it is `kind: SandboxClaim`.
+    assert resolve_provisioner_kind({
+        "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+        "kind": "SandboxClaim",
+    }) == "sandbox"
     # Empty means the default Pod, not a failure: merge_kubernetes_config
     # supplies both, but a hand-built dict in a caller should not explode.
     assert resolve_provisioner_kind({}) == "pod"
@@ -320,7 +329,9 @@ def test_an_unsupported_kind_names_what_is_supported():
 
     with pytest.raises(ValueError, match="no provisioner for apps/v1/Deployment"):
         resolve_provisioner_kind({"apiVersion": "apps/v1", "kind": "Deployment"})
-    with pytest.raises(ValueError, match="Supported: v1/Pod"):
+    # A kind we DO serve, but under the wrong apiVersion: dispatch is on the
+    # pair, so this must still fail rather than guess the group.
+    with pytest.raises(ValueError, match="no provisioner for v1/SandboxClaim"):
         resolve_provisioner_kind({"kind": "SandboxClaim"})
 
 
@@ -914,7 +925,8 @@ def test_factory_builds_kubernetes_env(monkeypatch):
 
 @pytest.mark.parametrize("bad", [
     {"kind": "Deployment", "apiVersion": "apps/v1"},
-    {"kind": "SandboxClaim", "apiVersion": "extensions.agents.x-k8s.io/v1beta1"},
+    # Right kind, wrong group — dispatch is on the pair.
+    {"kind": "SandboxClaim", "apiVersion": "agents.x-k8s.io/v1beta1"},
 ])
 def test_factory_rejects_a_kind_it_has_no_provisioner_for(monkeypatch, bad):
     """The ONE Hermes-side config decision: kind selects which Kubernetes API
@@ -1907,12 +1919,16 @@ def test_shipped_policies_do_not_document_deleted_config_keys():
         for gone in ("template_ref", "use_claim", "spec_overrides",
                      "pod_template_overrides", "security_context",
                      "runtime_class_name",
-                     # the stateless / claim-based cut
+                     # the stateless cut
                      "kubernetes.persistent", "volume.claim_name",
                      "sandbox.spec", "api_group",
-                     # the claim provisioner and its admin-side objects
-                     "SandboxClaim", "SandboxWarmPool", "SandboxTemplate",
-                     "sandboxclaims", "warm_pool", "provisioner: sandbox"):
+                     # the claim provisioner's OLD config surface. The CRD
+                     # names (SandboxClaim, SandboxWarmPool, SandboxTemplate)
+                     # are no longer forbidden: kind: SandboxClaim is a
+                     # supported provisioner, and this list previously made it
+                     # impossible to document the very path whose own error
+                     # messages point at k8s/README.md.
+                     "warm_pool", "provisioner: sandbox"):
             assert gone not in text, f"{name} still documents {gone}"
 
 
