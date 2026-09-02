@@ -372,6 +372,14 @@ def check_sandbox_requirements() -> bool:
     if config.get("env_type") == "vercel_sandbox":
         return _check_vercel_sandbox_requirements(config)
 
+    if config.get("env_type") == "kubernetes":
+        # Report unavailable up front rather than failing at dispatch.
+        import importlib.util
+
+        if importlib.util.find_spec("kubernetes") is None:
+            logger.debug("execute_code unavailable: kubernetes client not installed")
+            return False
+
     return True
 
 
@@ -918,6 +926,7 @@ def _get_or_create_env(task_id: str):
 
         if _is_container(env_type):
             container_config = {
+                "kubernetes": config.get("kubernetes", {}),
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),

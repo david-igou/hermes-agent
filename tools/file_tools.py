@@ -169,7 +169,9 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # (gateway/run.py); the file/terminal-tool layer must do likewise so CLI
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
-_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
+_CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({
+    "docker", "singularity", "modal", "daytona", "vercel_sandbox", "kubernetes",
+})
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -1525,6 +1527,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
             if _is_container(env_type):
                 container_config = {
+                    "kubernetes": config.get("kubernetes", {}),
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
                     "container_disk": config.get("container_disk", 51200),
