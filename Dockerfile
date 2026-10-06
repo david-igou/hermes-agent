@@ -269,6 +269,8 @@ FROM runtime_base AS python_deps
 # Google Chat's [google-chat] extra (google-cloud-pubsub + Chat API clients)
 # is baked so hosted/immutable images can enable the adapter without writing
 # the sealed venv.
+# Firecrawl's optional SDK must also be installed at build time so the bundled
+# web-firecrawl plugin works when runtime lazy installs are disabled.
 #
 # Source binding is created after the source copy below.
 COPY pyproject.toml uv.lock ./
@@ -276,7 +278,7 @@ RUN touch ./README.md
 RUN python3 -m pm.build_env --source /opt/hermes --python /usr/local/bin/python3 \
     --out /opt/hermes/.venv --no-install-project --sealed \
     --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock \
-    --extra azure-identity --extra matrix --extra google-chat --extra kubernetes
+    --extra azure-identity --extra matrix --extra google-chat --extra kubernetes --extra firecrawl
 
 # Icons render on the runtime environment: Pillow and resvg-py are core
 # dependencies. A stage of its own so the frontend stage keeps building its
