@@ -12,6 +12,20 @@ Hermes Agent integrates with Telegram as a full-featured conversational bot. Onc
 
 The **Messaging → Telegram** page in the [dashboard](../features/web-dashboard.md) and the [desktop app](../desktop.md) has a **Create with QR** button. Scan the code (or open the link) in Telegram; Hermes creates the bot for you, detects your Telegram user ID, writes `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS` into your profile's `.env`, and restarts the gateway. If you prefer to create the bot yourself, follow the manual steps below.
 
+## Hermes Cloud with Team Gateway
+
+On a Hermes Cloud instance with Team Gateway on, Telegram (and Discord and Slack) reach your agent through a shared Hermes bot. A bot of your own does not run there: the gateway switches direct connections off at every start so the instance can sleep when idle. The Telegram card shows **Via Team Gateway** instead of **Create with QR**.
+
+When Nous Portal manages who can reach the agent (agents created in the Portal), link your account from the Portal: the card lists the linked accounts and its **Link accounts in Nous Portal** button opens the agent there. Use **Message platforms** on the agent to get the link code.
+
+Otherwise the card links the account itself:
+
+1. Click **Link Telegram**. Hermes shows a one-time message such as `/link AB12CD`, a QR code and an **Open Telegram** button.
+2. Scan the QR code with your phone (or click the button) to open the shared bot, and send it that message from the Telegram account you want to use.
+3. The card lists the account once the bot sees the message. From then on, message the shared bot to talk to your agent.
+
+The gateway must be running for the button to work, because it holds the Team Gateway connection. To run your own bot beside the shared one instead, set `GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS=true` in the instance's environment. That keeps a live Telegram connection open, so the instance never sleeps.
+
 ## Step 1: Create a Bot via BotFather
 
 Every Telegram bot requires an API token issued by [@BotFather](https://t.me/BotFather), Telegram's official bot management tool.
@@ -497,6 +511,8 @@ brew install ffmpeg
 
 Without ffmpeg, Edge TTS audio is sent as a regular audio file (still playable, but uses the rectangular player instead of a voice bubble).
 
+MP3 and M4A files go out as Telegram audio tracks. Their captions get the same markdown formatting as voice notes. With ffmpeg installed, the file's own artist and title tags and its embedded cover art also fill in the performer, track name and album art in Telegram's music player.
+
 Configure the TTS provider in your `config.yaml` under the `tts.provider` key.
 
 ## Large Files (>20MB) via Local Bot API Server
@@ -640,7 +656,7 @@ Hermes Agent works in Telegram group chats with a few considerations:
   - `@botusername` mentions
   - `/command@botusername` (Telegram's bot-menu command form that includes the bot name)
   - matches for one of your configured regex wake words in `telegram.mention_patterns`
-- In groups with multiple Hermes bots, `telegram.exclusive_bot_mentions` keeps routing deterministic. When a message explicitly mentions one or more Telegram bot usernames, only the mentioned bot profiles process it; other Hermes bots ignore it before reply and wake-word fallbacks run. This is enabled by default.
+- In groups with multiple Hermes bots, `telegram.exclusive_bot_mentions` keeps routing deterministic. When a message is addressed to one or more Telegram bot usernames, only the mentioned bot profiles process it; other Hermes bots ignore it before reply and wake-word fallbacks run (and log one `Skipping message ... addressed to other bot(s)` line). A message is addressed to another bot only when it starts with that bot's handle (`@OtherBot do this`, `@BotA @BotB: compare`, `/status@OtherBot`). A handle later in the text, as in `the shop has its own bot now (@ShopBot)`, only talks about that bot and does not silence this one. This bot's own handle anywhere still wins unless an opening command, optionally after this bot's address, explicitly targets another bot. Enabled by default.
 - Renaming the bot's `@username` in BotFather is picked up automatically — Hermes follows the new handle for mention routing without a gateway restart. Collectible (Fragment) usernames that don't end in `bot` are supported too.
 - Use `telegram.ignored_threads` to keep Hermes silent in specific Telegram forum topics, even when the group would otherwise allow free responses or mention-triggered replies
 - If `telegram.require_mention` is left unset or false, Hermes keeps the previous open-group behavior and responds to normal group messages it can see
@@ -673,7 +689,7 @@ telegram:
 
 With this setup, a group message like `@research_bot @ops_bot summarize this` is processed by `research_bot` and `ops_bot` only. Other Hermes bots in the group stay silent, even if the message is a reply to one of their earlier messages or would otherwise match a shared wake word.
 
-Two Hermes bots that answer each other's quote-replies can still loop forever with `TELEGRAM_ALLOW_BOTS=all`, because a reply to the bot always passes the `require_mention` gate. Setting `telegram.bots_require_mention: true` (env `TELEGRAM_BOTS_REQUIRE_MENTION`) closes that path: a message from another bot only triggers a response when it explicitly `@mentions` this bot, while human replies keep working unchanged.
+Two Hermes bots that answer each other's quote-replies can still loop forever with `TELEGRAM_ALLOW_BOTS=all`, because a reply to the bot always passes the `require_mention` gate. Setting `telegram.bots_require_mention: true` (env `TELEGRAM_BOTS_REQUIRE_MENTION`) closes that path: a message from another bot only triggers a response when it explicitly `@mentions` this bot, while human replies keep working unchanged. This also holds in `free_response_chats` / `free_response_topics`: those let *humans* trigger Hermes without a mention, but another bot must still `@mention` it explicitly.
 
 A bot-to-bot loop guard also meters every chat where bot-authored messages are admitted (`TELEGRAM_ALLOW_BOTS` set to `mentions` or `all`). Once 20 bot messages land in one chat inside 5 minutes, further bot messages in that chat are dropped for 10 minutes and one warning is logged; human messages are never counted or dropped. Settings live in `config.yaml`:
 
@@ -687,6 +703,15 @@ gateway:
 ```
 
 A legitimate high-volume bot posting more than 20 messages into one chat in 5 minutes trips the guard too; raise `max_events` for that gateway.
+
+The same block also ends a bot-to-bot exchange long before that budget. Your message starts an exchange. After it, each bot message is one hop, and past `max_hops` (default 4) further bot messages start no turn. A bot repeating the same text in one exchange counts once. With `bot_replies_expect_reply: false` (the default), Hermes does not answer a bot that is answering Hermes's own reply. Hermes also never sends its runtime notices to a bot: busy and interrupt acknowledgements, progress and status lines, the "not processed" and retry hints, and model-fallback notices. A bot gets only the model's reply.
+
+```yaml
+gateway:
+  bot_loop_guard:
+    max_hops: 4
+    bot_replies_expect_reply: false
+```
 
 Group conversation text and media captions keep every mention when the message names other participants too (`@research_bot , @ops_bot are you both listening?` reaches `research_bot` verbatim); when this bot is the only one addressed, its own handle is still stripped so short answers such as `@hermes_bot 2` keep working. Group turns also carry the bot's own Telegram username in the per-channel context so the model can tell which retained mentions are for it. Slash commands still use the normal command-trigger cleanup.
 
@@ -816,9 +841,10 @@ platforms:
 ### How it works
 
 1. On gateway startup, Hermes calls `createForumTopic` for each topic that doesn't have a `thread_id` yet
-2. The `thread_id` is saved back to `config.yaml` automatically — subsequent restarts skip the API call
+2. The `thread_id` is saved back to `config.yaml` automatically. Restarts, reconnects and adapter rebuilds after a network failure reuse it instead of creating the topic again
 3. Each topic maps to an isolated session key: `agent:main:telegram:dm:{chat_id}:{thread_id}`
 4. Messages in each topic have their own conversation history, memory flush, and context window
+5. Every topic with a `thread_id` (in `dm_topics` and `group_topics`) is listed in `channel_directory.json`, so `send_message` can target it by name even when it has no recent session. A topic name used in more than one chat is listed as `<chat_id> / <name>`. A topic named like another directory entry (a DM or group of that name) is listed as `<chat_id>:<thread_id> / <name>`, and that entry as `<its id> / <name>`, so the bare name resolves to neither
 
 ### Root DM handling
 
@@ -1077,7 +1103,7 @@ To find a topic's `thread_id`, open the topic in Telegram Web or Desktop and loo
 
 - **Bot API 9.4 (Feb 2026):** Private Chat Topics — bots can create forum topics in 1-on-1 DM chats via `createForumTopic`. Hermes uses this for two distinct features: operator-curated [Private Chat Topics](#private-chat-topics-bot-api-94) (config-driven, fixed topic list) and user-driven [Multi-session DM mode](#multi-session-dm-mode-topic) (activated by `/topic`, unlimited user-created topics).
 - **Privacy policy:** Telegram now requires bots to have a privacy policy. Set one via BotFather with `/setprivacy_policy`, or Telegram may auto-generate a placeholder. This is particularly important if your bot is public-facing.
-- **Bot API 9.5 (Mar 2026): Native streaming via `sendMessageDraft`.** Hermes supports Telegram's native streaming-draft API as an opt-in transport for private chats. The default remains the legacy `editMessageText` path because draft previews can visibly collapse and re-render on some Telegram clients.
+- **Bot API 9.5 (Mar 2026): Native streaming via `sendMessageDraft`.** Hermes uses Telegram's native streaming-draft API for private chats under the default `auto` transport (groups and group forum topics always use the `editMessageText` path; private-chat topics try drafts too and fall back to edits if Telegram rejects them). If the draft preview visibly collapses and re-renders on your Telegram client, set `transport: edit` (see below).
 
 ### Streaming transport (`gateway.streaming.transport`)
 
@@ -1086,7 +1112,7 @@ When streaming is enabled (`gateway.streaming.enabled: true`), Hermes picks one 
 | Value | Behaviour |
 |---|---|
 | `auto` (default) | Native draft streaming on supported chats (currently Telegram DMs); legacy edit-based path otherwise. Falls back gracefully if a draft frame fails. |
-| `draft` | Force native drafts. Logs a downgrade and falls back to edit if the chat doesn't support drafts (e.g. groups/topics). |
+| `draft` | Force native drafts. Logs a downgrade and falls back to edit if the chat doesn't support drafts (e.g. groups and group forum topics). |
 | `edit` | Legacy progressive `editMessageText` polling for every chat type. |
 | `off` | Disable streaming entirely (final reply only, no progressive updates). |
 
@@ -1099,11 +1125,11 @@ gateway:
     transport: auto    # auto | draft | edit | off
 ```
 
-**What you'll see in DMs with `edit` (default)** — the gateway sends a normal preview message and progressively updates it via `editMessageText`, avoiding Telegram's draft-preview collapse/rollback effect.
+**What you'll see in DMs with `auto` (default) or `draft`** — Telegram shows an animated draft preview that updates token-by-token. When the reply finishes, it's delivered as a regular message and the draft preview clears naturally on the client. Drafts have no message id, so the final answer is what stays in your chat history.
 
-**What you'll see in DMs with `auto` or `draft`** — Telegram shows an animated draft preview that updates token-by-token. When the reply finishes, it's delivered as a regular message and the draft preview clears naturally on the client. Drafts have no message id, so the final answer is what stays in your chat history.
+**What you'll see in DMs with `edit`** — the gateway sends a normal preview message and progressively updates it via `editMessageText`. Pick this if your client shows the draft preview collapsing or flickering while it grows.
 
-**What about groups, supergroups, forum topics?** Telegram restricts `sendMessageDraft` to private chats (DMs). The gateway transparently falls back to the edit-based path for everything else — same UX as before.
+**What about groups, supergroups and group forum topics?** Telegram restricts `sendMessageDraft` to private chats (DMs). The gateway transparently falls back to the edit-based path for those — same UX as before. Topics inside a private chat count as DMs: they try drafts and fall back to edits if Telegram rejects them.
 
 **What if a draft frame fails?** Any failure (transient network error, server-side rejection, older python-telegram-bot install) flips that response back to the edit-based path for the rest of the stream. The next response gets a fresh attempt.
 
@@ -1146,7 +1172,7 @@ gateway:
         disable_link_previews: true
 ```
 
-When enabled, Hermes attaches Telegram's `LinkPreviewOptions(is_disabled=True)` to every outgoing message and falls back to the legacy `disable_web_page_preview` parameter on older `python-telegram-bot` versions.
+When enabled, Hermes attaches Telegram's `LinkPreviewOptions(is_disabled=True)` to every outgoing message, including the streaming preview edits and the final edit of a streamed reply (edits that resolve a button prompt, such as an approval card, don't carry it yet), and falls back to the legacy `disable_web_page_preview` parameter on older `python-telegram-bot` versions.
 
 **Long replies and flood control.** A reply longer than Telegram's 4,096-character limit is sent as numbered parts (`(1/3)`, `(2/3)`, …). Sends to one chat are delivered one reply at a time, so a scheduled report and a DM answer landing together cannot interleave their parts, and a file upload cannot land between two parts of the text it accompanies. If Telegram's flood control refuses a part mid-way, Hermes resumes from the refused part once the penalty passes instead of re-sending the parts already on screen, and while a chat is inside a known penalty window further sends to it fail closed locally (no extra requests that would lengthen the penalty). A penalty longer than the gateway's inline wait cap is handed to the delivery ledger, which redelivers the reply with a "part of it may already have arrived above" note.
 
@@ -1436,7 +1462,7 @@ When the agent calls the `clarify` tool — to ask which approach you prefer, ge
 
 Tap a button to answer, or tap **Other** to type a free-form response (the next message you send becomes the answer). Open-ended `clarify` calls (no preset choices) skip the buttons and just capture your next message.
 
-Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `3600` seconds). If you don't respond within the timeout, the agent unblocks with `"outcome": "timed_out"` and adapts rather than hanging. Reply `skip` to skip a question.
+Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `90` seconds). If you don't respond within the timeout, the agent unblocks with `"outcome": "timed_out"` and adapts rather than hanging. Reply `skip` to skip a question.
 
 If Telegram cannot render the button card (the Bot API rejects it, or the send fails after its 15-second acknowledgement window), Hermes re-asks the same question as a plain numbered-list message and your typed reply (a number or the option text) is taken as the answer. When even that cannot be delivered, the agent is released at once with `[clarify prompt could not be delivered]` instead of waiting out the timeout and mistaking the silence for you not answering.
 

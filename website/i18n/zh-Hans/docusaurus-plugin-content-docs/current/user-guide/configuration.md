@@ -86,11 +86,11 @@ delegation:
 
 ## 终端后端配置
 
-Hermes 支持七种终端后端。每种后端决定 agent 的 shell 命令实际在哪里执行 —— 本地机器、Docker 容器、通过 SSH 的远程服务器、Modal 云沙箱（直接或通过 Nous 托管的 gateway）、Daytona 工作区、Vercel Sandbox，或 Singularity/Apptainer 容器。
+Hermes 支持八种终端后端。每种后端决定 agent 的 shell 命令实际在哪里执行 —— 本地机器、Docker 容器、通过 SSH 的远程服务器、Modal 云沙箱（直接或通过 Nous 托管的 gateway）、Daytona 工作区、Vercel Sandbox、Singularity/Apptainer 容器，或 Kubernetes 集群中的会话 Pod。
 
 ```yaml
 terminal:
-  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | singularity
+  backend: local    # local | docker | ssh | modal | daytona | vercel_sandbox | singularity | kubernetes
   cwd: "."          # Gateway/cron 工作目录（CLI 始终使用启动目录）
   timeout: 180      # 每条命令的超时时间（秒）
   env_passthrough: []  # 转发到沙箱执行的环境变量名（terminal + execute_code）
@@ -112,6 +112,7 @@ terminal:
 | **daytona** | Daytona 工作区 | 完全（云容器） | 托管云开发环境 |
 | **vercel_sandbox** | Vercel Sandbox | 完全（云 microVM） | 带快照文件系统持久化的云执行 |
 | **singularity** | Singularity/Apptainer 容器 | 命名空间（--containall） | HPC 集群、共享机器 |
+| **kubernetes** | 集群内的会话 Pod | 完整（Pod 隔离，可选 kata 运行时） | 在集群内运行 Hermes |
 
 ### Local 后端
 
@@ -790,7 +791,7 @@ Qwen Cloud（阿里巴巴 DashScope）上游将缓存 TTL 限制为 5 分钟，�
 
 不存在禁用此功能的旋钮 —— 缓存始终开启，即使在单轮对话中也能节省费用，因为仅系统提示词就占输入 token 数的相当大比例。
 
-## 辅助模型
+## 辅助模型 {#auxiliary-models}
 
 Hermes 使用"辅助"模型处理图像分析、浏览器截图分析、会话标题生成和上下文压缩等附带任务。默认情况下（`auxiliary.*.provider: "auto"`），Hermes 将每个辅助任务路由到您的**主聊天模型** —— 与您在 `hermes model` 中选择的相同 provider/模型。您无需配置任何内容即可开始，但请注意，在昂贵的推理模型（Opus、MiniMax M2.7 等）上，辅助任务会增加显著成本。如果您希望无论主模型如何都使用便宜且快速的附带任务，请显式设置 `auxiliary.<task>.provider` 和 `auxiliary.<task>.model`（例如，在 OpenRouter 上使用 Gemini Flash 进行视觉分析）。（网页提取不是辅助任务：`web_extract` 和浏览器快照会确定性截断长内容，并将完整文本存储供 `read_file` 分页读取 —— 不涉及 LLM。）
 
@@ -891,14 +892,6 @@ auxiliary:
     #     base_url: ""
     #     api_key: ""
 
-  # 技能中心 —— 技能匹配和搜索
-  skills_hub:
-    provider: "auto"
-    model: ""
-    base_url: ""
-    api_key: ""
-    timeout: 30
-
   # MCP 工具调度
   mcp:
     provider: "auto"
@@ -954,7 +947,7 @@ auxiliary:
 | `model` | 该 provider 的模型名称 |
 | `base_url` | （可选）自定义 OpenAI 兼容端点 |
 
-`fallback_chain` 适用于任何辅助任务 —— `compression`、`vision`、`approval`、`skills_hub`、`mcp` 等。
+`fallback_chain` 适用于任何辅助任务 —— `compression`、`vision`、`approval`、`mcp` 等。
 
 ### OpenRouter 路由和辅助任务的 Pareto Code
 

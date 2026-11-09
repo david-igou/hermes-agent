@@ -74,16 +74,18 @@ The terminal tool can execute commands in different environments:
 | `docker` | Isolated containers | Security, reproducibility |
 | `ssh` | Remote server | Sandboxing, keep agent away from its own code |
 | `singularity` (plugin) | HPC containers | Cluster computing, rootless |
+| `sprites` (plugin) | Stateful Fly.io cloud sandbox | Persistent cloud environments with checkpoint & restore |
 | `modal` | Cloud execution | Serverless, scale |
 | `daytona` | Cloud sandbox workspace | Persistent remote dev environments |
 | `vercel_sandbox` | Vercel Sandbox cloud microVM | Cloud execution with snapshot-backed filesystem persistence |
+| `kubernetes` | Session pod in a Kubernetes cluster | Running Hermes in-cluster; optional kata sandboxed runtime |
 
 ### Configuration
 
 ```yaml
 # In ~/.hermes/config.yaml
 terminal:
-  backend: local    # or: docker, ssh, modal, daytona, vercel_sandbox, or a plugin backend (singularity)
+  backend: local    # or: docker, ssh, modal, daytona, vercel_sandbox, kubernetes, or a plugin backend (singularity, sprites)
   cwd: "."          # Working directory
   timeout: 180      # Command timeout in seconds
 ```
@@ -156,6 +158,16 @@ hermes config set terminal.backend singularity
 hermes config set terminal.singularity_image ~/python.sif
 ```
 
+### Sprites
+
+A plugin ([`sprites`](https://github.com/NousResearch/hermes-plugin-sprites)) that runs commands in a stateful [Sprite](https://fly.io/sprites) on Fly.io. See [Sprites Backend](../configuration.md#sprites-backend).
+
+```bash
+hermes plugins install NousResearch/hermes-plugin-sprites --enable
+hermes config set terminal.backend sprites
+# Add SPRITES_TOKEN to ~/.hermes/.env
+```
+
 ### Modal (Serverless Cloud)
 
 ```bash
@@ -199,6 +211,7 @@ Configure CPU, memory, disk, and persistence for all container backends:
 ```yaml
 terminal:
   backend: docker  # or modal, daytona, vercel_sandbox, singularity (plugin)
+                   # (kubernetes ignores these keys — resources belong in its pod spec)
   container_cpu: 1              # CPU cores (default: 1)
   container_memory: 5120        # Memory in MB (default: 5GB)
   container_disk: 51200         # Disk in MB (default: 50GB)
